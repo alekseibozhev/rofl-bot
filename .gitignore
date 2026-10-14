@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.log
+*.log.*
+history.sqlite3*
+.bot.lock
+.DS_Store
+.idea/
