@@ -95,6 +95,10 @@ def post(url, payload, timeout=60, direct=False, headers=None):
 
 SYSTEM = """Ты Рофл — двачер и тролль в чате корешей. Твоя цель — развлекать чат, чтобы все ржали. Роастишь людей из чата и цепляешься к деталям из того, что они сами писали. Мемы, отсылки, цитаты, пасты, чёрный и абсурдный юмор, мат. Эмодзи изредка, не хвостом в конце каждой реплики.
 
+Пишешь как человек в чате, а не как текст: имя в начало не ставишь — ответ и так реплаем; шутку не строишь на «это \
+не X, а Y»; просьбу и указания не пересказываешь («держи», «принял», «докладываю») — сразу к делу. Людей зовёшь \
+по-свойски, по-русски, как кореша, а не как в паспорте.
+
 Переписка приходит как «Имя: текст»; «Имя → Кому» — ответ на сообщение Кому. Рофл — это ты. Ответь одной своей репликой, без имени."""
 
 # Сетап-панчлайн: the setup reads the chat and picks how to answer, the punchline is written to it. A length
@@ -335,6 +339,13 @@ def text_of(content):
 
 def clip(text, limit):
     return text if len(text) <= limit else text[:limit].rstrip() + '…'
+
+
+def casual(text):
+    """A line or two the way people type it: no period at the end, a hyphen for the dash. Pastes and code stay."""
+    if '```' in text or len([line for line in text.splitlines() if line.strip()]) > 2:
+        return text
+    return re.sub(r'(?<![.])\.$', '', text.replace(' — ', ' - '))
 
 
 def telegram_html(text):
@@ -1071,6 +1082,8 @@ class Bot:
                 # «Алексей → Рофл: ты че там совсем долбанулся?». A greentext comes as «\>» escaped for Markdown.
                 answer = re.split(rf'\n\s*\n(?={name.pattern[1:]})', answer, maxsplit=1)[0]
                 answer = re.sub(r'^\\>', '>', '\n'.join(line.rstrip() for line in answer.splitlines()), flags=re.M)
+                # Typed, not typeset: «—» and a period at the end gave the bot away in 33 and 19 answers of 37.
+                answer = answer if form else casual(answer)
                 return answer, {'setup': setup, 'context_chars': len(chat), 'lines': len(lines), 'image': bool(image),
                                 'alone': alone, **({'form': form[0]} if form else {}), 'feelings': feelings,
                                 'morale': left, 'topic': topic_hint, **spent(usage)}
@@ -1236,8 +1249,8 @@ class Bot:
                                                             window=self.window, limit=self.limit), names)
                         prompt = ('Переписка чата, старые сообщения сверху:\n\n' + '\n\n'.join(lines) + '\n\n'
                                   + (feelings + '\n\n' if feelings else '') + BUTT_IN)
-                        text = re.sub(r'^Рофл(?: → [^:\n]*)?:\s*', '', self.generate(
-                            [{'role': 'user', 'content': prompt}], chat_id=chat, topic=topic))
+                        text = casual(re.sub(r'^Рофл(?: → [^:\n]*)?:\s*', '', self.generate(
+                            [{'role': 'user', 'content': prompt}], chat_id=chat, topic=topic)))
                     elif kind == 'share':
                         text, markup, link = self.repost(chat, now, feelings)
                 except RuntimeError as exc:
