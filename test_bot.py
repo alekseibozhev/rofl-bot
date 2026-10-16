@@ -215,7 +215,7 @@ class ConversationTests(unittest.TestCase):
         self.assertTrue(prompt.startswith('Просьба:\n\nUser 7: бот, расскажи анекдот про бабку\n\n'))
         self.assertTrue(prompt.endswith('Сетап: Кому: User 7. Форма: анекдот. Заход: бабка и панки. '
                                         'Ты — Рофл: ответь от первого лица, одной репликой, на заход сетапа.'))
-        trace = json.loads(self.b.history.db.execute("SELECT trace FROM messages WHERE role='assistant'").fetchone()[0])
+        trace = json.loads(self.b.history.db.execute('SELECT trace FROM answers').fetchone()[0])
         self.assertTrue(trace['alone'])
         self.b.setup.return_value = 'Кому: User 8.\nФорма: одна строка.'
         self.b.handle(self.message('бот, а он?'))
@@ -228,7 +228,7 @@ class ConversationTests(unittest.TestCase):
         self.assertIn('Сетап: Кому: User 8. Форма: батл-куплет, 12 строк. Заход: хакер-недоучка. Как выглядит рэп: '
                       '8–16 строк', self.prompt())
         self.assertTrue(self.prompt().endswith('других деталей из переписки не приплетай.'))
-        trace = json.loads(self.b.history.db.execute("SELECT trace FROM messages WHERE role='assistant'").fetchone()[0])
+        trace = json.loads(self.b.history.db.execute('SELECT trace FROM answers').fetchone()[0])
         self.assertEqual(trace['form'], 'рэп')
         self.b.setup.return_value = '[без чата]\nКому: User 7.\nФорма: бугурт-тред.\nЗаход: сессия.'
         self.b.handle(self.message('бот, бугурт тред про сессию'))
@@ -259,6 +259,10 @@ class ConversationTests(unittest.TestCase):
         self.assertEqual(bot.reaction_of('Форма: реакция ❤️'), '❤')
         self.assertEqual(bot.reaction_of('Форма: реакция 💀'), '🤣')
         self.assertIsNone(bot.reaction_of('Форма: одна строка. Заход: его реакция 🤡'))
+        self.assertIsNone(bot.reaction_of('Форма: одна-две строки реакции на анекдот. Заход: бабка 🤡'))
+        self.assertEqual(bot.reaction_of('Форма: «реакция» 🔥'), '🔥')
+        self.assertIsNone(bot.reaction_of('Форма: реакция на шутку, одна-две строки'))
+        self.assertEqual(bot.reaction_of('Кому: Никита 👾 Форма: реакция Заход: ржёт. Эмодзи: 💀 или 🔥'), '🤣')
         with patch('builtins.print') as printed:
             self.b.replay(request['message_id'])
         self.assertIn('[реакция 🤣]', [call.args[0] for call in printed.call_args_list])
@@ -296,7 +300,7 @@ class ConversationTests(unittest.TestCase):
 
     def test_the_trace_keeps_the_setup(self):
         self.b.handle(self.message('бот, жги'))
-        trace = json.loads(self.b.history.db.execute("SELECT trace FROM messages WHERE role='assistant'").fetchone()[0])
+        trace = json.loads(self.b.history.db.execute('SELECT trace FROM answers').fetchone()[0])
         self.assertEqual(trace['setup'], 'Кому: User 7. Форма: одна строка')
         self.assertEqual(trace['lines'], 1)
 
@@ -882,14 +886,13 @@ class ConversationTests(unittest.TestCase):
         for i in range(220):
             self.store(i, f'реплика {i}')
         self.store(500, 'другой топик', topic=5)
-        self.b.history.add((-100123, 0), 400, 'user', 'Олег, ответ Рофл:\nстрока старого формата', time.time())
-        self.b.history.checkpoint(1234)
+        self.b.history.stamp('offset', 1234)
         self.b.history.db.close()
         self.b.history = History(self.path)
-        self.assertEqual(self.b.history.offset(), 1234)
+        self.assertEqual(self.b.history.stamp('offset'), 1234)
         context = self.b.history.context((-100123, 0))
         self.assertEqual(len(context), 40)
-        self.assertEqual(context[-1], 'User 9: реплика 219')  # the old format line is gone
+        self.assertEqual(context[-1], 'User 9: реплика 219')
         self.b.handle(self.message('/reset'))
         self.assertEqual(self.b.history.context((-100123, 0)), [])
         self.assertEqual(len(self.b.history.context((-100123, 5))), 1)

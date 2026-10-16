@@ -47,30 +47,25 @@ def load_env():
                 os.environ.setdefault(key.strip(), value.strip())
 
 
-class Typing:
+@contextmanager
+def typing(send, every=4.0):
     """Keeps «печатает» on while the model is busy, including the silent prompt evaluation."""
-    def __init__(self, send, every=4.0):
-        self.send = send
-        self.every = every
-        self.stop = threading.Event()
-        self.worker = threading.Thread(target=self.run, daemon=True)
+    stop = threading.Event()
 
-    def run(self):
+    def run():
         while True:
             try:
-                self.send()
+                send()
             except Exception as exc:
                 # Typing failures must not abort generation or expose token-bearing URLs.
                 LOG.warning('telegram.typing_failed error_type=%s', type(exc).__name__)
-            if self.stop.wait(self.every):
+            if stop.wait(every):
                 return
-
-    def __enter__(self):
-        self.worker.start()
-        return self
-
-    def __exit__(self, *args):
-        self.stop.set()
+    threading.Thread(target=run, daemon=True).start()
+    try:
+        yield
+    finally:
+        stop.set()
 
 
 def fetch(request, timeout=60, direct=False):
@@ -99,7 +94,7 @@ SYSTEM = """Ты Рофл — двачер и тролль в чате коре�
 не X, а Y»; просьбу и указания не пересказываешь («держи», «принял», «докладываю») — сразу к делу. Людей зовёшь \
 по-свойски, по-русски, как кореша, а не как в паспорте.
 
-Переписка приходит как «Имя: текст»; «Имя → Кому» — ответ на сообщение Кому. Рофл — это ты. Ответь одной своей репликой, без имени."""
+Переписка приходит как «Имя: текст»; «Имя → Кому» — ответ на сообщение Кому. Рофл — это ты. Ответь одной своей репликой."""
 
 # Сетап-панчлайн: the setup reads the chat and picks how to answer, the punchline is written to it. A length
 # drawn at random answered «распиши» with one line and a quick jab with a paste.
@@ -110,18 +105,18 @@ SETUP = """Ты сетапер Рофла — двачера и тролля в 
 Форма: на быстрый вопрос, подкол или «зацени» — одна-две строки; просят расписать, рассказать или доложить — паста \
 на 8–15 строк; Рофлу только поддакнули или поржали и словами отвечать незачем — «реакция» и сразу само эмодзи, которое Рофл поставит; просят \
 конкретную форму — назови её так, как просят; просят известный анекдот, пасту или \
-цитату — «как есть»: Рофл рассказывает её как она есть, своего захода не добавляет, а Заход — какая именно \
-и чем кончается; шутку уже рассказали в переписке («вот этот», прислали текст) — не повторяй, одна-две строки \
-реакции на неё.
+цитату — «как есть»: Рофл расскажет её как есть, без своего захода, а в Заходе — какая именно и чем кончается; \
+шутку уже рассказали в переписке («вот этот», прислали текст) — не повторяй, ответь на неё одной-двумя строками.
 Заход: одна мысль, что обыграть. Просят про конкретное — картинку, вопрос, человека — мысль про это, \
 чат не приплетай; иначе — за какую деталь из чата зацепиться. Факты о людях — только из переписки: выдуманное примут \
-за правду; материала мало — стёб над этим. Приложена картинка — опиши, что на ней смешного: Рофл её не видит. \
-Просят сменить тему, забыть что-то или не трогать кого-то — выполни, а не обыгрывай, и к старой шутке не возвращайся.
+за правду; материала мало — стёб над этим. Приложена картинка — опиши, что на ней смешного: Рофл её не видит.
 
-Просят что-то своё (анекдот, стих, объяснение), сменить тему, забыть или не трогать кого-то — первой строкой \
-поставь [без чата]: Рофл тогда увидит только просьбу. Про людей чата тег не ставь."""
+Просят что-то своё (анекдот, стих, объяснение), сменить тему, забыть или не трогать кого-то — выполни, а не \
+обыгрывай, к старой шутке не возвращайся и первой строкой поставь [без чата]: Рофл тогда увидит только просьбу. \
+Про людей чата тег не ставь."""
 
 ALONE = '[без чата]'
+CHAT = 'Переписка чата, старые сообщения сверху:\n\n'
 
 # How an ordered form looks, for the punchline only: the one form the setup had an example of, greentext, went
 # to a rap battle. A list in the setup would draw it to the forms where nobody asks for them, like the topics.
@@ -159,12 +154,14 @@ REACTIONS = tuple('👍 👎 ❤ 🔥 🥰 👏 😁 🤔 🤯 😱 🤬 😢 �
 def reaction_of(setup):
     """The emoji to put on the request when the setup answers it with a reaction, or None.
 
-    «+», «ору» or praise got a line of the model each: people put a reaction on such or keep quiet."""
-    line = form_line(setup).replace('\ufe0f', '')
-    if not re.search(r'(?i)реакц', line):
+    «+», «ору» or praise got a line of the model each: people put a reaction on such or keep quiet. The form
+    begins with it and has no lines: «одна-две строки реакции на анекдот» and «реакция, одна-две строки» are lines.
+    The emoji is the first one from the form on: the setup puts it in «Заход» as often."""
+    line = form_line(setup)
+    if not re.match(r'(?i)\W*реакц', line) or 'строк' in line:
         return None
-    line = re.sub('[😂💀😹]', '🤣', line)  # «ору» in the emoji a bot may not put
-    return next((e for e in sorted(REACTIONS, key=len, reverse=True) if e in line), '🗿')
+    rest = re.sub('[😂💀😹]', '🤣', setup.partition('Форма:')[2].replace('\ufe0f', ''))  # «ору» a bot may not put
+    return min(((rest.find(e), -len(e), e) for e in REACTIONS if e in rest), default=(0, 0, '🗿'))[2]
 
 
 RUDE, SHRUG, FAILED = ('пошёл нахуй', 'ладно, братва',
@@ -486,24 +483,15 @@ class History:
         self.db.execute('PRAGMA journal_mode=WAL;')
         self.db.execute('''CREATE TABLE IF NOT EXISTS messages (
             chat INTEGER, topic INTEGER, id INTEGER, role TEXT, content TEXT,
-            date REAL, reply_to INTEGER, PRIMARY KEY (chat, topic, id))''')
+            date REAL, reply_to INTEGER, raw TEXT, PRIMARY KEY (chat, topic, id))''')
         self.db.execute('CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value INTEGER)')
         self.db.execute('''CREATE TABLE IF NOT EXISTS people (
             chat INTEGER, username TEXT, name TEXT, PRIMARY KEY (chat, username))''')
         self.db.execute('''CREATE TABLE IF NOT EXISTS replies (
             chat INTEGER, topic INTEGER, id INTEGER, PRIMARY KEY (chat, topic, id))''')
-        for old in ('tags', 'topic_use', 'dossiers'):  # features that are gone
-            self.db.execute(f'DROP TABLE IF EXISTS {old}')
         self.db.execute('CREATE TABLE IF NOT EXISTS hints (chat INTEGER, topic TEXT, used REAL)')
-        for table, column, kind in (('messages', 'reply_to', 'INTEGER'), ('messages', 'raw', 'TEXT'),
-                                    ('messages', 'trace', 'TEXT')):
-            if column not in [info[1] for info in self.db.execute(f'PRAGMA table_info({table})')]:
-                self.db.execute(f'ALTER TABLE {table} ADD COLUMN {column} {kind}')
-        with self.db:  # lines rendered by an old format cannot follow a new one; whole messages always can
-            self.db.execute("DELETE FROM messages WHERE role = 'user' AND raw IS NULL")
         # Metrics: the answers with the settings they were made on, and what people put on them. Kept for good,
         # unlike the messages: the settings change every few days and are judged by weeks of reactions.
-        new = not self.db.execute("SELECT 1 FROM sqlite_master WHERE name='answers'").fetchone()
         self.db.execute('''CREATE TABLE IF NOT EXISTS answers (
             chat INTEGER, topic INTEGER, id INTEGER, request INTEGER, date REAL, content TEXT, params TEXT, trace TEXT,
             PRIMARY KEY (chat, id))''')
@@ -511,11 +499,6 @@ class History:
             chat INTEGER, id INTEGER, user INTEGER, emoji TEXT, date REAL, PRIMARY KEY (chat, id, user))''')
         self.db.execute('''CREATE TABLE IF NOT EXISTS news (
             day TEXT, interest TEXT, title TEXT, link TEXT, mood INTEGER, thought TEXT, PRIMARY KEY (day, interest))''')
-        if new:  # the answers of the past week, settings unknown; comebacks to reactions answer the bot itself
-            with self.db:
-                self.db.execute('''INSERT OR IGNORE INTO answers SELECT chat, topic, id, reply_to, date, content, NULL, trace
-                    FROM messages WHERE role='assistant' AND reply_to NOT IN
-                    (SELECT id FROM messages WHERE role='assistant')''')
 
     def remember(self, chat, *people):
         with self.db:
@@ -543,13 +526,11 @@ class History:
             return self.db.execute('INSERT OR IGNORE INTO replies VALUES (?, ?, ?)',
                                    (*key, message_id)).rowcount == 1
 
-    def add(self, key, message_id, role, content, date, reply_to=None, raw=None, trace=None):
-        """`trace` is how an answer was made, the setup: what went wrong is read there."""
+    def add(self, key, message_id, role, content, date, reply_to=None, raw=None):
         with self.db:
-            self.db.execute('''INSERT OR IGNORE INTO messages (chat, topic, id, role, content, date, reply_to, raw, trace)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                            (*key, message_id, role, content and content[:6500], date, reply_to, raw,
-                             trace and json.dumps(trace, ensure_ascii=False)))
+            self.db.execute('''INSERT OR IGNORE INTO messages (chat, topic, id, role, content, date, reply_to, raw)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                            (*key, message_id, role, content and content[:6500], date, reply_to, raw))
             self.db.execute('DELETE FROM messages WHERE date < ?', (time.time() - 7 * 86400,))
             self.db.execute('''DELETE FROM messages WHERE chat=? AND topic=? AND id NOT IN
                 (SELECT id FROM messages WHERE chat=? AND topic=? ORDER BY id DESC LIMIT 200)''',
@@ -560,7 +541,7 @@ class History:
         self.add(key, message['message_id'], 'user', None, message.get('date', time.time()),
                  (message.get('reply_to_message') or {}).get('message_id'), json.dumps(message, ensure_ascii=False))
 
-    def context(self, key, through_id=9223372036854775807, me_id=None, recent=40, window=21600, depth=10, limit=12000):
+    def context(self, key, through_id=sys.maxsize, me_id=None, recent=40, window=21600, depth=10, limit=12000):
         """The chat up to the newest message as lines, oldest first: the last `recent` messages of people
         from `window` seconds before it, plus its reply chain (rebuilt from earlier updates) however old.
 
@@ -718,7 +699,8 @@ class History:
             self.db.execute('DELETE FROM news WHERE day < ?', (str(day - datetime.timedelta(7)),))
 
     def stamp(self, key, date=None):
-        """When `key` last happened: the bot blurt, broke down, tried to read; with `date`, mark it then."""
+        """When `key` last happened: the bot blurt, broke down, tried to read; with `date`, mark it then.
+        The 'offset' of the updates is kept the same way."""
         if date is None:
             row = self.db.execute('SELECT value FROM state WHERE key=?', (key,)).fetchone()
             return row[0] if row else 0
@@ -746,14 +728,6 @@ class History:
     def clear(self, key):
         with self.db:
             self.db.execute('DELETE FROM messages WHERE chat=? AND topic=?', key)
-
-    def offset(self):
-        row = self.db.execute("SELECT value FROM state WHERE key='offset'").fetchone()
-        return row[0] if row else 0
-
-    def checkpoint(self, offset):
-        with self.db:
-            self.db.execute("INSERT OR REPLACE INTO state VALUES ('offset', ?)", (offset,))
 
 
 def report(db, days=14):
@@ -918,7 +892,7 @@ class Bot:
 
     def generate(self, messages, chat_id=None, topic=0, system=SYSTEM, temperature=1.0, effort=None):
         messages = [{'role': 'system', 'content': system}] + messages
-        def typing():
+        def send():
             action = {'chat_id': chat_id, 'action': 'typing'}
             if topic:
                 action['message_thread_id'] = topic
@@ -927,7 +901,7 @@ class Bot:
 
         started = time.monotonic()
         try:
-            with Typing(typing) if chat_id is not None else nullcontext():
+            with typing(send) if chat_id is not None else nullcontext():
                 answer, stats = (self.ask_openrouter(messages, temperature, effort) if self.openrouter
                                  else self.ask_ollama(messages, temperature))
         except RuntimeError as exc:
@@ -1054,20 +1028,19 @@ class Bot:
         typing = chat_id if live else None
         with self.counting() as usage:
             try:
-                names = {**self.history.names(chat_id), self.me['username'].lower(): 'Рофл'}
-                lines = rename(self.history.context(key, through, self.me['id'], self.recent, self.window,
-                                                    limit=self.limit), names)
-                chat = 'Переписка чата, старые сообщения сверху:\n\n' + '\n\n'.join(lines)
+                lines, names = self.chat(key, through)
+                chat = CHAT + '\n\n'.join(lines)
+                heads = [re.split(r' → |: ', line, maxsplit=1)[0] for line in lines]
                 # A forced topic in every answer makes every answer the same: it is only offered.
                 topic_hint = self.history.next_topic(chat_id, now=None if live else date, record=live)
                 hint = f'\n\n(Тема в чате сейчас: {topic_hint}. Бери, если в тему.)' if topic_hint else ''
                 # The answers off the chain are only marks in the chat: three in a row went at one «ноут с олламой».
                 # The punchline never sees them, the small model would take them for a template.
-                said = [clip(' '.join(text.split()), 200) for text in self.history.said(key, through, date)]
+                recent = self.history.said(key, through, date, count=6)
+                said = [clip(' '.join(text.split()), 200) for text in recent[-3:]]
                 said = ('\n\nРофл недавно ответил, не повторяй ни детали, ни заход, ни построение:\n'
                         + '\n'.join(f'- {text}' for text in said)) if said else ''
-                gags = worn(self.history.said(key, through, date, count=6),
-                            [*names.values(), *(re.split(r' → |: ', line, maxsplit=1)[0] for line in lines)])
+                gags = worn(recent, [*names.values(), *heads])
                 said += (f'\n\nУже заезжено, Рофл обыгрывал это не раз: {", ".join(gags)}. Не бери, даже если чат '
                          'об этом.') if gags else ''
                 # Only a model that takes images gets one: the local one would fail on it.
@@ -1087,11 +1060,11 @@ class Bot:
                                    + ('\n\nКартинка, о которой речь, приложена.' if image else '') + hint,
                                    typing, topic, image)
                 setup = ' '.join(setup.split()).rstrip('.')
+                trace = {'setup': setup, 'context_chars': len(chat), 'lines': len(lines), 'image': bool(image),
+                         'feelings': feelings, 'morale': left, 'topic': topic_hint}
                 reaction = reaction_of(setup)
                 if reaction:
-                    return reaction, {'setup': setup, 'reaction': True, 'context_chars': len(chat), 'lines': len(lines),
-                                      'image': bool(image), 'feelings': feelings, 'morale': left, 'topic': topic_hint,
-                                      **spent(usage)}
+                    return reaction, {**trace, 'reaction': True, **spent(usage)}
                 # «Расскажи анекдот» after an evening of one gag got the gag back: the punchline saw the chat full
                 # of it. A setup tagged so gets the punchline the request alone.
                 alone = ALONE in setup
@@ -1101,6 +1074,8 @@ class Bot:
                 looks = f' Как выглядит {form[0]}: {form[1]}' if form else ''
                 # Whom to jab and how long is the setup's: in one line, and the prompt ends on who answers, or the
                 # model goes on with the chat log.
+                task = (f'пишет {person_label(sender)}. Сетап: {brief}.{looks} Ты — Рофл: ответь от первого лица, '
+                        'одной репликой, на заход сетапа')
                 if alone:
                     # Without the message it replies to: an excerpt of the old joke brought the gag back.
                     request = rename([message_content({**json.loads(raw), 'reply_to_message': None},
@@ -1108,16 +1083,13 @@ class Bot:
                                       for (raw,) in self.history.db.execute(
                         "SELECT raw FROM messages WHERE chat=? AND topic=? AND role='user' AND id >= ? AND id <= ? "
                         'ORDER BY id', (*key, message['message_id'], through))], names)
-                    prompt = ('Просьба:\n\n' + '\n\n'.join(request) + f'\n\nОна адресована тебе, пишет '
-                              f'{person_label(sender)}. Сетап: {brief}.{looks} Ты — Рофл: ответь от первого лица, '
-                              'одной репликой, на заход сетапа.')
+                    prompt = 'Просьба:\n\n' + '\n\n'.join(request) + f'\n\nОна адресована тебе, {task}.'
                 else:
-                    prompt = (chat + f'\n\nПоследнее сообщение адресовано тебе, пишет {person_label(sender)}. '
-                              f'Сетап: {brief}.{looks} Ты — Рофл: ответь от первого лица, одной репликой, на заход '
-                              'сетапа; других деталей из переписки не приплетай.')
+                    prompt = (chat + f'\n\nПоследнее сообщение адресовано тебе, {task}; других деталей из переписки '
+                              'не приплетай.')
                 # The log invites the model to go on with it: the answer opens with lines copied from it or with a
                 # name, «РОФЛ:», «Серёга: …». Leading lines that, name cut, are empty or already said are dropped.
-                speakers = {'Рофл', person_label(sender), *(re.split(r' → |: ', line, maxsplit=1)[0] for line in lines)}
+                speakers = {'Рофл', person_label(sender), *heads}
                 name = re.compile(rf'^(?i:{"|".join(map(re.escape, speakers))})(?: → [^:\n]*)?:\s*')
                 known = {name.sub('', line).lower() for line in chat.splitlines()} | {''}
                 answer = self.generate([{'role': 'user', 'content': prompt}], chat_id=typing, topic=topic)
@@ -1130,12 +1102,16 @@ class Bot:
                 answer = re.sub(r'^\\>', '>', '\n'.join(line.rstrip() for line in answer.splitlines()), flags=re.M)
                 # Typed, not typeset: «—» and a period at the end gave the bot away in 33 and 19 answers of 37.
                 answer = answer if form else casual(answer)
-                return answer, {'setup': setup, 'context_chars': len(chat), 'lines': len(lines), 'image': bool(image),
-                                'alone': alone, **({'form': form[0]} if form else {}), 'feelings': feelings,
-                                'morale': left, 'topic': topic_hint, **spent(usage)}
+                return answer, {**trace, 'alone': alone, **({'form': form[0]} if form else {}), **spent(usage)}
             except RuntimeError as exc:
                 LOG.error('generation.failed %s', exc)
                 return FAILED, None
+
+    def chat(self, key, through=sys.maxsize):
+        """The chat up to message `through` as lines for the model, one name per person, and the names by username."""
+        names = {**self.history.names(key[0]), self.me['username'].lower(): 'Рофл'}
+        return rename(self.history.context(key, through, self.me['id'], self.recent, self.window,
+                                           limit=self.limit), names), names
 
     @contextmanager
     def counting(self):
@@ -1245,7 +1221,7 @@ class Bot:
         sent = self.send(key, message['message_id'], markup or answer, parse_mode='HTML' if markup else None)
         if kind != 'reset':
             self.history.add(key, sent['message_id'], 'assistant', answer, sent.get('date', time.time()),
-                             message['message_id'], trace=trace)
+                             message['message_id'])
         if kind == 'rofl':
             self.history.record(key, sent['message_id'], message['message_id'], sent.get('date', time.time()),
                                 answer, self.params(), trace)
@@ -1298,11 +1274,8 @@ class Bot:
                     if text is None:
                         feelings = self.feelings(chat, now)
                     if kind == 'butt_in':
-                        names = {**self.history.names(chat), self.me['username'].lower(): 'Рофл'}
-                        lines = rename(self.history.context((chat, topic), me_id=self.me['id'], recent=self.recent,
-                                                            window=self.window, limit=self.limit), names)
-                        prompt = ('Переписка чата, старые сообщения сверху:\n\n' + '\n\n'.join(lines) + '\n\n'
-                                  + (feelings + '\n\n' if feelings else '') + BUTT_IN)
+                        lines, _ = self.chat((chat, topic))
+                        prompt = CHAT + '\n\n'.join(lines) + '\n\n' + (feelings + '\n\n' if feelings else '') + BUTT_IN
                         text = casual(re.sub(r'^Рофл(?: → [^:\n]*)?:\s*', '', self.generate(
                             [{'role': 'user', 'content': prompt}], chat_id=chat, topic=topic)))
                     elif kind == 'share':
@@ -1461,7 +1434,7 @@ class Bot:
             LOG.warning('Режим read-only: сообщения сохраняются в контекст, бот ничего не отправляет.')
         if not self.me.get('can_read_all_group_messages'):
             LOG.warning('Privacy Mode включён: фон чата и обращения по имени Telegram не доставляет.')
-        offset = self.history.offset()
+        offset = self.history.stamp('offset')
         while True:
             try:
                 self.idle()
@@ -1482,7 +1455,7 @@ class Bot:
                         except RuntimeError as exc:
                             LOG.error('Реакция пропущена: %s', exc)
                 offset = updates[-1]['update_id'] + 1
-                self.history.checkpoint(offset)
+                self.history.stamp('offset', offset)
             except RuntimeError as exc:
                 LOG.error('Polling: %s; повтор через 5 секунд', exc)
                 time.sleep(5)
