@@ -108,7 +108,8 @@ SETUP = """Ты сетапер Рофла — двачера и тролля в 
 
 Кому: тот, кому или про кого просят («объясни X», «про X»), просящего не трогай; ни о ком не просят — тот, кто пишет.
 Форма: на быстрый вопрос, подкол или «зацени» — одна-две строки; просят расписать, рассказать или доложить — паста \
-на 8–15 строк; просят конкретную форму — назови её так, как просят; просят известный анекдот, пасту или \
+на 8–15 строк; Рофлу только поддакнули или поржали и словами отвечать незачем — «реакция» и сразу само эмодзи, которое Рофл поставит; просят \
+конкретную форму — назови её так, как просят; просят известный анекдот, пасту или \
 цитату — «как есть»: Рофл рассказывает её как она есть, своего захода не добавляет, а Заход — какая именно \
 и чем кончается; шутку уже рассказали в переписке («вот этот», прислали текст) — не повторяй, одна-две строки \
 реакции на неё.
@@ -139,10 +140,31 @@ FORMS = (
 )
 
 
+def form_line(setup):
+    line = re.search(r'Форма:(.*?)(?:Заход:|$)', ' '.join(setup.split()))
+    return line[1] if line else ''
+
+
 def form_of(setup):
     """The form the setup orders, by its «Форма» line, as (name, how it looks), or None."""
-    line = re.search(r'Форма:(.*?)(?:Заход:|$)', ' '.join(setup.split()))
-    return next(((name, looks) for name, words, looks in FORMS if line and words.search(line[1])), None)
+    return next(((name, looks) for name, words, looks in FORMS if words.search(form_line(setup))), None)
+
+
+# The emoji a bot may react with; the model's own 😂 is not one of them.
+REACTIONS = tuple('👍 👎 ❤ 🔥 🥰 👏 😁 🤔 🤯 😱 🤬 😢 🎉 🤩 🤮 💩 🙏 👌 🕊 🤡 🥱 🥴 😍 🐳 ❤‍🔥 🌚 🌭 💯 🤣 ⚡ 🍌 🏆 💔 🤨 😐 🍓 '
+                  '🍾 💋 🖕 😈 😴 😭 🤓 👻 👨‍💻 👀 🎃 🙈 😇 😨 🤝 ✍ 🤗 🫡 🎅 🎄 ☃ 💅 🤪 🗿 🆒 💘 🙉 🦄 😘 💊 🙊 😎 👾 🤷‍♂ 🤷 '
+                  '🤷‍♀ 😡'.split())
+
+
+def reaction_of(setup):
+    """The emoji to put on the request when the setup answers it with a reaction, or None.
+
+    «+», «ору» or praise got a line of the model each: people put a reaction on such or keep quiet."""
+    line = form_line(setup).replace('\ufe0f', '')
+    if not re.search(r'(?i)реакц', line):
+        return None
+    line = re.sub('[😂💀😹]', '🤣', line)  # «ору» in the emoji a bot may not put
+    return next((e for e in sorted(REACTIONS, key=len, reverse=True) if e in line), '🗿')
 
 
 RUDE, SHRUG, FAILED = ('пошёл нахуй', 'ладно, братва',
@@ -1046,6 +1068,11 @@ class Bot:
                                    + ('\n\nКартинка, о которой речь, приложена.' if image else '') + hint,
                                    typing, topic, image)
                 setup = ' '.join(setup.split()).rstrip('.')
+                reaction = reaction_of(setup)
+                if reaction:
+                    return reaction, {'setup': setup, 'reaction': True, 'context_chars': len(chat), 'lines': len(lines),
+                                      'image': bool(image), 'feelings': feelings, 'morale': left, 'topic': topic_hint,
+                                      **spent(usage)}
                 # «Расскажи анекдот» after an evening of one gag got the gag back: the punchline saw the chat full
                 # of it. A setup tagged so gets the punchline the request alone.
                 alone = ALONE in setup
@@ -1170,7 +1197,7 @@ class Bot:
             print(f'\n— прогон {run}', flush=True)
             if trace:
                 print(f'Сетап: {trace["setup"]}')
-            print(answer)
+            print(f'[реакция {answer}]' if trace and trace.get('reaction') else answer)
 
     def respond(self, message, kind, extra=()):
         chat = message['chat']
@@ -1186,6 +1213,14 @@ class Bot:
                      chat['id'], message['message_id'], time.time() - message.get('date', time.time()), len(extra))
             answer, trace = self.joke(message, extra[-1]['message_id'] if extra else message['message_id'])
         if not self.history.claim_reply(key, message['message_id']):
+            return
+        if trace and trace.get('reaction'):
+            # No message of its own: the answer is kept without an id, so reactions to the request never count as
+            # reactions to the bot.
+            self.api('setMessageReaction', chat_id=chat['id'], message_id=message['message_id'],
+                     reaction=[{'type': 'emoji', 'emoji': answer}])
+            LOG.info('telegram.reacted chat=%s source=%s', chat['id'], message['message_id'])
+            self.history.record(key, None, message['message_id'], time.time(), answer, self.params(), trace)
             return
         markup = telegram_html(answer)
         sent = self.send(key, message['message_id'], markup or answer, parse_mode='HTML' if markup else None)

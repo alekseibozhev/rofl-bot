@@ -242,6 +242,27 @@ class ConversationTests(unittest.TestCase):
         self.assertNotIn('>', bot.SETUP)
         self.assertIsNone(bot.form_of(bot.SETUP))
 
+    def test_a_plus_or_a_laugh_gets_a_reaction_not_a_line(self):
+        self.b.setup.return_value = 'Кому: User 7.\nФорма: реакция 😂.\nЗаход: поржал.'
+        request = self.message('рофл, ору')
+        self.b.handle(request)
+        self.b.generate.assert_not_called()
+        self.assertEqual(self.b.api.call_args.args, ('setMessageReaction',))
+        self.assertEqual(self.b.api.call_args.kwargs, {'chat_id': -100123, 'message_id': request['message_id'],
+                                                       'reaction': [{'type': 'emoji', 'emoji': '🤣'}]})
+        self.assertEqual(self.b.history.db.execute('SELECT id, request, content FROM answers').fetchall(),
+                         [(None, request['message_id'], '🤣')])
+        self.assertIsNone(self.b.history.db.execute("SELECT 1 FROM messages WHERE role='assistant'").fetchone())
+        # People's reactions on their own request are no reactions to the bot.
+        self.assertFalse(self.b.history.reacted(-100123, request['message_id'], 8, ['👍'], time.time()))
+        self.assertEqual(bot.reaction_of('Форма: реакция, без слов'), '🗿')
+        self.assertEqual(bot.reaction_of('Форма: реакция ❤️'), '❤')
+        self.assertEqual(bot.reaction_of('Форма: реакция 💀'), '🤣')
+        self.assertIsNone(bot.reaction_of('Форма: одна строка. Заход: его реакция 🤡'))
+        with patch('builtins.print') as printed:
+            self.b.replay(request['message_id'])
+        self.assertIn('[реакция 🤣]', [call.args[0] for call in printed.call_args_list])
+
     def test_a_line_or_two_go_typed_not_typeset(self):
         self.assertEqual(bot.casual('sudo rm rf — это вот так. Ну.'), 'sudo rm rf - это вот так. Ну')
         self.assertEqual(bot.casual('ну и...'), 'ну и...')
