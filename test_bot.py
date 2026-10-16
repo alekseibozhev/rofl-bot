@@ -222,6 +222,44 @@ class ConversationTests(unittest.TestCase):
         self.assertIn('Андрюха', self.prompt())
         self.assertIn('Сетап: Кому: User 8. Форма: одна строка.', self.prompt())
 
+    def test_an_ordered_form_comes_to_the_punchline_with_how_it_looks(self):
+        self.b.setup.return_value = 'Кому: User 8.\nФорма: батл-куплет, 12 строк.\nЗаход: хакер-недоучка.'
+        self.b.handle(self.message('бот, рэпанись батл про User 8'))
+        self.assertIn('Сетап: Кому: User 8. Форма: батл-куплет, 12 строк. Заход: хакер-недоучка. Как выглядит рэп: '
+                      '8–16 строк', self.prompt())
+        self.assertTrue(self.prompt().endswith('других деталей из переписки не приплетай.'))
+        trace = json.loads(self.b.history.db.execute("SELECT trace FROM messages WHERE role='assistant'").fetchone()[0])
+        self.assertEqual(trace['form'], 'рэп')
+        self.b.setup.return_value = '[без чата]\nКому: User 7.\nФорма: бугурт-тред.\nЗаход: сессия.'
+        self.b.handle(self.message('бот, бугурт тред про сессию'))
+        self.assertTrue(self.prompt().startswith('Просьба:'))
+        self.assertIn('Как выглядит бугурт: строки КАПСОМ', self.prompt())
+        # A reply, a word of a form in the Заход: no form.
+        self.b.setup.return_value = 'Кому: User 7.\nФорма: одна реплика, подкол.\nЗаход: его рэп про код.'
+        self.b.handle(self.message('бот, ну как?'))
+        self.assertNotIn('Как выглядит', self.prompt())
+        # The setup has no example of a form: the one it had went to every form ordered.
+        self.assertNotIn('>', bot.SETUP)
+        self.assertIsNone(bot.form_of(bot.SETUP))
+
+    def test_code_goes_to_telegram_as_code_and_the_rest_as_plain_text(self):
+        self.assertEqual(bot.telegram_html('Держи:\n```python\nif a < b & c:\n    go()\n```\nи `ls -la` <тоже>'),
+                         'Держи:\n<pre><code class="language-python">if a &lt; b &amp; c:\n    go()</code></pre>\n'
+                         'и <code>ls -la</code> &lt;тоже&gt;')
+        self.assertEqual(bot.telegram_html('```\n$ python rofl.py\n```'), '<pre><code>$ python rofl.py</code></pre>')
+        for text in ('>тумба\n>юмба', 'незакрытый ```python\nx', 'КАПСОМ\n@\nБУГУРТ'):
+            self.assertIsNone(bot.telegram_html(text))
+        self.b.generate.return_value = '```python\nwhile True: pass\n```'
+        self.b.handle(self.message('бот, скрипт напишешь?'))
+        sent = self.b.api.call_args.kwargs
+        self.assertEqual((sent['text'], sent['parse_mode']),
+                         ('<pre><code class="language-python">while True: pass</code></pre>', 'HTML'))
+        stored = self.b.history.db.execute("SELECT content FROM answers ORDER BY date DESC LIMIT 1").fetchone()[0]
+        self.assertEqual(stored, '```python\nwhile True: pass\n```')
+        self.b.generate.return_value = '>тумба\n>юмба'
+        self.b.handle(self.message('бот, гринтекст'))
+        self.assertNotIn('parse_mode', self.b.api.call_args.kwargs)
+
     def test_the_trace_keeps_the_setup(self):
         self.b.handle(self.message('бот, жги'))
         trace = json.loads(self.b.history.db.execute("SELECT trace FROM messages WHERE role='assistant'").fetchone()[0])

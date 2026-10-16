@@ -104,10 +104,10 @@ SETUP = """Ты сетапер Рофла — двачера и тролля в 
 
 Кому: тот, кому или про кого просят («объясни X», «про X»), просящего не трогай; ни о ком не просят — тот, кто пишет.
 Форма: на быстрый вопрос, подкол или «зацени» — одна-две строки; просят расписать, рассказать или доложить — паста \
-на 8–15 строк; просят конкретную форму — она и как она выглядит (гринтекст — каждая строка начинается с «>»); \
-просят известный анекдот, пасту или цитату — «как есть»: Рофл рассказывает её как она есть, своего захода не \
-добавляет, а Заход — какая именно и чем кончается; шутку уже рассказали в переписке («вот этот», прислали \
-текст) — не повторяй, одна-две строки реакции на неё.
+на 8–15 строк; просят конкретную форму — назови её так, как просят; просят известный анекдот, пасту или \
+цитату — «как есть»: Рофл рассказывает её как она есть, своего захода не добавляет, а Заход — какая именно \
+и чем кончается; шутку уже рассказали в переписке («вот этот», прислали текст) — не повторяй, одна-две строки \
+реакции на неё.
 Заход: одна мысль, что обыграть. Просят про конкретное — картинку, вопрос, человека — мысль про это, \
 чат не приплетай; иначе — за какую деталь из чата зацепиться. Факты о людях — только из переписки: выдуманное примут \
 за правду; материала мало — стёб над этим. Приложена картинка — опиши, что на ней смешного: Рофл её не видит. \
@@ -117,6 +117,29 @@ SETUP = """Ты сетапер Рофла — двачера и тролля в 
 поставь [без чата]: Рофл тогда увидит только просьбу. Про людей чата тег не ставь."""
 
 ALONE = '[без чата]'
+
+# How an ordered form looks, for the punchline only: the one form the setup had an example of, greentext, went
+# to a rap battle. A list in the setup would draw it to the forms where nobody asks for them, like the topics.
+FORMS = (
+    ('гринтекст', re.compile(r'(?i)гринтекст'), 'каждая строка начинается с «>», без пробела после него; история от '
+     'первого лица, короткие строки, в конце поворот.'),
+    ('бугурт', re.compile(r'(?i)бугурт'), 'строки КАПСОМ, между ними отдельная строка «@»; ситуация с каждой строкой '
+     'нагнетается и в конце срывается в абсурд.'),
+    ('рэп', re.compile(r'(?i)(?<!\w)р[эе]п(?:а|ом|чик)?(?!\w)|куплет|батл|фристайл'),
+     '8–16 строк, рифма парами или перекрёстная, ровный ритм, панч в конце строки; без «>» и без кавычек. '
+     'Батл бьёт по оппоненту, по его деталям из переписки.'),
+    ('стих', re.compile(r'(?i)стих|стиш|поэм|частушк'), 'размер и рифма; частушка — четыре строки.'),
+    ('код', re.compile(r'(?i)(?<!\w)код|скрипт|питон|python|bash'),
+     'один блок ```язык с кодом, который работает, и пара строк текста вне блока; вывод, будто ты его запустил, — '
+     'отдельным блоком ```.'),
+)
+
+
+def form_of(setup):
+    """The form the setup orders, by its «Форма» line, as (name, how it looks), or None."""
+    line = re.search(r'Форма:(.*?)(?:Заход:|$)', ' '.join(setup.split()))
+    return next(((name, looks) for name, words, looks in FORMS if line and words.search(line[1])), None)
+
 
 RUDE, SHRUG, FAILED = ('пошёл нахуй', 'ладно, братва',
                        'Не получилось ответить — модель сейчас не отвечает. Попробуй ещё раз чуть позже.')
@@ -312,6 +335,21 @@ def text_of(content):
 
 def clip(text, limit):
     return text if len(text) <= limit else text[:limit].rstrip() + '…'
+
+
+def telegram_html(text):
+    """An answer with code as Telegram HTML: ```blocks``` and `inline` code; None for one without, it goes as is."""
+    if not re.search(r'```[^\n]*\n.*?```|`[^`\n]+`', text, re.S):
+        return None
+    parts = re.split(r'(```[^\n]*\n.*?```)', text, flags=re.S)
+    for n, part in enumerate(parts):
+        if n % 2:
+            language, _, code = part[3:-3].partition('\n')
+            lang = f' class="language-{html.escape(language.strip())}"' if language.strip() else ''
+            parts[n] = f'<pre><code{lang}>{html.escape(code.rstrip(), quote=False)}</code></pre>'
+        else:
+            parts[n] = re.sub(r'`([^`\n]+)`', r'<code>\1</code>', html.escape(part, quote=False))
+    return ''.join(parts)
 
 
 MEDIA = (('photo', 'фото'), ('video', 'видео'), ('animation', 'гифка'), ('video_note', 'кружок'),
@@ -1001,6 +1039,9 @@ class Bot:
                 # of it. A setup tagged so gets the punchline the request alone.
                 alone = ALONE in setup
                 brief = ' '.join(setup.replace(ALONE, '').split()).rstrip('.')
+                # The setup names an ordered form, the punchline is told how it looks: it went by the name alone.
+                form = form_of(setup)
+                looks = f' Как выглядит {form[0]}: {form[1]}' if form else ''
                 # Whom to jab and how long is the setup's: in one line, and the prompt ends on who answers, or the
                 # model goes on with the chat log.
                 if alone:
@@ -1011,12 +1052,12 @@ class Bot:
                         "SELECT raw FROM messages WHERE chat=? AND topic=? AND role='user' AND id >= ? AND id <= ? "
                         'ORDER BY id', (*key, message['message_id'], through))], names)
                     prompt = ('Просьба:\n\n' + '\n\n'.join(request) + f'\n\nОна адресована тебе, пишет '
-                              f'{person_label(sender)}. Сетап: {brief}. Ты — Рофл: ответь от первого лица, одной '
-                              'репликой, на заход сетапа.')
+                              f'{person_label(sender)}. Сетап: {brief}.{looks} Ты — Рофл: ответь от первого лица, '
+                              'одной репликой, на заход сетапа.')
                 else:
                     prompt = (chat + f'\n\nПоследнее сообщение адресовано тебе, пишет {person_label(sender)}. '
-                              f'Сетап: {brief}. Ты — Рофл: ответь от первого лица, одной репликой, на заход сетапа; '
-                              'других деталей из переписки не приплетай.')
+                              f'Сетап: {brief}.{looks} Ты — Рофл: ответь от первого лица, одной репликой, на заход '
+                              'сетапа; других деталей из переписки не приплетай.')
                 # The log invites the model to go on with it: the answer opens with lines copied from it or with a
                 # name, «РОФЛ:», «Серёга: …». Leading lines that, name cut, are empty or already said are dropped.
                 speakers = {'Рофл', person_label(sender), *(re.split(r' → |: ', line, maxsplit=1)[0] for line in lines)}
@@ -1031,8 +1072,8 @@ class Bot:
                 answer = re.split(rf'\n\s*\n(?={name.pattern[1:]})', answer, maxsplit=1)[0]
                 answer = re.sub(r'^\\>', '>', '\n'.join(line.rstrip() for line in answer.splitlines()), flags=re.M)
                 return answer, {'setup': setup, 'context_chars': len(chat), 'lines': len(lines), 'image': bool(image),
-                                'alone': alone, 'feelings': feelings, 'morale': left,
-                                'topic': topic_hint, **spent(usage)}
+                                'alone': alone, **({'form': form[0]} if form else {}), 'feelings': feelings,
+                                'morale': left, 'topic': topic_hint, **spent(usage)}
             except RuntimeError as exc:
                 LOG.error('generation.failed %s', exc)
                 return FAILED, None
@@ -1133,7 +1174,8 @@ class Bot:
             answer, trace = self.joke(message, extra[-1]['message_id'] if extra else message['message_id'])
         if not self.history.claim_reply(key, message['message_id']):
             return
-        sent = self.send(key, message['message_id'], answer)
+        markup = telegram_html(answer)
+        sent = self.send(key, message['message_id'], markup or answer, parse_mode='HTML' if markup else None)
         if kind != 'reset':
             self.history.add(key, sent['message_id'], 'assistant', answer, sent.get('date', time.time()),
                              message['message_id'], trace=trace)
