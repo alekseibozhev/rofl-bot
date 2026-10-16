@@ -796,7 +796,10 @@ class ConversationTests(unittest.TestCase):
         other = self.message('левое сообщение', user=9)
         self.assertEqual(followups(comment, [comment, news, other]), [news])
         self.assertEqual(followups(comment, [comment, other, news]), [])
+        for text in ('тесла прыгает', 'новая тесла'):
+            self.b.handle(self.message(text, user=9))
         self.b.handle(comment, news)
+        self.assertNotIn('Тема в чате', self.b.setup.call_args.args[0])  # the morning's тесла took the news
         prompt = self.prompt()
         self.assertIn('User 8: Рофл как тебе новость ?\n\nUser 8 переслал из «Бальзам»:\nВласти выдворили', prompt)
         self.assertTrue(prompt.endswith('Последнее сообщение адресовано тебе, пишет User 8. Сетап: Кому: User 7. '
@@ -808,6 +811,9 @@ class ConversationTests(unittest.TestCase):
         self.assertEqual(self.b.generate.call_count, 1)
         stored = self.b.history.db.execute("SELECT count(*) FROM messages WHERE raw LIKE '%выдворили%'").fetchone()
         self.assertEqual(stored[0], 1)
+        with patch('builtins.print'):
+            self.b.replay(comment['message_id'])
+        self.assertIn('выдворили цыган', self.b.setup.call_args.args[0])  # the replay sees the forward too
 
     def test_collect_polls_until_quiet_and_keeps_what_arrived_on_failure(self):
         first, late = [{'update_id': 1}], [{'update_id': 2}]
@@ -917,7 +923,7 @@ class ConversationTests(unittest.TestCase):
         self.assertTrue(prompt.index('кеш-трейс') < prompt.index('ПОШЁЛ НАХУЙ') < prompt.index('рофл, рассуди'))
         self.assertIn('User 7 → User 8 «ПОШЁЛ НАХУЙ!!!»: рофл, рассуди', prompt)
         self.assertNotIn('флуд 21', prompt)
-        self.assertIn('Тема в чате сейчас: флуд.', self.b.setup.call_args.args[0])  # 60 lines of it are the chat's hottest topic
+        self.assertNotIn('Тема в чате', self.b.setup.call_args.args[0])  # a reply is about its message, not the flood
         self.assertEqual(prompt.count('флуд '), 38)
         answer_id = self.counter
         self.b.handle(self.message('бот, ещё', reply_to_message={'message_id': answer_id, 'from': {'id': 42}, 'text': 'Согласен'}))

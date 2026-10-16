@@ -1031,8 +1031,12 @@ class Bot:
                 lines, names = self.chat(key, through)
                 chat = CHAT + '\n\n'.join(lines)
                 heads = [re.split(r' → |: ', line, maxsplit=1)[0] for line in lines]
-                # A forced topic in every answer makes every answer the same: it is only offered.
-                topic_hint = self.history.next_topic(chat_id, now=None if live else date, record=live)
+                # A forced topic in every answer makes every answer the same: it is only offered. A request that
+                # brings its own material, a forward or a reply, is about it: offered the morning's «тесла», the
+                # setup made a forward about a raid on the market a kickflip of the Roadster.
+                own = through != message['message_id'] or any(
+                    message.get(field) for field in ('reply_to_message', 'forward_origin', 'photo', 'sticker'))
+                topic_hint = None if own else self.history.next_topic(chat_id, now=None if live else date, record=live)
                 hint = f'\n\n(Тема в чате сейчас: {topic_hint}. Бери, если в тему.)' if topic_hint else ''
                 # The answers off the chain are only marks in the chat: three in a row went at one «ноут с олламой».
                 # The punchline never sees them, the small model would take them for a template.
@@ -1187,8 +1191,13 @@ class Bot:
             raise RuntimeError(f'Сообщения {message_id} нет в базе')
         message = json.loads(row[0])
         print(render(row[0], self.me['id']), flush=True)
+        # What its author sent right after came with it, as in `handle`: a comment without its forward is a riddle.
+        later = [json.loads(raw) for raw, in self.history.db.execute(
+            "SELECT raw FROM messages WHERE chat=? AND topic=? AND role='user' AND id > ? ORDER BY id LIMIT 10",
+            (message['chat']['id'], topic_of(message), message_id))]
+        extra = followups(message, later)
         for run in range(1, runs + 1):
-            answer, trace = self.joke(message, message_id, live=False)
+            answer, trace = self.joke(message, extra[-1]['message_id'] if extra else message_id, live=False)
             print(f'\n— прогон {run}', flush=True)
             if trace:
                 print(f'Сетап: {trace["setup"]}')
