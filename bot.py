@@ -103,8 +103,7 @@ SETUP = """Ты сетапер Рофла — двачера и тролля в 
 
 Кому: тот, кому или про кого просят («объясни X», «про X»), просящего не трогай; ни о ком не просят — тот, кто пишет.
 Форма: на быстрый вопрос, подкол или «зацени» — одна-две строки; просят расписать, рассказать или доложить — паста \
-на 8–15 строк; Рофлу только поддакнули или поржали и словами отвечать незачем — «реакция» и сразу само эмодзи, которое Рофл поставит; просят \
-конкретную форму — назови её так, как просят; просят известный анекдот, пасту или \
+на 8–15 строк; просят конкретную форму — назови её так, как просят; просят известный анекдот, пасту или \
 цитату — «как есть»: Рофл расскажет её как есть, без своего захода, а в Заходе — какая именно и чем кончается; \
 шутку уже рассказали в переписке («вот этот», прислали текст) — не повторяй, ответь на неё одной-двумя строками.
 Заход: одна мысль, что обыграть. Просят про конкретное — картинку, вопрос, человека — мысль про это, \
@@ -113,36 +112,38 @@ SETUP = """Ты сетапер Рофла — двачера и тролля в 
 
 Просят что-то своё (анекдот, стих, объяснение), сменить тему, забыть или не трогать кого-то — выполни, а не \
 обыгрывай, к старой шутке не возвращайся и первой строкой поставь [без чата]: Рофл тогда увидит только просьбу. \
-Про людей чата тег не ставь."""
+Про людей чата тег не ставь.
 
-ALONE = '[без чата]'
+Рофла в обращении всерьёз обзывают или посылают — первой строкой поставь [обида]: у него от этого портится менталка.
+
+Рофлу только поддакнули или поржали и словами отвечать незачем — первой строкой поставь [реакция X], где X — \
+эмодзи, которое Рофл поставит на сообщение; остальные строки тогда не нужны.
+
+Просят гринтекст, бугурт, рэп или батл, стих или код — первой строкой поставь тег этой формы: [гринтекст], [бугурт], \
+[рэп], [стих] или [код]. Не просят — тег не ставь."""
+
+ALONE, OFFENDED = '[без чата]', '[обида]'
 CHAT = 'Переписка чата, старые сообщения сверху:\n\n'
 
 # How an ordered form looks, for the punchline only: the one form the setup had an example of, greentext, went
-# to a rap battle. A list in the setup would draw it to the forms where nobody asks for them, like the topics.
-FORMS = (
-    ('гринтекст', re.compile(r'(?i)гринтекст'), 'каждая строка начинается с «>», без пробела после него; история от '
-     'первого лица, короткие строки, в конце поворот.'),
-    ('бугурт', re.compile(r'(?i)бугурт'), 'строки КАПСОМ, между ними отдельная строка «@»; ситуация с каждой строкой '
-     'нагнетается и в конце срывается в абсурд.'),
-    ('рэп', re.compile(r'(?i)(?<!\w)р[эе]п(?:а|ом|чик)?(?!\w)|куплет|батл|фристайл'),
-     '8–16 строк, рифма парами или перекрёстная, ровный ритм, панч в конце строки; без «>» и без кавычек. '
-     'Батл бьёт по оппоненту, по его деталям из переписки.'),
-    ('стих', re.compile(r'(?i)стих|стиш|поэм|частушк'), 'размер и рифма; частушка — четыре строки.'),
-    ('код', re.compile(r'(?i)(?<!\w)код|скрипт|питон|python|bash'),
-     'один блок ```язык с кодом, который работает, и пара строк текста вне блока; вывод, будто ты его запустил, — '
-     'отдельным блоком ```.'),
-)
-
-
-def form_line(setup):
-    line = re.search(r'Форма:(.*?)(?:Заход:|$)', ' '.join(setup.split()))
-    return line[1] if line else ''
+# to a rap battle. The setup orders a form by its tag: the words of its «Форма» gave «без гринтекста» a greentext.
+FORMS = {
+    'гринтекст': 'каждая строка начинается с «>», без пробела после него; история от первого лица, короткие строки, '
+                 'в конце поворот.',
+    'бугурт': 'строки КАПСОМ, между ними отдельная строка «@»; ситуация с каждой строкой нагнетается и в конце '
+              'срывается в абсурд.',
+    'рэп': '8–16 строк, рифма парами или перекрёстная, ровный ритм, панч в конце строки; без «>» и без кавычек. '
+           'Батл бьёт по оппоненту, по его деталям из переписки.',
+    'стих': 'размер и рифма; частушка — четыре строки.',
+    'код': 'один блок ```язык с кодом, который работает, и пара строк текста вне блока; вывод, будто ты его '
+           'запустил, — отдельным блоком ```.',
+}
+TAG = re.compile(r'\[(без чата|обида|реакция|' + '|'.join(FORMS) + r')([^\]\n]*)\]')
 
 
 def form_of(setup):
-    """The form the setup orders, by its «Форма» line, as (name, how it looks), or None."""
-    return next(((name, looks) for name, words, looks in FORMS if words.search(form_line(setup))), None)
+    """The form the setup orders by its tag, as (name, how it looks), or None."""
+    return next(((tag[1], FORMS[tag[1]]) for tag in TAG.finditer(setup) if tag[1] in FORMS), None)
 
 
 # The emoji a bot may react with; the model's own 😂 is not one of them.
@@ -152,15 +153,14 @@ REACTIONS = tuple('👍 👎 ❤ 🔥 🥰 👏 😁 🤔 🤯 😱 🤬 😢 �
 
 
 def reaction_of(setup):
-    """The emoji to put on the request when the setup answers it with a reaction, or None.
+    """The emoji to put on the request when the setup tags it for a reaction, or None.
 
-    «+», «ору» or praise got a line of the model each: people put a reaction on such or keep quiet. The form
-    begins with it and has no lines: «одна-две строки реакции на анекдот» and «реакция, одна-две строки» are lines.
-    The emoji is the first one from the form on: the setup puts it in «Заход» as often."""
-    line = form_line(setup)
-    if not re.match(r'(?i)\W*реакц', line) or 'строк' in line:
+    «+», «ору» or praise got a line of the model each: people put a reaction on such or keep quiet. The emoji is
+    the first one from the tag on: the setup may put it after the tag."""
+    tag = next((tag for tag in TAG.finditer(setup) if tag[1] == 'реакция'), None)
+    if not tag:
         return None
-    rest = re.sub('[😂💀😹]', '🤣', setup.partition('Форма:')[2].replace('\ufe0f', ''))  # «ору» a bot may not put
+    rest = re.sub('[😂💀😹]', '🤣', (tag[2] + setup[tag.end():]).replace('\ufe0f', ''))  # «ору» a bot may not put
     return min(((rest.find(e), -len(e), e) for e in REACTIONS if e in rest), default=(0, 0, '🗿'))[2]
 
 
@@ -175,11 +175,9 @@ SAD = ('никто меня не любит, пидоры', 'ну и пошли 
 BUTT_IN = ('Тебя давно не звали, а тебе скучно. Вклинься в разговор сам, одной репликой: подколи кого-нибудь '
            'по последним сообщениям.')
 
-# Менталка is the morale of Disco Elysium, as much as Психика + 2: angry reactions, insults in the requests and the
-# requests past `Bot.patience` take a point each, kind reactions give one back; what is older than two hours is
+# Менталка is the morale of Disco Elysium, as much as Психика + 2: angry reactions, insults in the requests (the
+# setup hears them, `OFFENDED`) and the requests past `Bot.patience` take a point each, kind reactions give one back; what is older than two hours is
 # forgotten. At zero the bot breaks down, in caps, and starts afresh.
-INSULT = re.compile(r'(?i)(?<!\w)(?:нахуй|нахер|заткнись|завали|отъебись|отвали|отстань|съебись|тупой|тупая|долбо\w*'
-                    r'|дебил\w*|идиот\w*|говно\w*|хуйня|хуйню|бесишь|задолбал\w*|пидор\w*|у[её]бок|чмо|клоун)(?!\w)')
 BREAKDOWN = 'ВЫ МНЕ МЕНТАЛКУ НЕ ПОРТИТЕ!!!'
 MELTDOWN = ('У тебя кончилась менталка: {why}. Сорвись: истерика капсом на 4–8 строк, как анонская паста '
             '(«НА ГЛАГНУ РАТЬ АНОНСКАЯ ВОШЛА!!!»), с «ВЫ МНЕ МЕНТАЛКУ НЕ ПОРТИТЕ!!!», наедь на тех, кто довёл.')
@@ -201,7 +199,7 @@ READ = ('{who} Утро, ты читаешь новости про себя за
         'строками: на первой её номер и «+» или «−» — тебе от неё хорошо или хреново; на второй — что ты о ней '
         'думаешь, от первого лица, одной фразой.')
 REPOST = '{who}\n\nНовость: {title}\n\n{code}{feelings}Ты репостишь её в чат: обшути одной-двумя строками{through}.'
-SNIPPETS = ('DAWN = ', 'RUDE, SHRUG, FAILED = ', '    rude = ', 'def plan(', 'INSULT = ')
+SNIPPETS = ('DAWN = ', 'RUDE, SHRUG, FAILED = ', '    rude = ', 'def plan(', 'MELTDOWN = ')
 # How the attributes show, low (1–2) and high (5–6); in the middle they do not.
 MOODS = {'Интеллект': ('тупит', 'умничает'), 'Психика': ('на взводе, обижается на всё', 'непрошибаемый'),
          'Физиология': ('разбитый, мак греется', 'бодрый'), 'Моторика': ('тормозит', 'шустрый')}
@@ -220,17 +218,6 @@ HOURS = (6,) * 4 + tuple(range(7, 24))
 
 # Reactions to the bot's answers: now and then an angry one gets a comeback, a kind one is taken in stride.
 ANGRY = ('👎', '🤬', '🤮', '💩', '🤡', '🥱', '🖕', '😡', '💔', '🤨', '😐', '😴')
-
-# One topic per answer, only one the chat talks about: a fixed list in the hint makes a small model put
-# all of it, beer first, in every joke. These gather their words: «тачку», «тачки» count for «тачки».
-TOPICS = ('бабы', 'игры', 'тачки', 'качалка', 'футбол', 'туса с корешами', 'мамка', 'район', 'бухло', 'работа')
-
-# The chat's own topics are counted, not asked from the model: a crude stem («тачку», «тачками» → «тачк»)
-# is enough to see which words people keep repeating.
-WORD = re.compile(r'[а-яёa-z]+')
-ENDINGS = re.compile(r'(?:ами|ями|ого|его|ому|ему|ыми|ими|ах|ях|ов|ев|ей|ой|ий|ый|ая|яя|ое|ее|ые|ие|ую|юю|ом|ем|ам|ям'
-                     r'|[аяоеуюыиь])$')
-
 
 def sheet(day):
     """The bot's character on a date: the attributes, 1 to 6, and the moon's age in days."""
@@ -291,53 +278,6 @@ def spent(usage):
     """What the model calls of one answer cost, summed for its trace."""
     return {k: round(sum(call.get(k) or 0 for call in usage), 6)
             for k in ('prompt_tokens', 'output_tokens', 'cost', 'elapsed_s')}
-
-
-def stem(word):
-    return ENDINGS.sub('', word.lower().replace('ё', 'е'))[:6]
-
-
-STOP = frozenset(map(stem, '''
-это этот эта эти этого этом этой этим этих этими того тому теми тоже также такой такая такое такие таких таким
-такую такого какой какая какое какие каких каким какую тебя тебе тобой твой твоя твое твои меня мной мой моя мое
-мои наша наше наши ваша ваше ваши свой своя свое свои себя себе него нему ними если когда чтобы потому поэтому
-только просто вообще сейчас щас будет будут буду будешь будем было были была есть нету очень опять почему зачем
-тогда потом теперь здесь туда сюда откуда который которая которое которые которых можно нужно надо нельзя хочу
-хочешь хочет хотел знаю знаешь знает знал думаю думаешь думал сказал сказала говорю говорит говорил делать делаю
-делает сделать сделал сделаю через после перед между всех всем всего всегда весь ничего нибудь типа вроде короче
-кароче короч кстати конечно реально наверное может можешь могу могут ладно давай давайте спасибо привет пока
-здорово норм нормально хорошо плохо круто прикольно точно правда сразу даже ведь хоть хотя пусть пускай будто
-около более менее самый самая самое самые сама само сами много мало немного больше меньше один одна одно одни
-двух первый второй разве куда давно недавно скоро сегодня вчера завтра утром вечером ночью день дела дело время
-года люди человек ребята пацаны народ блин блять блядь нахуй похуй пиздец хуйня хуйню хули нихуя дохуя ебать ебал
-ебаный нахер похер пофиг нахрен ахах ахаха хаха хахах ахахах смотри смотрю видел видишь вижу понял поняла понятно
-слушай слышь стал стала стало стать кажется видимо значит чето чего чему зато либо ваще чтоли штоли рофл
-'''.split()))
-
-
-def words(text):
-    """The content words of a text by stem, each with the form it was written in."""
-    found = {}
-    for word in WORD.findall(re.sub(r'@\w+|https?://\S+', ' ', text.lower())):
-        key = stem(word)
-        if len(word) >= 4 and len(key) >= 3 and key not in STOP:
-            found.setdefault(key, word)
-    return found
-
-
-def worn(said, names=()):
-    """The words the bot played on in two of its answers `said` or more, as written: «тумба юмба» went into
-    four answers of an evening, the «не повторяй» over the last three did not hold it. A name of the people is
-    no gag: it goes into every answer, «Кирилл» as a word written with a capital letter inside a sentence."""
-    skip = set().union(*(words(name) for name in names))
-    for text in said:
-        skip.update(*(words(name) for name in re.findall(r'(?<=[a-zа-яё,] )[A-ZА-ЯЁ]\w+', text)))
-    count, forms = Counter(), {}
-    for text in said:
-        for key, form in words(text).items():
-            count[key] += 1
-            forms.setdefault(key, form)
-    return [forms[key] for key, n in count.items() if n >= 2 and key not in skip]
 
 
 def person_label(person):
@@ -489,7 +429,6 @@ class History:
             chat INTEGER, username TEXT, name TEXT, PRIMARY KEY (chat, username))''')
         self.db.execute('''CREATE TABLE IF NOT EXISTS replies (
             chat INTEGER, topic INTEGER, id INTEGER, PRIMARY KEY (chat, topic, id))''')
-        self.db.execute('CREATE TABLE IF NOT EXISTS hints (chat INTEGER, topic TEXT, used REAL)')
         # Metrics: the answers with the settings they were made on, and what people put on them. Kept for good,
         # unlike the messages: the settings change every few days and are judged by weeks of reactions.
         self.db.execute('''CREATE TABLE IF NOT EXISTS answers (
@@ -603,60 +542,6 @@ class History:
                                (*key, before, date - window, *CANNED, count)).fetchall()
         return [content for (content,) in reversed(rows)]
 
-    def next_topic(self, chat, half_life=3600, now=None, record=True):
-        """The hottest topic of the chat, with penalties so that none holds it all day; None in a quiet chat.
-
-        A word scores a point for every message of people with it and loses one for every answer of the
-        bot with it. Every time a hint gives a topic its score is multiplied by 0.3, so even the hottest one
-        gives way after a few answers. All of it fades with `half_life`. A word becomes a topic once two
-        messages have it; names of the people never do. Base topics only gather their words: a topic the
-        chat does not talk about would be dragged into every joke.
-        """
-        now = now or time.time()
-        since = now - 6 * half_life
-
-        def fade(date):
-            return 0.5 ** ((now - date) / half_life)
-
-        heat, said, forms, names = Counter(), Counter(), {}, set()
-        for role, content, raw, date in self.db.execute(
-                'SELECT role, content, raw, date FROM messages WHERE chat=? AND date >= ? AND date <= ?', (chat, since, now)):
-            if role == 'assistant':
-                said.update(dict.fromkeys(words(content or ''), fade(date)))
-                continue
-            message = json.loads(raw)
-            names.update(words(person_label(sender_of(message))))
-            for key, form in words(message.get('text') or message.get('caption') or '').items():
-                heat[key] += fade(date)
-                forms.setdefault(key, Counter())[form] += 1
-        for (name,) in self.db.execute('''SELECT name FROM people WHERE chat=:chat
-                UNION SELECT username FROM people WHERE chat=:chat''', {'chat': chat}):
-            names.update(words(name or ''))
-        topics = {topic: set(words(topic)) for topic in TOPICS}
-        covered = set().union(*topics.values())
-        for key, seen in forms.items():
-            if seen.total() >= 2 and key not in names | covered:
-                topics[seen.most_common(1)[0][0]] = {key}
-        used = [(set(words(topic)), fade(date)) for topic, date in
-                self.db.execute('SELECT topic, used FROM hints WHERE chat=? AND used >= ?', (chat, since))]
-
-        def score(topic):
-            keys = topics[topic]
-            if sum(forms[key].total() for key in keys if key in forms) < 2:
-                return 0
-            heat_left = sum(heat[key] - said[key] for key in keys)
-            return heat_left * 0.3 ** sum(weight for used_keys, weight in used if used_keys & keys) if heat_left > 0 else heat_left
-
-        topic = max(topics, key=lambda topic: (score(topic), random.random()))
-        if score(topic) <= 0:
-            return None
-        if not record:
-            return topic
-        with self.db:
-            self.db.execute('INSERT INTO hints VALUES (?, ?, ?)', (chat, topic, now))
-            self.db.execute('DELETE FROM hints WHERE chat=? AND used < ?', (chat, since))
-        return topic
-
     def needs(self, chat, now):
         """Hours since the bot and since people last wrote in the chat and the topic they last wrote in; None for
         a chat nobody wrote in for a week."""
@@ -670,15 +555,16 @@ class History:
         return (now - (spoke or 0)) / 3600, (now - wrote) / 3600, topic
 
     def strain(self, chat, since):
-        """What wore the bot down after `since`: kind and angry reactions on it, the requests to it as (who, text)."""
+        """What wore the bot down after `since`: kind and angry reactions on it, the requests to it as (who,
+        whether the setup heard an insult in it)."""
         emoji = [e for (value,) in self.db.execute('SELECT emoji FROM reactions WHERE chat=? AND date > ?',
                                                    (chat, since)) for e in json.loads(value)]
         angry = sum(e in ANGRY for e in emoji)
         requests = []
-        for (raw,) in self.db.execute('''SELECT m.raw FROM answers a JOIN messages m ON m.chat=a.chat AND m.topic=a.topic
-                AND m.id=a.request WHERE a.chat=? AND m.date > ? AND m.raw IS NOT NULL''', (chat, since)):
-            message = json.loads(raw)
-            requests.append((person_label(sender_of(message)), message.get('text') or message.get('caption') or ''))
+        for raw, insult in self.db.execute('''SELECT m.raw, json_extract(a.trace, '$.insult') FROM answers a
+                JOIN messages m ON m.chat=a.chat AND m.topic=a.topic AND m.id=a.request
+                WHERE a.chat=? AND m.date > ? AND m.raw IS NOT NULL''', (chat, since)):
+            requests.append((person_label(sender_of(json.loads(raw))), bool(insult)))
         return len(emoji) - angry, angry, requests
 
     def breakdown(self, chat, since):
@@ -1012,7 +898,7 @@ class Bot:
     def joke(self, message, through, live=True):
         """The answer and how it was made: the setup.
 
-        Not `live` (a replay) it sends no typing, records no topic hint and is never just rude.
+        Not `live` (a replay) it sends no typing, never breaks down and is never just rude.
         """
         chat_id, topic = message['chat']['id'], topic_of(message)
         key, sender, date = (chat_id, topic), sender_of(message), message.get('date', time.time())
@@ -1031,22 +917,13 @@ class Bot:
                 lines, names = self.chat(key, through)
                 chat = CHAT + '\n\n'.join(lines)
                 heads = [re.split(r' → |: ', line, maxsplit=1)[0] for line in lines]
-                # A forced topic in every answer makes every answer the same: it is only offered. A request that
-                # brings its own material, a forward or a reply, is about it: offered the morning's «тесла», the
-                # setup made a forward about a raid on the market a kickflip of the Roadster.
-                own = through != message['message_id'] or any(
-                    message.get(field) for field in ('reply_to_message', 'forward_origin', 'photo', 'sticker'))
-                topic_hint = None if own else self.history.next_topic(chat_id, now=None if live else date, record=live)
-                hint = f'\n\n(Тема в чате сейчас: {topic_hint}. Бери, если в тему.)' if topic_hint else ''
-                # The answers off the chain are only marks in the chat: three in a row went at one «ноут с олламой».
-                # The punchline never sees them, the small model would take them for a template.
-                recent = self.history.said(key, through, date, count=6)
-                said = [clip(' '.join(text.split()), 200) for text in recent[-3:]]
-                said = ('\n\nРофл недавно ответил, не повторяй ни детали, ни заход, ни построение:\n'
+                # The answers off the chain are only marks in the chat: three in a row went at one «ноут с олламой»,
+                # «тумба юмба» went into four of an evening. The punchline never sees them, the small model would take
+                # them for a template.
+                said = [clip(' '.join(text.split()), 200) for text in self.history.said(key, through, date, count=6)]
+                said = ('\n\nРофл недавно ответил, не повторяй ни детали, ни заход, ни построение; что он обыгрывал '
+                        'не раз, заезжено, не бери, даже если чат об этом:\n'
                         + '\n'.join(f'- {text}' for text in said)) if said else ''
-                gags = worn(recent, [*names.values(), *heads])
-                said += (f'\n\nУже заезжено, Рофл обыгрывал это не раз: {", ".join(gags)}. Не бери, даже если чат '
-                         'об этом.') if gags else ''
                 # Only a model that takes images gets one: the local one would fail on it.
                 image = self.openrouter and self.image(message)
                 asker = f'\n\nПоследнее сообщение адресовано Рофлу, пишет {person_label(sender)}.'
@@ -1061,18 +938,27 @@ class Bot:
                 mood = (f'\n\n({feelings} Это фон, не тема: держи в тоне, вслух — только к слову или если спросят, '
                         'как он.)' if feelings else '')
                 setup = self.setup(seeing + mood + said + asker
-                                   + ('\n\nКартинка, о которой речь, приложена.' if image else '') + hint,
+                                   + ('\n\nКартинка, о которой речь, приложена.' if image else ''),
                                    typing, topic, image)
                 setup = ' '.join(setup.split()).rstrip('.')
                 trace = {'setup': setup, 'context_chars': len(chat), 'lines': len(lines), 'image': bool(image),
-                         'feelings': feelings, 'morale': left, 'topic': topic_hint}
+                         'feelings': feelings, 'morale': left}
+                if OFFENDED in setup:
+                    trace['insult'] = True
+                    setup = ' '.join(setup.replace(OFFENDED, '').split())
+                    if live:
+                        left, top, why = self.morale(chat_id, date, message, insulted=True)
+                        trace['morale'] = left
+                        if left <= 0:
+                            LOG.info('meltdown chat=%s message=%s morale=%s/%s', chat_id, message['message_id'], left, top)
+                            return self.meltdown(chat_id, topic, date, why)
                 reaction = reaction_of(setup)
                 if reaction:
                     return reaction, {**trace, 'reaction': True, **spent(usage)}
                 # «Расскажи анекдот» after an evening of one gag got the gag back: the punchline saw the chat full
                 # of it. A setup tagged so gets the punchline the request alone.
                 alone = ALONE in setup
-                brief = ' '.join(setup.replace(ALONE, '').split()).rstrip('.')
+                brief = ' '.join(TAG.sub('', setup).split()).rstrip('.')
                 # The setup names an ordered form, the punchline is told how it looks: it went by the name alone.
                 form = form_of(setup)
                 looks = f' Как выглядит {form[0]}: {form[1]}' if form else ''
@@ -1129,15 +1015,15 @@ class Bot:
     def interest(self, chat):
         return self.interests.get(chat, 'ai')
 
-    def morale(self, chat, now, message=None):
-        """The менталка left, its top and what wore it down; `message` is the request being answered. The news of
-        the morning gives a point or takes one."""
+    def morale(self, chat, now, message=None, insulted=False):
+        """The менталка left, its top and what wore it down; `message` is the request being answered, `insulted`
+        whether the setup heard an insult in it. The news of the morning gives a point or takes one."""
         day = datetime.date.fromtimestamp(now)
         top = nerve(day)
         kind, angry, requests = self.history.strain(chat, max(now - 7200, self.history.stamp(f'meltdown {chat}')))
         if message:
-            requests.append((person_label(sender_of(message)), message.get('text') or message.get('caption') or ''))
-        insulted = [who for who, text in requests if INSULT.search(text)]
+            requests.append((person_label(sender_of(message)), insulted))
+        insulted = [who for who, insult in requests if insult]
         pestered = max(0, len(requests) - self.patience)
         news = self.history.news(day, self.interest(chat))
         why = '; '.join(([f'обзывали: {", ".join(dict.fromkeys(insulted))}'] if insulted else [])
