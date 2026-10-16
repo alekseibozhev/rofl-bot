@@ -328,6 +328,21 @@ def words(text):
     return found
 
 
+def worn(said, names=()):
+    """The words the bot played on in two of its answers `said` or more, as written: «тумба юмба» went into
+    four answers of an evening, the «не повторяй» over the last three did not hold it. A name of the people is
+    no gag: it goes into every answer, «Кирилл» as a word written with a capital letter inside a sentence."""
+    skip = set().union(*(words(name) for name in names))
+    for text in said:
+        skip.update(*(words(name) for name in re.findall(r'(?<=[a-zа-яё,] )[A-ZА-ЯЁ]\w+', text)))
+    count, forms = Counter(), {}
+    for text in said:
+        for key, form in words(text).items():
+            count[key] += 1
+            forms.setdefault(key, form)
+    return [forms[key] for key, n in count.items() if n >= 2 and key not in skip]
+
+
 def person_label(person):
     name = person.get('title') or ' '.join(filter(None, [person.get('first_name'), person.get('last_name')]))
     return name or (f'@{person["username"]}' if person.get('username') else 'Аноним')
@@ -1051,6 +1066,10 @@ class Bot:
                 said = [clip(' '.join(text.split()), 200) for text in self.history.said(key, through, date)]
                 said = ('\n\nРофл недавно ответил, не повторяй ни детали, ни заход, ни построение:\n'
                         + '\n'.join(f'- {text}' for text in said)) if said else ''
+                gags = worn(self.history.said(key, through, date, count=6),
+                            [*names.values(), *(re.split(r' → |: ', line, maxsplit=1)[0] for line in lines)])
+                said += (f'\n\nУже заезжено, Рофл обыгрывал это не раз: {", ".join(gags)}. Не бери, даже если чат '
+                         'об этом.') if gags else ''
                 # Only a model that takes images gets one: the local one would fail on it.
                 image = self.openrouter and self.image(message)
                 asker = f'\n\nПоследнее сообщение адресовано Рофлу, пишет {person_label(sender)}.'

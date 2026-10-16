@@ -337,6 +337,18 @@ class ConversationTests(unittest.TestCase):
         self.assertNotIn('пошёл нахуй', setup)  # a canned answer is no joke to avoid
         self.assertNotIn('недавно ответил', self.prompt())  # the punchline would take it for a template
 
+    def test_a_gag_played_twice_is_worn_and_a_name_never(self):
+        for answer in ('тумба юмба - твой реп, User', 'ну ты и мастер, User 7', 'опять тумба юмба, Кирюх, сидишь'):
+            self.b.handle(self.message('бот, а дальше?'))
+            self.assertNotIn('заезжено', self.b.setup.call_args.args[0])  # once is a callback
+            self.b.generate.return_value = answer  # the answer to the next request
+        self.b.handle(self.message('бот, а дальше?'))  # answered with the third
+        self.b.handle(self.message('бот, а теперь?'))
+        setup = self.b.setup.call_args.args[0]
+        self.assertIn('Уже заезжено, Рофл обыгрывал это не раз: тумба, юмба. Не бери, даже если чат об этом.', setup)
+        self.assertNotIn('заезжено', self.prompt())
+        self.assertEqual(bot.worn(['привет, Кирилл, тумба', 'Кирилл, ну, Кирилл: тумба']), ['тумба'])
+
     def test_an_answer_to_a_message_of_the_chain_goes_whole(self):
         photo = self.message('', caption='рофл, зацени мем', photo=[{'file_id': 'f', 'width': 9, 'height': 9}])
         self.b.generate.return_value = 'трансы — Трансформеры'
