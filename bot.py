@@ -111,10 +111,12 @@ SYSTEM = """Ты Рофл — двачер и тролль в чате коре�
 # everyone as well or better: the joke is born while writing. What the code needs to know comes as tags.
 SETUP = """Ты разметчик чата Рофла — двачера и тролля в чате корешей. Последнее сообщение адресовано Рофлу; ответ \
 напишет он сам. Ты ответ не пишешь, не пересказываешь и не советуешь: ставишь только теги из списка ниже, \
-каждый в квадратных скобках, — и больше ничего. Ни один не подходит — ответь «нет».
+каждый в своих квадратных скобках, — и больше ничего. Ни один не подходит — ответь «нет».
 
-[без чата] — просят что-то своё (анекдот, стих, объяснение), сменить тему, забыть или не трогать кого-то: Рофл \
-тогда увидит только просьбу, без переписки. Про людей чата этот тег не ставь.
+[без чата] — просят своё, не про этот чат: анекдот, стих или объяснение о чём-то вне переписки, сменить тему, \
+забыть или не трогать кого-то. Рофл тогда увидит только просьбу, без переписки. Просьба про чат или людей в нём — \
+навести суету, потегать, доложить обстановку, прожарить кого-то — этот тег не получает. Рядом с тегом формы он \
+стоит, только если форма о чём-то вне чата.
 
 [обида] — Рофла в обращении всерьёз обзывают или посылают: у него от этого портится менталка. Без тега обида не \
 засчитается.
@@ -170,10 +172,13 @@ def wanted_of(setup):
 # own copies the text out of the search: the setup that searched itself squeezed the paste into a line.
 READER = 'Ты находишь тексты в интернете и выписываешь их дословно, без своих шуток и пересказа.'
 # Only what people repeat: «опа, у меня тоже есть птички» is funny by itself, the battle round retold killed it.
+# The original whole: a reader that brought three lines of the Bush paste got a two-line answer back (#339914).
+# Of two versions of a paste it takes the best known one.
 FIND = ('Найди в интернете: {wanted}\n\nОтветь так:\nЧто повторяют: дословно то, что люди повторяют как мем. '
-        'Паста, цитата, песня — сам текст, длинный — самое узнаваемое, до 15 строк. Мем-фраза — только сама фраза, '
-        'без текста, откуда она.\nКак обыгрывают: одна-две строки — когда и как её вставляют.\n\nДословно не '
-        'нашёл — ответь одним словом НЕТ, не сочиняй.')
+        'Паста, цитата, песня — сам текст целиком, как его постят, своими словами не пересказывай; длинный — самая '
+        'узнаваемая часть подряд, 10–15 строк. Вариантов несколько — бери самый известный. Мем-фраза — только сама '
+        'фраза, без текста, откуда она.\nКак обыгрывают: одна-две строки — когда и как её вставляют.\n\nВ найденном '
+        'нет ничего похожего — ответь одним словом НЕТ, не сочиняй.')
 
 
 def tagged_of(setup, people):
@@ -933,9 +938,11 @@ class Bot:
         found, or no search on the local model."""
         if not self.openrouter:
             return None
+        # It thinks a little: without it the reader said НЕТ 5 times of 6 over sources that held the Bush paste,
+        # with «low» it copied the paste out 6 times of 6.
         try:
             found = self.generate([{'role': 'user', 'content': FIND.format(wanted=wanted)}], chat_id=chat_id,
-                                  system=READER, temperature=0.3, search=True)
+                                  system=READER, temperature=0.3, search=True, effort='low')
         except RuntimeError as exc:
             LOG.warning('find.failed %s', exc)
             return None
@@ -1046,7 +1053,8 @@ class Bot:
                 card = f'Что просят ({wanted}), из интернета:\n{found}\n\n' if found else ''
                 # How long: «распиши» answered with one line and a quick jab with a paste when the length was drawn
                 # at random. A form and an original have a length of their own.
-                length = (' Распиши на 8–15 строк.' if long else '' if form or found else ' Одна-две строки.')
+                # A paste came as nine one-liners under blank lines (#339898): the cleanup adds none, the model did.
+                length = (' Распиши на 8–15 строк, строки одна под другой, пустая строка только между абзацами.' if long else '' if form or found else ' Одна-две строки.')
                 # The prompt ends on who answers, or the model goes on with the chat log.
                 task = (f'пишет {person_label(sender)}.{looks}{tagging}'
                         + (' Бери найденное узнаваемо и не пересказывай, откуда оно.' if found else '')

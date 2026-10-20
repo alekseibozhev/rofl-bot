@@ -214,9 +214,11 @@ class ConversationTests(unittest.TestCase):
         self.assertIn('не пересказывай, откуда оно', self.prompt())
         self.assertNotIn('[найти', self.prompt())
         self.assertEqual(self.b.api.call_args.kwargs['text'], 'Опа')
-        found['text'] = 'НЕТ.'  # not found: nothing made up goes on
+        found['text'], calls = 'НЕТ.', self.b.generate.call_count  # not found: nothing made up goes on
         self.b.handle(self.message('бот, ещё'))
         self.assertNotIn('из интернета', self.prompt())
+        searches = [(call.kwargs.get('search'), call.kwargs.get('effort')) for call in self.b.generate.call_args_list[calls:]]
+        self.assertEqual(searches, [(True, 'low'), (None, 'high')])  # the reader thinks a little: it found more
         self.b.openrouter, calls = False, self.b.generate.call_count  # the local model has no search
         self.b.handle(self.message('бот, ну'))
         self.assertEqual([call.kwargs.get('search') for call in self.b.generate.call_args_list[calls:]], [None])
@@ -234,6 +236,8 @@ class ConversationTests(unittest.TestCase):
 
     def test_the_setup_asks_for_tags_only_and_thinks_not(self):
         self.assertIn('ставишь только теги', bot.SETUP)
+        self.assertIn('навести суету', bot.SETUP)  # a request about the chat keeps the chat (#339900)
+        self.assertIn('10–15 строк', bot.FIND)  # the original whole, not three lines of it (#339914)
         for gone in ('Кому:', 'Форма:', 'Заход:'):
             self.assertNotIn(gone, bot.SETUP)
         self.b.generate = Mock(return_value='[рэп]')
@@ -250,7 +254,8 @@ class ConversationTests(unittest.TestCase):
     def test_a_paste_is_asked_long_and_a_line_short(self):
         self.b.setup.return_value = '[паста]'
         self.b.handle(self.message('бот, доложи обстановку'))
-        self.assertTrue(self.prompt().endswith('пишет User 7. Распиши на 8–15 строк. Ответь одной репликой.'))
+        self.assertTrue(self.prompt().endswith('пишет User 7. Распиши на 8–15 строк, строки одна под другой, '
+                                                 'пустая строка только между абзацами. Ответь одной репликой.'))
         self.b.setup.return_value = 'нет'
         self.b.handle(self.message('бот, ну'))
         self.assertTrue(self.prompt().endswith('пишет User 7. Одна-две строки. Ответь одной репликой.'))
