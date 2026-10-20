@@ -245,6 +245,30 @@ class ConversationTests(unittest.TestCase):
         self.b.handle(self.message('бот, ну'))
         self.assertEqual([call.kwargs.get('search') for call in self.b.generate.call_args_list[calls:]], [None])
 
+    def test_a_meme_named_gets_the_writer_a_few_lines_of_what_it_is(self):
+        # «бомбардиро крокадило и тун тун сахур устроили протесты» the writer knew not and went at the asker (#339991).
+        self.assertEqual(bot.wanted_of('[без чата] [справка тун тун сахур]'), ('справка', 'тун тун сахур'))
+        self.assertEqual(bot.wanted_of('[найти паста Жириновский]'), ('найти', 'паста Жириновский'))
+        self.assertIsNone(bot.wanted_of('[справка] справка тун тун сахур'))  # nothing to look for, a word is no tag
+        self.assertIn('строка с многоточием', bot.SETUP)  # the opening of a paste is found, not a form (#339995)
+        self.assertIn('в шутку не тащишь', bot.SYSTEM)  # the setup brought is played on, not the asker roasted
+        self.b.openrouter = True
+        about = 'Тун тун сахур — итальянский брейнрот: деревянное существо с битой.'
+        self.b.generate.side_effect = lambda messages, **kwargs: about if kwargs.get('search') else 'Опа'
+        self.b.setup.return_value = '[справка тун тун сахур]'
+        self.b.rude = 1  # never on a request with a reference
+        self.b.handle(self.message('бот, тун тун сахур устроил погромы во франции'))
+        search = self.b.generate.call_args_list[0]
+        self.assertIn('Найди в интернете, что это: тун тун сахур', search.args[0][0]['content'])
+        self.assertIn('2–4 строки', search.args[0][0]['content'])
+        self.assertEqual((search.kwargs['system'], search.kwargs['effort']), (bot.READER, 'low'))
+        self.assertTrue(self.prompt().startswith(f'Что это (тун тун сахур), из интернета:\n{about}\n\n'))
+        self.assertIn('справку не пересказывай', self.prompt())
+        self.assertIn('Одна-две строки', self.prompt())  # a reference is no paste: the answer keeps its length
+        self.assertNotIn('не пересказывай, откуда оно', self.prompt())
+        trace = json.loads(self.b.history.db.execute('SELECT trace FROM answers').fetchone()[0])
+        self.assertEqual((trace['kind'], trace['wanted'], trace['found']), ('справка', 'тун тун сахур', True))
+
     def test_every_joke_is_thought_through_and_without_thinking_when_it_runs_dry(self):
         self.b.effort = 'high'
         self.b.setup.return_value = '[рэп]'
@@ -483,12 +507,20 @@ class ConversationTests(unittest.TestCase):
         [writer] = self.b.generate.call_args.args[0]
         self.assertEqual(writer['content'][1], {'type': 'image_url', 'image_url': {'url': image}})  # sees it itself
         meme = self.message('', caption='зацени', photo=photo, user=8)
+        asked = self.message('рофл, смешно?', reply_to_message=meme)
         with patch('bot.fetch', return_value=b'jpeg'):
-            self.b.handle(meme, self.message('рофл, смешно?', reply_to_message=meme))
+            self.b.handle(meme, asked)
         self.assertEqual(files[-1], 'mid')  # the photo replied to
         self.assertIn('В исходном сообщении есть фото, оно приложено.', self.b.setup.call_args.args[0])
         self.assertIn('В исходном сообщении есть фото, оно приложено.', self.prompt())
         self.assertNotIn('само изображение ты не видишь', self.prompt())
+        # A replay sees the picture as live did (#339991), and says so under the request it prints with «не видишь».
+        self.b.setup.reset_mock()
+        with patch('bot.fetch', return_value=b'jpeg'), patch('builtins.print') as printed:
+            self.b.replay(asked['message_id'])
+        self.assertEqual(self.b.setup.call_args.args[3], image)
+        self.assertEqual(self.b.generate.call_args.args[0][0]['content'][1]['image_url']['url'], image)
+        self.assertIn('Теги: нет; картинка приложена', [call.args[0] for call in printed.call_args_list])
         self.b.openrouter = False  # the local model takes no picture and is told it does not see one
         self.b.handle(meme, self.message('рофл, а так?', reply_to_message=meme))
         self.assertIsInstance(self.b.generate.call_args.args[0][0]['content'], str)

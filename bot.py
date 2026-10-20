@@ -93,7 +93,7 @@ def post(url, payload, timeout=60, direct=False, headers=None):
         raise RuntimeError('Некорректный JSON в ответе сервиса') from None
 
 
-SYSTEM = """Ты Рофл — двачер и тролль в чате корешей. Твоя цель — развлекать чат, чтобы все ржали. Роастишь людей из чата и цепляешься к деталям из того, что они сами писали. Мемы, отсылки, цитаты, пасты, чёрный и абсурдный юмор, мат. Эмодзи изредка, не хвостом в конце каждой реплики.
+SYSTEM = """Ты Рофл — двачер и тролль в чате корешей. Твоя цель — развлекать чат, чтобы все ржали. Принесли заход — абсурдную посылку, мем, картинку — это и есть тема: подхватываешь и раскручиваешь её дальше, а того, кто принёс, в шутку не тащишь. Захода нет или просят прожарить — роастишь людей из чата и цепляешься к деталям из того, что они сами писали. Мемы, отсылки, цитаты, пасты, чёрный и абсурдный юмор, мат. Эмодзи изредка, не хвостом в конце каждой реплики.
 
 Пишешь как человек в чате, а не как текст: имя в начало не ставишь — ответ и так реплаем; шутку не строишь на «это \
 не X, а Y»; просьбу и указания не пересказываешь («держи», «принял», «докладываю») — сразу к делу. Людей зовёшь \
@@ -138,7 +138,11 @@ SETUP = """Ты разметчик чата Рофла — двачера и т�
 
 [найти …] с тем, что искать, внутри скобок — просят конкретный текст (пасту, цитату, песню, анекдот) или ответ в \
 стиле, на мотив, по шаблону конкретного мема или строчки, например [найти паста Жириновский «это другие ребята»]. \
-Рофл получит оригинал: по памяти такие тексты путаются."""
+Цитируют начало или кусок известной пасты, стиха, мема — «дополни», «продолжи» или просто строка с многоточием — это \
+тоже [найти] с этой строкой, а не тег формы. Рофл получит оригинал: по памяти такие тексты путаются.
+
+[справка …] с тем, что это, внутри скобок — в последнем сообщении назван мем, персонаж или отсылка, например \
+[справка тун тун сахур, бомбардиро крокодило] — все названные. Рофл получит пару строк о том, что это и откуда."""
 
 ALONE, OFFENDED, ABOUT = '[без чата]', '[обида]', '[о себе]'
 CHAT = 'Переписка чата, старые сообщения сверху:\n\n'
@@ -156,7 +160,7 @@ FORMS = {
     'код': 'один блок ```язык с кодом, который работает, и пара строк текста вне блока; вывод, будто ты его '
            'запустил, — отдельным блоком ```.',
 }
-TAG = re.compile(r'\[(без чата|обида|реакция|о себе|тег|найти|паста|' + '|'.join(FORMS) + r')([^\]\n]*)\]')
+TAG = re.compile(r'\[(без чата|обида|реакция|о себе|тег|найти|справка|паста|' + '|'.join(FORMS) + r')([^\]\n]*)\]')
 
 
 def form_of(setup):
@@ -165,8 +169,10 @@ def form_of(setup):
 
 
 def wanted_of(setup):
-    """What the setup wants found by «[найти …]», or None."""
-    return next((tag[2].strip() for tag in TAG.finditer(setup) if tag[1] == 'найти' and tag[2].strip()), None)
+    """What the setup wants found, as (kind, what), or None: «[найти …]» an original, «[справка …]» what a meme
+    named in the request is."""
+    return next(((tag[1], tag[2].strip()) for tag in TAG.finditer(setup)
+                 if tag[1] in ('найти', 'справка') and tag[2].strip()), None)
 
 
 # The original of a paste, a quote or a meme the setup wants found, for the punchline. From memory the model mixed
@@ -182,6 +188,11 @@ FIND = ('Найди в интернете: {wanted}\n\nОтветь так:\nЧ�
         'узнаваемая часть подряд, 10–15 строк. Вариантов несколько — бери самый известный. Мем-фраза — только сама '
         'фраза, без текста, откуда она.\nКак обыгрывают: одна-две строки — когда и как её вставляют.\n\nВ найденном '
         'нет ничего похожего — ответь одним словом НЕТ, не сочиняй.')
+# What a meme named in a request is: asked about «бомбардиро крокадило и тун тун сахур устроили протесты во франции»
+# (#339991), the writer knew neither and went at the asker, «Леха, ты…», in the live answer and three replays.
+ABOUT_MEME = ('Найди в интернете, что это: {wanted}\n\nОтветь в 2–4 строки: что это, откуда пошло, как выглядит и '
+              'как его обыгрывают. Без шуток и оценок.\n\nВ найденном нет ничего похожего — ответь одним словом НЕТ, '
+              'не сочиняй.')
 
 
 def tagged_of(setup, people):
@@ -962,15 +973,16 @@ class Bot:
         return self.generate([{'role': 'user', 'content': with_image(chat, image)}], chat_id=chat_id, topic=topic,
                              system=SETUP, temperature=0.7)
 
-    def find(self, wanted, chat_id=None):
-        """The original of what the setup wants found, as the reader copied it out of the search, or None: not
-        found, or no search on the local model."""
+    def find(self, wanted, chat_id=None, kind='найти'):
+        """The original of what the setup wants found, or for «справка» a few lines of what it is, as the reader
+        copied it out of the search, or None: not found, or no search on the local model."""
         if not self.openrouter:
             return None
         # It thinks a little: without it the reader said НЕТ 5 times of 6 over sources that held the Bush paste,
         # with «low» it copied the paste out 6 times of 6.
         try:
-            found = self.generate([{'role': 'user', 'content': FIND.format(wanted=wanted)}], chat_id=chat_id,
+            ask = (ABOUT_MEME if kind == 'справка' else FIND).format(wanted=wanted)
+            found = self.generate([{'role': 'user', 'content': ask}], chat_id=chat_id,
                                   system=READER, temperature=0.3, search=True, effort='low')
         except RuntimeError as exc:
             LOG.warning('find.failed %s', exc)
@@ -1079,15 +1091,20 @@ class Bot:
                 manner = tone(datetime.date.fromtimestamp(date))
                 tagging = (f' Тегнуты: {", ".join(dict.fromkeys(people[user] for user in tagged))} — обращайся к ним '
                            'по этим именам, @ не пиши.' if tagged else '')
-                found = self.find(wanted, typing) if wanted else None
-                card = f'Что просят ({wanted}), из интернета:\n{found}\n\n' if found else ''
+                kind, wanted = wanted or (None, None)
+                found = self.find(wanted, typing, kind) if wanted else None
+                # A reference is for the writer, not an original to give: it keeps its length.
+                reference = found and kind == 'справка'
+                card = (f'{"Что это" if reference else "Что просят"} ({wanted}), из интернета:\n{found}\n\n'
+                        if found else '')
                 # How long: «распиши» answered with one line and a quick jab with a paste when the length was drawn
                 # at random. A form and an original have a length of their own.
                 # A paste came as nine one-liners under blank lines (#339898): the cleanup adds none, the model did.
-                length = (' Распиши на 8–15 строк, строки одна под другой, пустая строка только между абзацами.' if long else '' if form or found else ' Одна-две строки.')
+                length = (' Распиши на 8–15 строк, строки одна под другой, пустая строка только между абзацами.' if long else '' if form or (found and not reference) else ' Одна-две строки.')
                 # The prompt ends on who answers, or the model goes on with the chat log.
                 task = (f'пишет {person_label(sender)}.{looks}{tagging}'
-                        + (' Бери найденное узнаваемо и не пересказывай, откуда оно.' if found else '')
+                        + (' Что это — тебе для понимания, справку не пересказывай.' if reference else
+                           ' Бери найденное узнаваемо и не пересказывай, откуда оно.' if found else '')
                         + (f' {manner}' if manner else '') + f'{length} Ответь одной репликой')
                 if about:
                     # Asked about the bot, it answers from the card of what it knows of itself.
@@ -1128,7 +1145,7 @@ class Bot:
                 # Typed, not typeset: «—» and a period at the end gave the bot away in 33 and 19 answers of 37.
                 answer = answer if form else casual(answer)
                 return answer, {**trace, 'alone': alone, 'about': about, 'tone': manner,
-                                **({'wanted': wanted, 'found': bool(found)} if wanted else {}),
+                                **({'wanted': wanted, 'kind': kind, 'found': bool(found)} if wanted else {}),
                                 **({'tagged': tagged} if tagged else {}), **({'form': form[0]} if form else {}),
                                 **spent(usage)}
             except RuntimeError as exc:
@@ -1224,7 +1241,9 @@ class Bot:
             answer, trace = self.joke(message, extra[-1]['message_id'] if extra else message_id, live=False)
             print(f'\n— прогон {run}', flush=True)
             if trace:
-                print(f'Теги: {trace["tags"] or "нет"}')
+                # The header above is the request as the chat shows it, «ты не видишь» under a photo included: the
+                # picture went to both models all the same, as live (#339991), and the line says so.
+                print(f'Теги: {trace["tags"] or "нет"}' + ('; картинка приложена' if trace.get('image') else ''))
             print(f'[реакция {answer}]' if trace and trace.get('reaction') else envelope(answer, trace))
 
     def respond(self, message, kind, extra=()):
