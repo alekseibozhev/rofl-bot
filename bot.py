@@ -111,11 +111,12 @@ SYSTEM = """Ты Рофл — двачер и тролль в чате коре�
 # everyone as well or better: the joke is born while writing. What the code needs to know comes as tags.
 SETUP = """Ты разметчик чата Рофла — двачера и тролля в чате корешей. Последнее сообщение адресовано Рофлу; ответ \
 напишет он сам. Ты ответ не пишешь, не пересказываешь и не советуешь: ставишь только теги из списка ниже, \
-каждый в своих квадратных скобках, — и больше ничего. Ни один не подходит — ответь «нет».
+каждый в своих квадратных скобках, — и больше ничего. Ни один не подходит — ответь «нет». Теги — о последнем \
+сообщении, о том, что просят в нём самом; переписка выше только помогает его понять.
 
 [без чата] — просят своё, не про этот чат: анекдот, стих или объяснение о чём-то вне переписки, сменить тему, \
 забыть или не трогать кого-то. Рофл тогда увидит только просьбу, без переписки. Просьба про чат или людей в нём — \
-навести суету, потегать, доложить обстановку, прожарить кого-то — этот тег не получает. Рядом с тегом формы он \
+навести суету, доложить обстановку, прожарить кого-то — этот тег не получает. Рядом с тегом формы он \
 стоит, только если форма о чём-то вне чата.
 
 [обида] — Рофла в обращении всерьёз обзывают или посылают: у него от этого портится менталка. Без тега обида не \
@@ -126,12 +127,14 @@ SETUP = """Ты разметчик чата Рофла — двачера и т�
 
 [о себе] — спрашивают про самого Рофла: как он, что помнит, как устроен, что читал.
 
-[тег Имя, Имя] с именами, как они в переписке, или [тег все] — просят тегнуть, позвать или потегать людей.
+[тег Имя, Имя] с именами, как они в переписке, или [тег все] — только если в последнем сообщении просят тегнуть, \
+позвать или потегать людей.
 
 [гринтекст], [бугурт], [рэп], [стих] или [код] — просят эту форму: батл — это [рэп], частушка — [стих]. Не просят — \
 тег формы не ставь.
 
-[паста] — просят расписать, рассказать или доложить: ответ на 8–15 строк вместо одной-двух.
+[паста] — только если в последнем сообщении просят расписать, рассказать или доложить: ответ на 8–15 строк \
+вместо одной-двух.
 
 [найти …] с тем, что искать, внутри скобок — просят конкретный текст (пасту, цитату, песню, анекдот) или ответ в \
 стиле, на мотив, по шаблону конкретного мема или строчки, например [найти паста Жириновский «это другие ребята»]. \
@@ -190,6 +193,15 @@ def tagged_of(setup, people):
         return []
     asked = {name.strip().lower() for name in tag[2].split(',')}
     return [user for user, name in people.items() if 'все' in asked or name.lower() in asked]
+
+
+def envelope(answer, trace):
+    """What goes to Telegram: the answer with the @ of the people tagged before it. The history keeps the answer
+    alone, both models read it: after two answers opening on «@anstol @antoha_gs …» the setup tagged everyone at «Рофл,
+    я программировал бота, а запрограммировался Андрей» (#339988), and the writer went on «раз тебя тегать не по чину»
+    (#339987)."""
+    tagged = (trace or {}).get('tagged')
+    return ' '.join(f'@{user}' for user in tagged) + '\n' + answer if tagged else answer
 
 
 # The emoji a bot may react with; the model's own 😂 is not one of them.
@@ -502,6 +514,23 @@ class History:
             chat INTEGER, id INTEGER, user INTEGER, emoji TEXT, date REAL, PRIMARY KEY (chat, id, user))''')
         self.db.execute('''CREATE TABLE IF NOT EXISTS news (
             day TEXT, interest TEXT, title TEXT, link TEXT, mood INTEGER, thought TEXT, PRIMARY KEY (day, interest))''')
+        self.untag()
+
+    def untag(self):
+        """Take the line of @ off the answers kept before it went only to Telegram: `tagged` in the trace says which
+        line the code put there. Run on every start, it finds nothing on the second: what the bot of the old code
+        kept until its restart comes off too. Returns how many rows it fixed."""
+        fixed = 0
+        with self.db:
+            for chat, topic, id_, trace in self.db.execute('''SELECT chat, topic, id, trace FROM answers
+                    WHERE id IS NOT NULL AND json_extract(trace, '$.tagged') IS NOT NULL''').fetchall():
+                line = ' '.join(f'@{user}' for user in json.loads(trace)['tagged']) + '\n'
+                for table, where in (('answers', 'chat=? AND id=?'),
+                                     ('messages', "chat=? AND topic=? AND id=? AND role='assistant'")):
+                    keys = (chat, id_) if table == 'answers' else (chat, topic, id_)
+                    fixed += self.db.execute(f'''UPDATE {table} SET content=substr(content, ?) WHERE {where}
+                        AND substr(content, 1, ?) = ?''', (len(line) + 1, *keys, len(line), line)).rowcount
+        return fixed
 
     def remember(self, chat, *people):
         with self.db:
@@ -995,12 +1024,13 @@ class Bot:
                 chat = CHAT + '\n\n'.join(lines)
                 heads = [re.split(r' → |: ', line, maxsplit=1)[0] for line in lines]
                 # The answers off the chain are only marks in the chat: three in a row went at one «ноут с олламой»,
-                # «тумба юмба» went into four of an evening. The punchline sees them as a list not to repeat, both
-                # the setup and it judge what is worn.
+                # «тумба юмба» went into four of an evening. The punchline sees them as a list not to repeat and judges
+                # what is worn. The setup does not: its tags are of the last message, and after two answers opening on
+                # the line of @ it tagged everyone at «я программировал бота, а запрограммировался Андрей» (#339988).
                 answers = [clip(' '.join(text.split()), 200) for text in self.history.said(key, through, date, count=6)]
-                said = lambda who, he: ((f'\n\n{who} недавно ответил, не повторяй ни детали, ни заход, ни построение; '
-                                         f'что {he} обыгрывал не раз, заезжено, не бери, даже если чат об этом:\n'
-                                         + '\n'.join(f'- {text}' for text in answers)) if answers else '')
+                said = (('\n\nТы недавно ответил, не повторяй ни детали, ни заход, ни построение; что ты обыгрывал не '
+                         'раз, заезжено, не бери, даже если чат об этом:\n' + '\n'.join(f'- {text}' for text in answers))
+                        if answers else '')
                 # Only a model that takes images gets one: the local one would fail on it.
                 image = self.openrouter and self.image(message)
                 asker = f'\n\nПоследнее сообщение адресовано Рофлу, пишет {person_label(sender)}.'
@@ -1017,7 +1047,7 @@ class Bot:
                 # and the morning's news into three answers of four. The punchline gets it asked about the bot.
                 feelings = self.feelings(chat_id, date, message)
                 # The setup says what the code needs to know, in tags; whatever else it wrote is dropped unread.
-                setup = self.setup(seeing + said('Рофл', 'он') + asker
+                setup = self.setup(seeing + asker
                                    + ('\n\nКартинка, о которой речь, приложена.' if image else ''),
                                    typing, topic, image)
                 tags = ' '.join(tag[0] for tag in TAG.finditer(setup))
@@ -1071,10 +1101,10 @@ class Bot:
                                       for (raw,) in self.history.db.execute(
                         "SELECT raw FROM messages WHERE chat=? AND topic=? AND role='user' AND id >= ? AND id <= ? "
                         'ORDER BY id', (*key, message['message_id'], through))], names)
-                    prompt = (card + 'Просьба:\n\n' + '\n\n'.join(request) + said('Ты', 'ты')
+                    prompt = (card + 'Просьба:\n\n' + '\n\n'.join(request) + said
                               + f'\n\nОна адресована тебе, {task}.')
                 else:
-                    prompt = (card + seeing + said('Ты', 'ты')
+                    prompt = (card + seeing + said
                               + f'\n\nПоследнее сообщение адресовано тебе, {task}.')
                 # The log invites the model to go on with it: the answer opens with lines copied from it or with a
                 # name, «РОФЛ:», «Серёга: …». Leading lines that, name cut, are empty or already said are dropped.
@@ -1097,7 +1127,6 @@ class Bot:
                 answer = re.sub(r'^\\>', '>', '\n'.join(line.rstrip() for line in answer.splitlines()), flags=re.M)
                 # Typed, not typeset: «—» and a period at the end gave the bot away in 33 and 19 answers of 37.
                 answer = answer if form else casual(answer)
-                answer = ' '.join(f'@{user}' for user in tagged) + '\n' + answer if tagged else answer
                 return answer, {**trace, 'alone': alone, 'about': about, 'tone': manner,
                                 **({'wanted': wanted, 'found': bool(found)} if wanted else {}),
                                 **({'tagged': tagged} if tagged else {}), **({'form': form[0]} if form else {}),
@@ -1196,7 +1225,7 @@ class Bot:
             print(f'\n— прогон {run}', flush=True)
             if trace:
                 print(f'Теги: {trace["tags"] or "нет"}')
-            print(f'[реакция {answer}]' if trace and trace.get('reaction') else answer)
+            print(f'[реакция {answer}]' if trace and trace.get('reaction') else envelope(answer, trace))
 
     def respond(self, message, kind, extra=()):
         chat = message['chat']
@@ -1221,8 +1250,9 @@ class Bot:
             LOG.info('telegram.reacted chat=%s source=%s', chat['id'], message['message_id'])
             self.history.record(key, None, message['message_id'], time.time(), answer, self.params(), trace)
             return
-        markup = telegram_html(answer)
-        sent = self.send(key, message['message_id'], markup or answer, parse_mode='HTML' if markup else None)
+        text = envelope(answer, trace)
+        markup = telegram_html(text)
+        sent = self.send(key, message['message_id'], markup or text, parse_mode='HTML' if markup else None)
         if kind != 'reset':
             self.history.add(key, sent['message_id'], 'assistant', answer, sent.get('date', time.time()),
                              message['message_id'])

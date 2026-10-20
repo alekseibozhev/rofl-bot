@@ -198,6 +198,28 @@ class ConversationTests(unittest.TestCase):
         self.assertEqual(self.b.api.call_args.kwargs['text'], '@antoha_gs @anton_k @oxgrb\nСогласен')  # no bots
         trace = json.loads(self.b.history.db.execute('SELECT trace FROM answers ORDER BY id DESC').fetchone()[0])
         self.assertEqual(trace['tagged'], ['antoha_gs', 'anton_k', 'oxgrb'])
+        # The line of @ goes to Telegram only: kept, it was copied, and the setup tagged everyone unasked (#339988).
+        stored = self.b.history.db.execute("SELECT content FROM messages WHERE role='assistant'").fetchall()
+        self.assertEqual(stored, [('Согласен',), ('Согласен',)])
+        self.assertEqual(self.b.history.db.execute('SELECT DISTINCT content FROM answers').fetchall(), [('Согласен',)])
+        self.b.setup.return_value = 'нет'
+        self.b.handle(self.message('бот, а теперь?', reply_to_message={'message_id': self.counter, 'from': {'id': 42}}))
+        self.assertNotIn('@', self.prompt())  # neither in what it said nor in the chain
+
+    def test_the_line_of_at_comes_off_the_answers_kept_with_it_once(self):
+        key, line = (-100123, 0), '@antoha_gs @oxgrb\n'
+        for id_, content, trace in ((2, line + 'подъём', {'tagged': ['antoha_gs', 'oxgrb']}),
+                                    (4, '@oxgrb\nне тот', {'tagged': ['antoha_gs']}),  # not the line the code put
+                                    (6, '@antoha_gs\nсам', None)):  # tagged by the model, not by the code
+            self.b.history.add(key, id_, 'assistant', content, time.time(), id_ - 1)
+            self.b.history.record(key, id_, id_ - 1, time.time(), content, {}, trace)
+        self.assertEqual(self.b.history.untag(), 2)  # the answer and the message of #2
+        self.assertEqual(self.b.history.untag(), 0)
+        self.b.history.db.close()
+        self.b.history = History(self.path)  # it runs on start
+        for table in ('answers', 'messages'):
+            rows = self.b.history.db.execute(f'SELECT content FROM {table} ORDER BY id').fetchall()
+            self.assertEqual(rows, [('подъём',), ('@oxgrb\nне тот',), ('@antoha_gs\nсам',)])
 
     def test_the_setup_wants_an_original_found_and_the_punchline_gets_it(self):
         self.b.openrouter = True
@@ -384,22 +406,23 @@ class ConversationTests(unittest.TestCase):
         self.assertIn('    2    1', report)
         self.assertIn('Огонь:\n  👍2 👎1', report)
 
-    def test_recent_answers_off_the_chain_go_to_both_as_said(self):
+    def test_recent_answers_off_the_chain_go_to_the_writer_as_said(self):
         self.b.handle(self.message('бот, оцени ноут'))
         self.b.rude = 1
         self.b.handle(self.message('бот, ещё'))
         self.b.rude = 0
         self.b.handle(self.message('бот, а теперь?'))
-        setup = self.b.setup.call_args.args[0]
-        self.assertIn('Рофл недавно ответил, не повторяй ни детали, ни заход, ни построение; что он обыгрывал не раз, '
-                      'заезжено, не бери, даже если чат об этом:\n- Согласен\n\n', setup)
-        self.assertNotIn('пошёл нахуй', setup)  # a canned answer is no joke to avoid
+        self.assertIn('Ты недавно ответил, не повторяй ни детали, ни заход, ни построение; что ты обыгрывал не раз, '
+                      'заезжено, не бери, даже если чат об этом:\n- Согласен\n\n', self.prompt())
+        self.assertNotIn('пошёл нахуй', self.prompt())  # a canned answer is no joke to avoid
         for n in range(7):
             self.b.generate.return_value = f'тумба юмба {n}'
             self.b.handle(self.message('бот, а дальше?'))
-        said = self.b.setup.call_args.args[0].partition('даже если чат об этом:\n')[2]
-        self.assertEqual(said.count('тумба юмба'), 6)  # what is worn the setup sees for itself
-        # The writer gets it too, the chat above it and the task last: the joke is its to make.
+        # The setup tags the last message: the answers of the bot are none of its business.
+        setup = self.b.setup.call_args.args[0]
+        self.assertNotIn('недавно ответил', setup)
+        self.assertNotIn('тумба юмба', setup)
+        # The writer judges what is worn, the chat above it and the task last: the joke is its to make.
         prompt = self.prompt()
         self.assertIn('Ты недавно ответил, не повторяй ни детали, ни заход, ни построение; что ты обыгрывал не раз, '
                       'заезжено, не бери, даже если чат об этом:\n- тумба юмба', prompt)
