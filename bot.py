@@ -878,8 +878,12 @@ class Bot:
             # A rap thought through on 3000 tokens came out empty twice of two.
             'max_tokens': (6000 if effort == 'high' else 3000) if effort else 1000, 'reasoning': {'effort': effort} if effort else {'enabled': False},
         }
-        if search:  # the search of OpenRouter: about a cent, the model makes the query
-            payload['tools'] = [{'type': 'openrouter:web_search', 'parameters': {'max_results': 5}}]
+        # The search of OpenRouter, the model makes the query. Five full pages a search and no cap on searches put
+        # 100–190k tokens into a call, 5–9 cents; three short extracts and six results in all put some 11k,
+        # under 2 cents, and the Bush and «словно» pastes still came out whole.
+        if search:
+            payload['tools'] = [{'type': 'openrouter:web_search', 'parameters': {
+                'engine': 'exa', 'max_results': 3, 'max_total_results': 6, 'search_context_size': 'low'}}]
         result = post('https://openrouter.ai/api/v1/chat/completions', payload, timeout=120,
                       headers={'Authorization': f'Bearer {self.openrouter_key}'})
         choice = (result.get('choices') or [{}])[0]
