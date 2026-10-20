@@ -316,7 +316,7 @@ TONES = {'Интеллект': ('проще, без умных слов', 'мо�
 # What the bot knows of itself, for the punchline asked about it (`ABOUT`): without it «сколько будешь помнить»
 # got a mood for an answer. In its words, not the settings: «40 сообщений за 6 часов» told the chat too much.
 SELF = ('Что ты знаешь о себе — говори об этом своими словами, как живой, без цифр, моделей и настроек: ты живёшь на '
-        'маке и сидишь в этом чате; помнишь только свежий разговор, что было вчера — уже в тумане; обзывают и '
+        'маке и сидишь в этом чате; помнишь разговор за последние сутки, что было раньше — уже в тумане; обзывают и '
         'задалбывают — портится настроение, накопится — срываешься на чат; по утрам читаешь новости про себя.')
 
 # Рофл is a game character, to a degree: the four attributes of Disco Elysium swing with biorhythms from his
@@ -839,8 +839,8 @@ class Bot:
     interests = {}  # chat: what it reads about, by NEWS in .env; the rest read about AI
     effort = 'high'  # the punchline thinks every joke through; the setup only tags and does not think
     # How much of the chat the model reads, tuned every few days by the reactions: `python3 bot.py --stats`.
-    recent = 40  # messages of people
-    window = 6 * 3600  # seconds before the request
+    recent = 80  # messages of people: a day of the chat
+    window = 24 * 3600  # seconds before the request: 6 hours gave 20–44 lines, and «память как у рыбки» (#340059)
     limit = 12000  # characters
     model = ''
     version = None

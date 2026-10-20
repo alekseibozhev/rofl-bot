@@ -472,7 +472,7 @@ class ConversationTests(unittest.TestCase):
         rows = self.b.history.db.execute('SELECT user, emoji FROM reactions ORDER BY user').fetchall()
         self.assertEqual(rows, [(8, '["🔥", "😂"]'), (9, '["🤡"]')])
         report = bot.report(self.b.history.db)
-        self.assertIn('60 сообщ · 6 ч · 12000 симв', report)
+        self.assertIn('60 сообщ · 24 ч · 12000 симв', report)
         self.assertIn('    2    1', report)
         self.assertIn('Огонь:\n  👍2 👎1', report)
 
@@ -1083,6 +1083,7 @@ class ConversationTests(unittest.TestCase):
         self.assertEqual(self.b.history.context((-100123, 5))[-1], 'User 9:\n' + 'y' * 6500)  # whole, over the limit
 
     def test_context_is_reply_chain_plus_the_last_lines(self):
+        self.b.recent = 40
         oracle = {'message_id': 1, 'from': {'id': 99, 'first_name': 'oracle'}, 'text': 'ТЗ: кеш-трейс'}
         alex = self.message('Укажи после какого пункта @andrew_k таранить', reply_to_message=oracle)
         self.b.handle(alex)
@@ -1104,17 +1105,17 @@ class ConversationTests(unittest.TestCase):
         self.assertIn('Рофл → User 7: Согласен\n\nUser 7 → Рофл: бот, ещё', prompt)
         self.assertIn('кеш-трейс', prompt)
 
-    def test_background_is_six_hours_and_the_chain_is_however_old(self):
-        self.store(1, 'качаю инженерку в вове', date=time.time() - 9 * 3600, name='Алексей')
-        self.b.history.add((-100123, 0), 2, 'assistant', 'Инженерка для крыс 🐀', time.time() - 9 * 3600, 1)
-        self.store(3, 'вчерашняя задача на пять пунктов', date=time.time() - 7 * 3600, name='oracle')
+    def test_background_is_a_day_and_the_chain_is_however_old(self):
+        self.store(1, 'качаю инженерку в вове', date=time.time() - 30 * 3600, name='Алексей')
+        self.b.history.add((-100123, 0), 2, 'assistant', 'Инженерка для крыс 🐀', time.time() - 30 * 3600, 1)
+        self.store(3, 'вчерашняя задача на пять пунктов', date=time.time() - 25 * 3600, name='oracle')
         self.store(4, 'Нормально кринжа насрал', date=time.time() - 3600, name='Kirill')
         self.counter = 10
         self.b.handle(self.message('бот, что скажешь в своё оправдание?',
                                    reply_to_message={'message_id': 2, 'from': {'id': 42}, 'text': 'Инженерка для крыс 🐀'}))
         self.assertIn('сверху:\n\nАлексей: качаю инженерку в вове\n\nРофл → Алексей: Инженерка для крыс 🐀\n\n'
                       'Kirill: Нормально кринжа насрал\n\nUser 7 → Рофл «Инженерка для крыс 🐀»: бот, что скажешь', self.prompt())
-        self.assertNotIn('вчерашняя задача', self.prompt())  # older than six hours and not in the chain
+        self.assertNotIn('вчерашняя задача', self.prompt())  # older than a day and not in the chain
         self.b.handle(self.message('бот, а ты?'))
         self.assertNotIn('качаю инженерку', self.prompt())  # the old chain stays with the request it belonged to
 
