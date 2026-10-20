@@ -22,7 +22,7 @@ class ConversationTests(unittest.TestCase):
         self.b.history = History(self.path)
         self.b.generate = Mock(return_value='Согласен')
         self.b.rude = 0
-        self.b.setup = Mock(return_value='Кому: User 7.\nФорма: одна строка.')
+        self.b.setup = Mock(return_value='нет')
         self.counter = 0
         self.b.api = Mock(side_effect=self.send)
         self.b.read = Mock()  # no news from the network unless a test asks
@@ -41,7 +41,8 @@ class ConversationTests(unittest.TestCase):
 
     def prompt(self):
         [message] = self.b.generate.call_args.args[0]
-        return message['content']
+        content = message['content']
+        return content if isinstance(content, str) else content[0]['text']  # a picture goes after the text
 
     def store(self, message_id, text, topic=0, date=None, name='User 9'):
         self.b.history.add_message((-100123, topic), {'message_id': message_id, 'date': date or time.time(),
@@ -178,7 +179,7 @@ class ConversationTests(unittest.TestCase):
         trace = json.loads(self.b.history.db.execute('SELECT trace FROM answers ORDER BY date DESC, id DESC')
                            .fetchone()[0])
         self.assertTrue(trace['rude'])
-        for tagged in ('[рэп]\nКому: User 8.', '[о себе]\nКому: User 7.', '[без чата]\nКому: User 7.'):
+        for tagged in ('[рэп]', '[о себе]', '[без чата]', '[паста]'):
             self.b.setup.return_value = tagged  # an ordered form or a question about the bot is never just rude
             self.b.handle(self.message('бот, давай'))
             self.assertEqual(self.b.api.call_args.kwargs['text'], 'Согласен')
@@ -187,12 +188,12 @@ class ConversationTests(unittest.TestCase):
         for user, name in (('antoha_gs', 'Anton'), ('oxgrb', 'Andrew'), ('archetype_oracle_bot', 'oracle'),
                            ('anton_k', 'Anton')):
             self.b.history.db.execute('INSERT INTO people VALUES (?, ?, ?)', (-100123, user, name))
-        self.b.setup.return_value = '[тег anton, Нет Такого]\nКому: Anton.\nФорма: одна строка.'
+        self.b.setup.return_value = '[тег anton, Нет Такого]'
         self.b.handle(self.message('бот, позови Антона'))
         self.assertNotIn('Andrew', self.b.setup.call_args.args[0])  # no list of people: it went into the jokes
         self.assertEqual(self.b.api.call_args.kwargs['text'], '@antoha_gs @anton_k\nСогласен')  # both Antons
         self.assertIn('Тегнуты: Anton — обращайся к ним по этим именам, @ не пиши.', self.prompt())
-        self.b.setup.return_value = '[тег все]\nКому: все.\nФорма: паста.'
+        self.b.setup.return_value = '[тег все]'
         self.b.handle(self.message('бот, потегай каждого'))
         self.assertEqual(self.b.api.call_args.kwargs['text'], '@antoha_gs @anton_k @oxgrb\nСогласен')  # no bots
         trace = json.loads(self.b.history.db.execute('SELECT trace FROM answers ORDER BY id DESC').fetchone()[0])
@@ -202,7 +203,7 @@ class ConversationTests(unittest.TestCase):
         self.b.openrouter = True
         found = {'text': 'Что повторяют: Опа, у меня тоже есть птички\nКак обыгрывают: когда хвастаются.'}
         self.b.generate.side_effect = lambda messages, **kwargs: found['text'] if kwargs.get('search') else 'Опа'
-        self.b.setup.return_value = '[найти мем «у меня тоже есть птички»]\nКому: User 8.\nФорма: одна строка.'
+        self.b.setup.return_value = '[найти мем «у меня тоже есть птички»]'
         self.b.rude = 1  # never on a request for an original
         self.b.handle(self.message('бот, в стиле: опа, у меня тоже есть птички'))
         search, punchline = self.b.generate.call_args_list
@@ -220,48 +221,71 @@ class ConversationTests(unittest.TestCase):
         self.b.handle(self.message('бот, ну'))
         self.assertEqual([call.kwargs.get('search') for call in self.b.generate.call_args_list[calls:]], [None])
 
-    def test_a_rap_is_thought_through_and_without_thinking_when_it_runs_dry(self):
-        self.b.setup.return_value = '[рэп]\nКому: User 7.\nФорма: рэп.'
+    def test_every_joke_is_thought_through_and_without_thinking_when_it_runs_dry(self):
+        self.b.effort = 'high'
+        self.b.setup.return_value = '[рэп]'
         self.b.generate.side_effect = [RuntimeError('Модель вернула пустой ответ'), 'йо']
         self.b.handle(self.message('бот, зачитай'))
         self.assertEqual([call.kwargs.get('effort') for call in self.b.generate.call_args_list], ['high', None])
         self.assertEqual(self.b.api.call_args.kwargs['text'], 'йо')
-        self.b.generate.side_effect, self.b.setup.return_value = None, 'Кому: User 7.\nФорма: одна строка.'
+        self.b.generate.side_effect, self.b.setup.return_value = None, 'нет'
         self.b.handle(self.message('бот, ну'))
-        self.assertIsNone(self.b.generate.call_args.kwargs.get('effort'))  # a line is not
+        self.assertEqual(self.b.generate.call_args.kwargs.get('effort'), 'high')  # a line too
+
+    def test_the_setup_asks_for_tags_only_and_thinks_not(self):
+        self.assertIn('ставишь только теги', bot.SETUP)
+        for gone in ('Кому:', 'Форма:', 'Заход:'):
+            self.assertNotIn(gone, bot.SETUP)
+        self.b.generate = Mock(return_value='[рэп]')
+        self.assertEqual(Bot.setup(self.b, 'чат', -100123, 0), '[рэп]')
+        self.assertIsNone(self.b.generate.call_args.kwargs.get('effort'))
+        self.assertEqual(self.b.generate.call_args.kwargs['system'], bot.SETUP)
+        # Whatever else the setup wrote goes nowhere: only its tags.
+        self.b.generate, self.b.setup.return_value = Mock(return_value='ок'), 'Кому: User 8. [стих] Заход: баня'
+        self.b.handle(self.message('бот, частушку'))
+        self.assertNotIn('баня', self.prompt())
+        trace = json.loads(self.b.history.db.execute('SELECT trace FROM answers').fetchone()[0])
+        self.assertEqual(trace['tags'], '[стих]')
+
+    def test_a_paste_is_asked_long_and_a_line_short(self):
+        self.b.setup.return_value = '[паста]'
+        self.b.handle(self.message('бот, доложи обстановку'))
+        self.assertTrue(self.prompt().endswith('пишет User 7. Распиши на 8–15 строк. Ответь одной репликой.'))
+        self.b.setup.return_value = 'нет'
+        self.b.handle(self.message('бот, ну'))
+        self.assertTrue(self.prompt().endswith('пишет User 7. Одна-две строки. Ответь одной репликой.'))
+        self.assertNotIn('приплетай', self.prompt())
 
     def test_a_request_of_its_own_gets_no_chat(self):
         self.b.handle(self.message('Андрюха опять вторая личность', user=8))
-        self.b.setup.return_value = '[без чата]\nКому: User 7.\nФорма: анекдот.\nЗаход: бабка и панки.'
+        self.b.setup.return_value = '[без чата]'
         self.b.handle(self.message('бот, расскажи анекдот про бабку',
                                    reply_to_message={'from': {'id': 42}, 'text': 'Андрюха второй'}))
         prompt = self.prompt()
         self.assertNotIn('Андрюха', prompt)
         self.assertTrue(prompt.startswith('Просьба:\n\nUser 7: бот, расскажи анекдот про бабку\n\n'))
-        self.assertTrue(prompt.endswith('Сетап: Кому: User 7. Форма: анекдот. Заход: бабка и панки. '
-                                        'Ты — Рофл: ответь от первого лица, одной репликой, на заход сетапа.'))
+        self.assertTrue(prompt.endswith('Она адресована тебе, пишет User 7. Одна-две строки. Ответь одной репликой.'))
         trace = json.loads(self.b.history.db.execute('SELECT trace FROM answers').fetchone()[0])
         self.assertTrue(trace['alone'])
-        self.b.setup.return_value = 'Кому: User 8.\nФорма: одна строка.'
+        self.b.setup.return_value = 'нет'
         self.b.handle(self.message('бот, а он?'))
         self.assertIn('Андрюха', self.prompt())
-        self.assertIn('Сетап: Кому: User 8. Форма: одна строка.', self.prompt())
 
     def test_an_ordered_form_comes_to_the_punchline_with_how_it_looks(self):
-        self.b.setup.return_value = '[рэп]\nКому: User 8.\nФорма: батл-куплет, 12 строк.\nЗаход: хакер-недоучка.'
+        self.b.setup.return_value = '[рэп]'
         self.b.handle(self.message('бот, рэпанись батл про User 8'))
-        self.assertIn('Сетап: Кому: User 8. Форма: батл-куплет, 12 строк. Заход: хакер-недоучка. Как выглядит рэп: '
-                      '8–16 строк', self.prompt())
-        self.assertTrue(self.prompt().endswith('других деталей из переписки не приплетай.'))
+        self.assertIn('пишет User 7. Как выглядит рэп: 8–16 строк', self.prompt())
+        self.assertTrue(self.prompt().endswith('Ответь одной репликой.'))
+        self.assertNotIn('Одна-две строки', self.prompt())  # a form has its own length
         trace = json.loads(self.b.history.db.execute('SELECT trace FROM answers').fetchone()[0])
         self.assertEqual(trace['form'], 'рэп')
-        self.b.setup.return_value = '[без чата] [бугурт]\nКому: User 7.\nФорма: бугурт-тред.\nЗаход: сессия.'
+        self.b.setup.return_value = '[без чата] [бугурт]'
         self.b.handle(self.message('бот, бугурт тред про сессию'))
         self.assertTrue(self.prompt().startswith('Просьба:'))
         self.assertIn('Как выглядит бугурт: строки КАПСОМ', self.prompt())
         self.assertNotIn('[', self.prompt())  # the tags are the bot's
         # A form named, no tag: «без гринтекста» got a greentext by the word.
-        self.b.setup.return_value = 'Кому: User 7.\nФорма: анекдот, без гринтекста.\nЗаход: его рэп про код.'
+        self.b.setup.return_value = 'анекдот, без гринтекста'
         self.b.handle(self.message('бот, ну как?'))
         self.assertNotIn('Как выглядит', self.prompt())
         # The setup has no example of a form: the one it had went to every form ordered.
@@ -269,7 +293,7 @@ class ConversationTests(unittest.TestCase):
         self.assertEqual(bot.form_of('[рэп] [стих]'), ('рэп', bot.FORMS['рэп']))
 
     def test_a_plus_or_a_laugh_gets_a_reaction_not_a_line(self):
-        self.b.setup.return_value = '[реакция 😂]\nКому: User 7.\nЗаход: поржал.'
+        self.b.setup.return_value = '[реакция 😂]'
         request = self.message('рофл, ору')
         self.b.handle(request)
         self.b.generate.assert_not_called()
@@ -300,7 +324,7 @@ class ConversationTests(unittest.TestCase):
         self.b.handle(self.message('бот, ну?'))
         self.assertEqual(self.b.api.call_args.kwargs['text'], 'Классика - грабли в проде')
         # An ordered form goes as written: a poem keeps its period.
-        self.b.setup.return_value = '[стих]\nКому: User 7.\nФорма: стих.'
+        self.b.setup.return_value = '[стих]'
         self.b.handle(self.message('бот, стих'))
         self.assertEqual(self.b.api.call_args.kwargs['text'], 'Классика — грабли в проде.')
 
@@ -322,10 +346,11 @@ class ConversationTests(unittest.TestCase):
         self.b.handle(self.message('бот, гринтекст'))
         self.assertNotIn('parse_mode', self.b.api.call_args.kwargs)
 
-    def test_the_trace_keeps_the_setup(self):
+    def test_the_trace_keeps_the_tags(self):
+        self.b.setup.return_value = '[тег все] [паста]'
         self.b.handle(self.message('бот, жги'))
         trace = json.loads(self.b.history.db.execute('SELECT trace FROM answers').fetchone()[0])
-        self.assertEqual(trace['setup'], 'Кому: User 7. Форма: одна строка')
+        self.assertEqual(trace['tags'], '[тег все] [паста]')
         self.assertEqual(trace['lines'], 1)
 
     def test_answers_keep_their_settings_and_the_reactions_people_put_on_them(self):
@@ -354,7 +379,7 @@ class ConversationTests(unittest.TestCase):
         self.assertIn('    2    1', report)
         self.assertIn('Огонь:\n  👍2 👎1', report)
 
-    def test_recent_answers_off_the_chain_go_to_the_setup_as_said(self):
+    def test_recent_answers_off_the_chain_go_to_both_as_said(self):
         self.b.handle(self.message('бот, оцени ноут'))
         self.b.rude = 1
         self.b.handle(self.message('бот, ещё'))
@@ -369,7 +394,13 @@ class ConversationTests(unittest.TestCase):
             self.b.handle(self.message('бот, а дальше?'))
         said = self.b.setup.call_args.args[0].partition('даже если чат об этом:\n')[2]
         self.assertEqual(said.count('тумба юмба'), 6)  # what is worn the setup sees for itself
-        self.assertNotIn('недавно ответил', self.prompt())  # the punchline would take it for a template
+        # The writer gets it too, the chat above it and the task last: the joke is its to make.
+        prompt = self.prompt()
+        self.assertIn('Ты недавно ответил, не повторяй ни детали, ни заход, ни построение; что ты обыгрывал не раз, '
+                      'заезжено, не бери, даже если чат об этом:\n- тумба юмба', prompt)
+        self.assertEqual(prompt.partition('даже если чат об этом:\n')[2].count('тумба юмба'), 6)
+        self.assertTrue(prompt.endswith('Последнее сообщение адресовано тебе, пишет User 7. Одна-две строки. '
+                                        'Ответь одной репликой.'))
 
     def test_an_answer_to_a_message_of_the_chain_goes_whole(self):
         photo = self.message('', caption='рофл, зацени мем', photo=[{'file_id': 'f', 'width': 9, 'height': 9}])
@@ -398,7 +429,7 @@ class ConversationTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.b.replay(999)
 
-    def test_addressed_picture_goes_to_the_setup_only(self):
+    def test_addressed_picture_goes_to_the_setup_and_the_writer(self):
         self.b.openrouter, self.b.telegram_url = True, 'https://api.telegram.org/botTOKEN/'
         files = []
 
@@ -421,19 +452,19 @@ class ConversationTests(unittest.TestCase):
         self.assertEqual(image, 'data:image/jpeg;base64,anBlZw==')
         self.assertIn('Картинка, о которой речь, приложена.', chat)
         self.assertIn('User 7 → Рофл: [стикер 😂]', self.prompt())
-        self.assertNotIn('base64', self.prompt())  # the punchline gets the setup's words for it
+        [writer] = self.b.generate.call_args.args[0]
+        self.assertEqual(writer['content'][1], {'type': 'image_url', 'image_url': {'url': image}})  # sees it itself
         meme = self.message('', caption='зацени', photo=photo, user=8)
         with patch('bot.fetch', return_value=b'jpeg'):
             self.b.handle(meme, self.message('рофл, смешно?', reply_to_message=meme))
         self.assertEqual(files[-1], 'mid')  # the photo replied to
         self.assertIn('В исходном сообщении есть фото, оно приложено.', self.b.setup.call_args.args[0])
-        self.assertIn('само изображение ты не видишь', self.prompt())  # true for the punchline
-
-    def test_setup_that_thinks_itself_out_of_tokens_goes_again_without_thinking(self):
-        self.b.openrouter, self.b.setup_effort = True, 'low'
-        self.b.generate = Mock(side_effect=[RuntimeError('Модель вернула пустой ответ'), 'Кому: User 7'])
-        self.assertEqual(Bot.setup(self.b, 'чат', -100123, 0), 'Кому: User 7')
-        self.assertEqual([call.kwargs.get('effort') for call in self.b.generate.call_args_list], ['low', None])
+        self.assertIn('В исходном сообщении есть фото, оно приложено.', self.prompt())
+        self.assertNotIn('само изображение ты не видишь', self.prompt())
+        self.b.openrouter = False  # the local model takes no picture and is told it does not see one
+        self.b.handle(meme, self.message('рофл, а так?', reply_to_message=meme))
+        self.assertIsInstance(self.b.generate.call_args.args[0][0]['content'], str)
+        self.assertIn('само изображение ты не видишь', self.prompt())
 
     def test_reactions_to_the_bot_angry_get_a_comeback_kind_a_shrug(self):
         self.b.handle(self.message('бот, привет'))
@@ -471,7 +502,7 @@ class ConversationTests(unittest.TestCase):
             self.assertEqual(TONE(day), 'Тон: резче, огрызайся; с напором; безумнее обычного.')
         with patch('bot.tone', return_value='Тон: резче, огрызайся.'):
             self.b.handle(self.message('бот, как погода'))
-        self.assertIn('Сетап: Кому: User 7. Форма: одна строка. Тон: резче, огрызайся. Ты — Рофл', self.prompt())
+        self.assertIn('пишет User 7. Тон: резче, огрызайся. Одна-две строки. Ответь одной репликой.', self.prompt())
         self.assertNotIn('Тон', self.b.setup.call_args.args[0])
 
     def test_a_day_follows_from_its_date_and_sets_the_temper(self):
@@ -594,7 +625,7 @@ class ConversationTests(unittest.TestCase):
 
     def test_insults_wear_the_mentalka_down_and_at_zero_the_bot_breaks_down(self):
         start = int(time.time()) - 100
-        self.b.setup.return_value = '[обида]\nКому: User 7.\nФорма: одна строка.'  # the setup hears the insults
+        self.b.setup.return_value = '[обида]'  # the setup hears the insults
         with patch('bot.sheet', return_value=self.character(Психика=1)), patch('bot.random.random', return_value=0.1):
             self.b.handle(self.message('бот, заткнись', user=8, date=start + 1))
             self.b.handle(self.message('рофл, ты тупой', date=start + 2))
@@ -618,7 +649,7 @@ class ConversationTests(unittest.TestCase):
         self.assertEqual(trace['cost'], 0)
         first = json.loads(self.b.history.db.execute('SELECT trace FROM answers ORDER BY id').fetchone()[0])
         self.assertEqual((first['morale'], first['insult']), (2, True))
-        self.b.setup.return_value = 'Кому: User 7.\nФорма: одна строка.'
+        self.b.setup.return_value = 'нет'
         self.b.handle(self.message('бот, иди нахуй', date=int(time.time())))  # a word is no insult if the setup says so
         self.assertEqual(self.b.api.call_args.kwargs['text'], 'Согласен')
 
@@ -692,13 +723,13 @@ class ConversationTests(unittest.TestCase):
             self.b.handle(self.message('бот, как ты?'))
             self.assertNotIn('Рофл сегодня', self.b.setup.call_args.args[0])
             self.assertNotIn('Рофл сегодня', self.prompt())  # not asked about the bot
-            self.b.setup.return_value = '[о себе]\nКому: User 7.\nФорма: одна строка.\nЗаход: сколько помнит.'
+            self.b.setup.return_value = '[о себе] он ничего не помнит'
             self.b.handle(self.message('бот, сколько ты помнишь?'))
         prompt = self.prompt()
         self.assertTrue(prompt.startswith('Что ты знаешь о себе'))
         self.assertNotIn(str(Bot.recent), prompt)  # no settings to tell the chat
         self.assertIn('Рофл сегодня: тупит, на взводе', prompt)
-        self.assertNotIn('сколько помнит', prompt)  # the setup's words: it answered for the bot
+        self.assertNotIn('ничего не помнит', prompt)  # the setup's words: it answered for the bot
         self.assertIn('Спрашивают о тебе', prompt)
         self.b.history.keep_news(today, 'ai', 'Путин внедряет ИИ', 'https://g/0', 1)
         with patch('bot.sheet', return_value=self.character(Психика=1)):
@@ -770,7 +801,7 @@ class ConversationTests(unittest.TestCase):
         self.b.generate.return_value = '\\>Тверь  \n\\>User 8: заяц\n\nUser 7 → Рофл: ты че, повтори\n\nРофл: ок'
         self.b.handle(self.message('бот, распиши'))
         self.assertEqual(self.b.api.call_args.kwargs['text'], '>Тверь\n>User 8: заяц')
-        # The setup's «Кому» opening the answer, and the log's tail replayed before «РОФЛ:».
+        # The asker's name opening the answer, and the log's tail replayed before «РОФЛ:».
         for answer in ('User 8: в Твери проснулся', 'проснулся в Твери\n\nБот, распиши\n\nРОФЛ:\n\nв Твери проснулся'):
             self.b.generate.return_value = answer
             self.b.handle(self.message('бот, распиши'))
@@ -824,7 +855,7 @@ class ConversationTests(unittest.TestCase):
         self.assertEqual(prompt.count('КОНЕЦ'), 1)
         self.assertIn('сверху:\n\noracle (бот):\nЗадача для', prompt)  # its «я» is not Рофл's
         self.assertIn('User 7 → oracle (бот): бот, укажи пункт\n\nРофл → User 7: [ответил]\n\nUser 7 → oracle (бот)', prompt)
-        self.assertNotIn('Согласен', prompt)  # an answer nobody replied to stays out
+        self.assertNotIn('Согласен', prompt.partition('Ты недавно ответил')[0])  # an answer nobody replied to stays out
         self.assertIn('\n\nUser 7 → oracle (бот) «Задача для @anton_k: пункт.', prompt)
 
     def test_mention_then_forwarded_news_answers_the_news(self):
@@ -837,9 +868,8 @@ class ConversationTests(unittest.TestCase):
         self.b.handle(comment, news)
         prompt = self.prompt()
         self.assertIn('User 8: Рофл как тебе новость ?\n\nUser 8 переслал из «Бальзам»:\nВласти выдворили', prompt)
-        self.assertTrue(prompt.endswith('Последнее сообщение адресовано тебе, пишет User 8. Сетап: Кому: User 7. '
-                                        'Форма: одна строка. Ты — Рофл: ответь от первого лица, одной репликой, на заход сетапа; '
-                                        'других деталей из переписки не приплетай.'))  # a quiet chat has no topic
+        self.assertTrue(prompt.endswith('Последнее сообщение адресовано тебе, пишет User 8. Одна-две строки. '
+                                        'Ответь одной репликой.'))  # a quiet chat has no topic
         stored = self.b.history.db.execute("SELECT count(*) FROM messages WHERE raw LIKE '%адресовано%'").fetchone()
         self.assertEqual(stored[0], 0)
         self.b.handle(news)

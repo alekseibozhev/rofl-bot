@@ -80,6 +80,11 @@ def fetch(request, timeout=60, direct=False):
         raise RuntimeError('Сеть недоступна или превышено время ожидания') from None
 
 
+def with_image(text, image=None):
+    """A message's content: the text, with the picture as a data URI after it when there is one."""
+    return [{'type': 'text', 'text': text}, {'type': 'image_url', 'image_url': {'url': image}}] if image else text
+
+
 def post(url, payload, timeout=60, direct=False, headers=None):
     request = Request(url, json.dumps(payload).encode(), {'Content-Type': 'application/json', **(headers or {})})
     try:
@@ -94,44 +99,41 @@ SYSTEM = """Ты Рофл — двачер и тролль в чате коре�
 не X, а Y»; просьбу и указания не пересказываешь («держи», «принял», «докладываю») — сразу к делу. Людей зовёшь \
 по-свойски, по-русски, как кореша, а не как в паспорте.
 
+Факты о людях — только из переписки: выдуманное примут за правду; материала мало — стёб над этим. Просят про \
+конкретное — картинку, человека, вопрос — шути про это, а не про чат. Просят известный анекдот, пасту или цитату — \
+расскажи её как есть. Шутку уже рассказали в переписке — ответь на неё, не пересказывай.
+
 Переписка приходит как «Имя: текст»; «Имя → Кому» — ответ на сообщение Кому. Рофл — это ты. Ответь одной своей репликой."""
 
-# Сетап-панчлайн: the setup reads the chat and picks how to answer, the punchline is written to it. A length
-# drawn at random answered «распиши» with one line and a quick jab with a paste.
-SETUP = """Ты сетапер Рофла — двачера и тролля в чате корешей, его цель — чтобы чат ржал. По переписке реши, \
-какой ответ Рофла сейчас будет смешнее всего. Сам ответ не пиши, только три короткие строки:
+# The setup tags, the punchline writes the joke. A setup that wrote «Кому / Форма / Заход» confined the writer to one
+# idea picked in advance, and wrote the answer itself in 3 setups of 12: the punchline printed two lines of the
+# setup's chastushka with «>» and a comment (#339955). A bare «here is the chat, answer» thought through jabbed
+# everyone as well or better: the joke is born while writing. What the code needs to know comes as tags.
+SETUP = """Ты разметчик чата Рофла — двачера и тролля в чате корешей. Последнее сообщение адресовано Рофлу; ответ \
+напишет он сам. Ты ответ не пишешь, не пересказываешь и не советуешь: ставишь только теги из списка ниже, \
+каждый в квадратных скобках, — и больше ничего. Ни один не подходит — ответь «нет».
 
-Кому: тот, кому или про кого просят («объясни X», «про X»), просящего не трогай; ни о ком не просят — тот, кто пишет.
-Форма: на быстрый вопрос, подкол или «зацени» — одна-две строки; просят расписать, рассказать или доложить — паста \
-на 8–15 строк; просят конкретную форму — назови её так, как просят; просят известный анекдот, пасту или \
-цитату — «как есть»: Рофл расскажет её как есть, без своего захода, а в Заходе — какая именно и чем кончается; \
-шутку уже рассказали в переписке («вот этот», прислали текст) — не повторяй, ответь на неё одной-двумя строками.
-Заход: одна мысль, что обыграть. Просят про конкретное — картинку, вопрос, человека — мысль про это, \
-чат не приплетай; иначе — за какую деталь из чата зацепиться. Факты о людях — только из переписки: выдуманное примут \
-за правду; материала мало — стёб над этим. Приложена картинка — опиши, что на ней смешного: Рофл её не видит.
+[без чата] — просят что-то своё (анекдот, стих, объяснение), сменить тему, забыть или не трогать кого-то: Рофл \
+тогда увидит только просьбу, без переписки. Про людей чата этот тег не ставь.
 
-Просят что-то своё (анекдот, стих, объяснение), сменить тему, забыть или не трогать кого-то — выполни, а не \
-обыгрывай, к старой шутке не возвращайся и первой строкой поставь [без чата]: Рофл тогда увидит только просьбу. \
-Про людей чата тег не ставь.
+[обида] — Рофла в обращении всерьёз обзывают или посылают: у него от этого портится менталка. Без тега обида не \
+засчитается.
 
-Рофла в обращении всерьёз обзывают или посылают — первой строкой поставь [обида]: у него от этого портится \
-менталка. Без тега обида не засчитается, даже если ты написал о ней в Заходе.
+[реакция X] — Рофлу только поддакнули или поржали и словами отвечать незачем; X — эмодзи, которое Рофл поставит на \
+сообщение. Других тегов тогда не нужно.
 
-Рофлу только поддакнули или поржали и словами отвечать незачем — первой строкой поставь [реакция X], где X — \
-эмодзи, которое Рофл поставит на сообщение; остальные строки тогда не нужны.
+[о себе] — спрашивают про самого Рофла: как он, что помнит, как устроен, что читал.
 
-Спрашивают про самого Рофла — как он, что помнит, как устроен, что читал — первой строкой поставь [о себе]; \
-остальные строки тогда не нужны: о себе Рофл знает сам.
+[тег Имя, Имя] с именами, как они в переписке, или [тег все] — просят тегнуть, позвать или потегать людей.
 
-Просят тегнуть, позвать или потегать людей — первой строкой поставь [тег Имя, Имя] с именами, как они в переписке, \
-или [тег все].
+[гринтекст], [бугурт], [рэп], [стих] или [код] — просят эту форму: батл — это [рэп], частушка — [стих]. Не просят — \
+тег формы не ставь.
 
-Просят гринтекст, бугурт, рэп или батл, стих или код — первой строкой поставь тег этой формы: [гринтекст], [бугурт], \
-[рэп], [стих] или [код]. Не просят — тег не ставь.
+[паста] — просят расписать, рассказать или доложить: ответ на 8–15 строк вместо одной-двух.
 
-Просят конкретный текст — пасту, цитату, песню, анекдот — или ответ в стиле, на мотив, по шаблону конкретного мема \
-или строчки: первой строкой поставь тег «найти» с тем, что искать, внутри скобок, например [найти паста Жириновский \
-«это другие ребята»]. Рофл получит оригинал: по памяти такие тексты путаются."""
+[найти …] с тем, что искать, внутри скобок — просят конкретный текст (пасту, цитату, песню, анекдот) или ответ в \
+стиле, на мотив, по шаблону конкретного мема или строчки, например [найти паста Жириновский «это другие ребята»]. \
+Рофл получит оригинал: по памяти такие тексты путаются."""
 
 ALONE, OFFENDED, ABOUT = '[без чата]', '[обида]', '[о себе]'
 CHAT = 'Переписка чата, старые сообщения сверху:\n\n'
@@ -149,8 +151,7 @@ FORMS = {
     'код': 'один блок ```язык с кодом, который работает, и пара строк текста вне блока; вывод, будто ты его '
            'запустил, — отдельным блоком ```.',
 }
-THOUGHT = ('рэп', 'стих', 'бугурт')  # the forms the punchline thinks through: rhyme and build-up want it
-TAG = re.compile(r'\[(без чата|обида|реакция|о себе|тег|найти|' + '|'.join(FORMS) + r')([^\]\n]*)\]')
+TAG = re.compile(r'\[(без чата|обида|реакция|о себе|тег|найти|паста|' + '|'.join(FORMS) + r')([^\]\n]*)\]')
 
 
 def form_of(setup):
@@ -690,7 +691,8 @@ def report(db, days=14):
         bad = sum(e in ANGRY for e in got)
         setting = ('выходки' if params.get('urge') else
                    f'{params["recent"]} сообщ · {params["window_h"]:g} ч · {params["limit"]} симв · '
-                   f'сетап {params["setup_effort"] or "без мыслей"} · {params["model"].split("/")[-1]}'
+                   + (f'ответ {params["effort"]}' if 'effort' in params else
+                      f'сетап {params.get("setup_effort") or "без мыслей"}') + f' · {params["model"].split("/")[-1]}'
                    if params else 'до метрик')
         rows.append({'day': time.strftime('%Y-%m-%d', time.localtime(date)), 'setting': setting, 'content': content,
                      'trace': trace, 'good': len(got) - bad, 'bad': bad, 'canned': content in CANNED,
@@ -719,8 +721,9 @@ def report(db, days=14):
             lines += ['', f'{title}:']
             for row in best:
                 lines.append(f'  👍{row["good"]} 👎{row["bad"]}  {row["day"]}  {clip(" ".join(row["content"].split()), 160)}')
-                if row['trace'].get('setup'):
-                    lines.append(f'      сетап: {clip(row["trace"]["setup"], 200)}')
+                made = row['trace'].get('tags', row['trace'].get('setup'))  # the setup's lines before it tagged
+                if made:
+                    lines.append(f'      {"теги" if "tags" in row["trace"] else "сетап"}: {clip(made, 200)}')
     return '\n'.join(lines)
 
 
@@ -751,7 +754,7 @@ class Bot:
     patience = 8  # requests in two hours; each one past them wears the менталка down
     shares = 1  # the chance an act-out reposts the morning's news, when there is some: the news shows there only
     interests = {}  # chat: what it reads about, by NEWS in .env; the rest read about AI
-    setup_effort = 'medium'  # the setup thinks: whom, how long and about what; the punchline only on a rap or a verse
+    effort = 'high'  # the punchline thinks every joke through; the setup only tags and does not think
     # How much of the chat the model reads, tuned every few days by the reactions: `python3 bot.py --stats`.
     recent = 40  # messages of people
     window = 6 * 3600  # seconds before the request
@@ -921,17 +924,9 @@ class Bot:
         return 'rofl'
 
     def setup(self, chat, chat_id, topic, image=None):
-        """How to answer, in three short lines: whom, in what form, at what detail."""
-        content = [{'type': 'text', 'text': chat}, {'type': 'image_url', 'image_url': {'url': image}}] if image else chat
-        messages = [{'role': 'user', 'content': content}]
-        try:
-            return self.generate(messages, chat_id=chat_id, topic=topic, system=SETUP, temperature=0.7,
-                                 effort=self.setup_effort)
-        except RuntimeError:
-            if not self.setup_effort:
-                raise
-            # «Low» thinking now and then takes all 3000 tokens and leaves no answer: then without it.
-            return self.generate(messages, chat_id=chat_id, topic=topic, system=SETUP, temperature=0.7)
+        """The tags the request wants, nothing else: «нет» or empty when none. Tagging wants no thinking."""
+        return self.generate([{'role': 'user', 'content': with_image(chat, image)}], chat_id=chat_id, topic=topic,
+                             system=SETUP, temperature=0.7)
 
     def find(self, wanted, chat_id=None):
         """The original of what the setup wants found, as the reader copied it out of the search, or None: not
@@ -949,7 +944,7 @@ class Bot:
     def image(self, message):
         """The picture a request is about, as a data URI: its own photo or sticker, or the photo it replies to.
 
-        Only the setup sees it and puts what is funny about it in words: the picture goes into the context once.
+        The setup and the punchline both see it: told in the setup's words, the picture lost its joke.
         """
         for source in (message, message.get('reply_to_message') or {}):
             photo, sticker = source.get('photo'), source.get('sticker')
@@ -972,7 +967,7 @@ class Bot:
         return None
 
     def joke(self, message, through, live=True):
-        """The answer and how it was made: the setup.
+        """The answer and how it was made: the setup's tags.
 
         Not `live` (a replay) it sends no typing, never breaks down and is never just rude. Rude it is after the
         setup: drawn before, it hit «у этого шиза Китай протек в текст» and would hit an ordered rap.
@@ -993,17 +988,17 @@ class Bot:
                 chat = CHAT + '\n\n'.join(lines)
                 heads = [re.split(r' → |: ', line, maxsplit=1)[0] for line in lines]
                 # The answers off the chain are only marks in the chat: three in a row went at one «ноут с олламой»,
-                # «тумба юмба» went into four of an evening. The punchline never sees them, the small model would take
-                # them for a template.
-                said = [clip(' '.join(text.split()), 200) for text in self.history.said(key, through, date, count=6)]
-                said = ('\n\nРофл недавно ответил, не повторяй ни детали, ни заход, ни построение; что он обыгрывал '
-                        'не раз, заезжено, не бери, даже если чат об этом:\n'
-                        + '\n'.join(f'- {text}' for text in said)) if said else ''
+                # «тумба юмба» went into four of an evening. The punchline sees them as a list not to repeat, both
+                # the setup and it judge what is worn.
+                answers = [clip(' '.join(text.split()), 200) for text in self.history.said(key, through, date, count=6)]
+                said = lambda who, he: ((f'\n\n{who} недавно ответил, не повторяй ни детали, ни заход, ни построение; '
+                                         f'что {he} обыгрывал не раз, заезжено, не бери, даже если чат об этом:\n'
+                                         + '\n'.join(f'- {text}' for text in answers)) if answers else '')
                 # Only a model that takes images gets one: the local one would fail on it.
                 image = self.openrouter and self.image(message)
                 asker = f'\n\nПоследнее сообщение адресовано Рофлу, пишет {person_label(sender)}.'
-                # The setup sees the picture the request replies to: «ты не видишь» under it made it say that
-                # its access to pictures was down.
+                # Both models see the picture the request replies to: «ты не видишь» under it made the model say
+                # that its access to pictures was down.
                 seeing = chat
                 if image and not (message.get('photo') or message.get('sticker')):
                     before, found, after = chat.rpartition(BLIND)
@@ -1014,54 +1009,53 @@ class Bot:
                 # How the bot is today the setup does not see: offered as «фон, не тема», it went into the Заход,
                 # and the morning's news into three answers of four. The punchline gets it asked about the bot.
                 feelings = self.feelings(chat_id, date, message)
-                setup = self.setup(seeing + said + asker
+                # The setup says what the code needs to know, in tags; whatever else it wrote is dropped unread.
+                setup = self.setup(seeing + said('Рофл', 'он') + asker
                                    + ('\n\nКартинка, о которой речь, приложена.' if image else ''),
                                    typing, topic, image)
-                setup = ' '.join(setup.split()).rstrip('.')
-                trace = {'setup': setup, 'context_chars': len(chat), 'lines': len(lines), 'image': bool(image),
+                tags = ' '.join(tag[0] for tag in TAG.finditer(setup))
+                trace = {'tags': tags, 'context_chars': len(chat), 'lines': len(lines), 'image': bool(image),
                          'feelings': feelings, 'morale': left}
-                if OFFENDED in setup:
+                if OFFENDED in tags:
                     trace['insult'] = True
-                    setup = ' '.join(setup.replace(OFFENDED, '').split())
                     if live:
                         left, top, why = self.morale(chat_id, date, message, insulted=True)
                         trace['morale'] = left
                         if left <= 0:
                             LOG.info('meltdown chat=%s message=%s morale=%s/%s', chat_id, message['message_id'], left, top)
                             return self.meltdown(chat_id, topic, date, why)
+                # The emoji may follow the tag: the setup's whole text is read for it.
                 reaction = reaction_of(setup)
                 if reaction:
                     return reaction, {**trace, 'reaction': True, **spent(usage)}
-                about, tagged, form, wanted = ABOUT in setup, tagged_of(setup, people), form_of(setup), wanted_of(setup)
-                if (live and not (form or about or tagged or wanted or ALONE in setup)
+                about, tagged, form, wanted = ABOUT in tags, tagged_of(tags, people), form_of(tags), wanted_of(tags)
+                long = any(tag[1] == 'паста' for tag in TAG.finditer(tags))
+                # «Расскажи анекдот» after an evening of one gag got the gag back: the punchline saw the chat full
+                # of it. A request tagged so gets the punchline the request alone.
+                alone = ALONE in tags
+                if (live and not (form or about or tagged or wanted or long or alone)
                         and random.random() < self.rude * temper(datetime.date.fromtimestamp(date))):
                     return RUDE, {**trace, 'rude': True, **spent(usage)}
-                # «Расскажи анекдот» after an evening of one gag got the gag back: the punchline saw the chat full
-                # of it. A setup tagged so gets the punchline the request alone.
-                alone = ALONE in setup
-                brief = ' '.join(TAG.sub('', setup).split()).rstrip('.')
                 # The setup names an ordered form, the punchline is told how it looks: it went by the name alone.
                 looks = f' Как выглядит {form[0]}: {form[1]}' if form else ''
-                # Whom to jab and how long is the setup's: in one line, and the prompt ends on who answers, or the
-                # model goes on with the chat log.
                 # The mood comes to the punchline as a tone with no reason, the facts only asked about the bot.
                 manner = tone(datetime.date.fromtimestamp(date))
                 tagging = (f' Тегнуты: {", ".join(dict.fromkeys(people[user] for user in tagged))} — обращайся к ним '
                            'по этим именам, @ не пиши.' if tagged else '')
-                task = (f'пишет {person_label(sender)}. Сетап: {brief}.{looks}{tagging}'
-                        + (f' {manner}' if manner else '') + ' Ты — Рофл: ответь от первого лица, одной репликой, '
-                        'на заход сетапа')
                 found = self.find(wanted, typing) if wanted else None
                 card = f'Что просят ({wanted}), из интернета:\n{found}\n\n' if found else ''
-                if found:
-                    task += ', бери это узнаваемо и не пересказывай, откуда оно'
+                # How long: «распиши» answered with one line and a quick jab with a paste when the length was drawn
+                # at random. A form and an original have a length of their own.
+                length = (' Распиши на 8–15 строк.' if long else '' if form or found else ' Одна-две строки.')
+                # The prompt ends on who answers, or the model goes on with the chat log.
+                task = (f'пишет {person_label(sender)}.{looks}{tagging}'
+                        + (' Бери найденное узнаваемо и не пересказывай, откуда оно.' if found else '')
+                        + (f' {manner}' if manner else '') + f'{length} Ответь одной репликой')
                 if about:
-                    # Asked about the bot, the setup answered for it, and the punchline repeated «нихуя не помню»
-                    # past the card: the setup's words are dropped.
+                    # Asked about the bot, it answers from the card of what it knows of itself.
                     card = SELF + (f'\n\n{feelings}' if feelings else '') + '\n\n'
                     task = (f'пишет {person_label(sender)}. Спрашивают о тебе: ответь одной-двумя строками, держись '
-                            'того, что знаешь о себе.' + (f' {manner}' if manner else '') + ' Ты — Рофл: ответь от '
-                            'первого лица, одной репликой')
+                            'того, что знаешь о себе.' + (f' {manner}' if manner else '') + ' Ответь одной репликой')
                 if alone:
                     # Without the message it replies to: an excerpt of the old joke brought the gag back.
                     request = rename([message_content({**json.loads(raw), 'reply_to_message': None},
@@ -1069,23 +1063,23 @@ class Bot:
                                       for (raw,) in self.history.db.execute(
                         "SELECT raw FROM messages WHERE chat=? AND topic=? AND role='user' AND id >= ? AND id <= ? "
                         'ORDER BY id', (*key, message['message_id'], through))], names)
-                    prompt = card + 'Просьба:\n\n' + '\n\n'.join(request) + f'\n\nОна адресована тебе, {task}.'
+                    prompt = (card + 'Просьба:\n\n' + '\n\n'.join(request) + said('Ты', 'ты')
+                              + f'\n\nОна адресована тебе, {task}.')
                 else:
-                    prompt = (card + chat + f'\n\nПоследнее сообщение адресовано тебе, {task}; других деталей из переписки '
-                              'не приплетай.')
+                    prompt = (card + seeing + said('Ты', 'ты')
+                              + f'\n\nПоследнее сообщение адресовано тебе, {task}.')
                 # The log invites the model to go on with it: the answer opens with lines copied from it or with a
                 # name, «РОФЛ:», «Серёга: …». Leading lines that, name cut, are empty or already said are dropped.
                 speakers = {'Рофл', person_label(sender), *heads}
                 name = re.compile(rf'^(?i:{"|".join(map(re.escape, speakers))})(?: → [^:\n]*)?:\s*')
                 known = {name.sub('', line).lower() for line in chat.splitlines()} | {''}
-                # A rap, a verse or a bugurt is thought through, the line is not; out of tokens, once more without.
+                # Every joke is thought through: a bare «here is the chat, answer» at high jabbed as well as the setup
+                # and punchline did. Out of tokens, once more without thinking.
+                messages = [{'role': 'user', 'content': with_image(prompt, image)}]
                 try:
-                    answer = self.generate([{'role': 'user', 'content': prompt}], chat_id=typing, topic=topic,
-                                           effort='high' if form and form[0] in THOUGHT else None)
+                    answer = self.generate(messages, chat_id=typing, topic=topic, effort=self.effort)
                 except RuntimeError:
-                    if not (form and form[0] in THOUGHT):
-                        raise
-                    answer = self.generate([{'role': 'user', 'content': prompt}], chat_id=typing, topic=topic)
+                    answer = self.generate(messages, chat_id=typing, topic=topic)
                 kept = '\n'.join(dropwhile(lambda line: name.sub('', line).strip().lower() in known,
                                            answer.splitlines()))
                 answer = name.sub('', kept or answer) or answer
@@ -1193,7 +1187,7 @@ class Bot:
             answer, trace = self.joke(message, extra[-1]['message_id'] if extra else message_id, live=False)
             print(f'\n— прогон {run}', flush=True)
             if trace:
-                print(f'Сетап: {trace["setup"]}')
+                print(f'Теги: {trace["tags"] or "нет"}')
             print(f'[реакция {answer}]' if trace and trace.get('reaction') else answer)
 
     def respond(self, message, kind, extra=()):
@@ -1231,7 +1225,7 @@ class Bot:
     def params(self):
         """The settings an answer is made on: answers are compared by them."""
         return {'model': self.model, 'recent': self.recent, 'window_h': self.window / 3600, 'limit': self.limit,
-                'setup_effort': self.setup_effort, 'version': self.version, 'sheet': sheet(datetime.date.today())}
+                'effort': self.effort, 'version': self.version, 'sheet': sheet(datetime.date.today())}
 
     def urge(self, chat, now):
         """What the bot blurts into the chat now as (kind, text, topic), the text None when the model writes it; or
