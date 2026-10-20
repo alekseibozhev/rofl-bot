@@ -251,6 +251,7 @@ class ConversationTests(unittest.TestCase):
         self.assertEqual(bot.wanted_of('[найти паста Жириновский]'), ('найти', 'паста Жириновский'))
         self.assertIsNone(bot.wanted_of('[справка] справка тун тун сахур'))  # nothing to look for, a word is no tag
         self.assertIn('строка с многоточием', bot.SETUP)  # the opening of a paste is found, not a form (#339995)
+        self.assertIn('дословно, теми же словами и буквами', bot.SETUP)  # «СЛОВНО» went «слово» (#340002)
         self.assertIn('в шутку не тащишь', bot.SYSTEM)  # the setup brought is played on, not the asker roasted
         self.b.openrouter = True
         about = 'Тун тун сахур — итальянский брейнрот: деревянное существо с битой.'
@@ -268,6 +269,17 @@ class ConversationTests(unittest.TestCase):
         self.assertNotIn('не пересказывай, откуда оно', self.prompt())
         trace = json.loads(self.b.history.db.execute('SELECT trace FROM answers').fetchone()[0])
         self.assertEqual((trace['kind'], trace['wanted'], trace['found']), ('справка', 'тун тун сахур', True))
+
+    def test_an_original_found_with_a_form_is_remade_not_written_anew(self):
+        # «напиши стих про СЛОВНО ХУЙ ДРОЧЕНЫЙ, но про кубернетес» got a quatrain of the bot's own (#340002).
+        self.b.openrouter = True
+        self.b.generate.side_effect = lambda messages, **kwargs: (
+            'Что повторяют: СЛОВНО ХУЙ ДРОЧЁНЫЙ!!!' if kwargs.get('search') else 'ок')
+        self.b.setup.return_value = '[стих] [найти СЛОВНО ХУЙ ДРОЧЕНЫЙ]'
+        self.b.handle(self.message('бот, стих про СЛОВНО ХУЙ ДРОЧЕНЫЙ, но про кубернетес'))
+        self.assertIn('Как выглядит стих', self.prompt())  # the form stays
+        self.assertIn('Переделай найденное под просьбу', self.prompt())
+        self.assertNotIn('Бери найденное', self.prompt())
 
     def test_every_joke_is_thought_through_and_without_thinking_when_it_runs_dry(self):
         self.b.effort = 'high'
