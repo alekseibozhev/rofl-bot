@@ -122,6 +122,10 @@ SETUP = """Ты разметчик чата Рофла — двачера и т�
 [обида] — Рофла в обращении всерьёз обзывают или посылают: у него от этого портится менталка. Без тега обида не \
 засчитается.
 
+[клоун] — к Рофлу тупо доёбываются, без мысли и без шутки: пустое «рофл» без дела, голая посылка или «ты тупой», \
+придирка к ерунде. Рофл шлёпнет на сообщение 🤡 и ответит как обычно. Ставится и рядом с [обида]. Просьбу, шутку, \
+подкол с выдумкой и поддакивание Рофлу так не помечай.
+
 [реакция X] — Рофлу только поддакнули или поржали и словами отвечать незачем; X — эмодзи, которое Рофл поставит на \
 сообщение. Других тегов тогда не нужно.
 
@@ -146,7 +150,7 @@ SETUP = """Ты разметчик чата Рофла — двачера и т�
 [справка …] с тем, что это, внутри скобок — в последнем сообщении назван мем, персонаж или отсылка, например \
 [справка ждун, кот Шрёдингера] — все названные. Рофл получит пару строк о том, что это и откуда."""
 
-ALONE, OFFENDED, ABOUT = '[без чата]', '[обида]', '[о себе]'
+ALONE, OFFENDED, ABOUT, CLOWN = '[без чата]', '[обида]', '[о себе]', '[клоун]'
 CHAT = 'Переписка чата, старые сообщения сверху:\n\n'
 
 # How an ordered form looks, for the punchline only: the one form the setup had an example of, greentext, went
@@ -162,7 +166,7 @@ FORMS = {
     'код': 'один блок ```язык с кодом, который работает, и пара строк текста вне блока; вывод, будто ты его '
            'запустил, — отдельным блоком ```.',
 }
-TAG = re.compile(r'\[(без чата|обида|реакция|о себе|тег|найти|справка|паста|' + '|'.join(FORMS) + r')([^\]\n]*)\]')
+TAG = re.compile(r'\[(без чата|обида|клоун|реакция|о себе|тег|найти|справка|паста|' + '|'.join(FORMS) + r')([^\]\n]*)\]')
 
 
 def form_of(setup):
@@ -1078,6 +1082,8 @@ class Bot:
                 tags = ' '.join(tag[0] for tag in TAG.finditer(setup))
                 trace = {'tags': tags, 'context_chars': len(chat), 'lines': len(lines), 'image': bool(image),
                          'feelings': feelings, 'morale': left}
+                if CLOWN in tags:
+                    trace['clown'] = True
                 if OFFENDED in tags:
                     trace['insult'] = True
                     if live:
@@ -1260,6 +1266,8 @@ class Bot:
                 # The header above is the request as the chat shows it, «ты не видишь» under a photo included: the
                 # picture went to both models all the same, as live (#339991), and the line says so.
                 print(f'Теги: {trace["tags"] or "нет"}' + ('; картинка приложена' if trace.get('image') else ''))
+            if trace and trace.get('clown'):
+                print('[реакция 🤡]')
             print(f'[реакция {answer}]' if trace and trace.get('reaction') else envelope(answer, trace))
 
     def respond(self, message, kind, extra=()):
@@ -1285,6 +1293,11 @@ class Bot:
             LOG.info('telegram.reacted chat=%s source=%s', chat['id'], message['message_id'])
             self.history.record(key, None, message['message_id'], time.time(), answer, self.params(), trace)
             return
+        if trace and trace.get('clown'):
+            # A dumb jab gets a 🤡 on it as well as the answer: «надо его научить Андрюхе клоунов шлепать» (#340037).
+            self.api('setMessageReaction', chat_id=chat['id'], message_id=message['message_id'],
+                     reaction=[{'type': 'emoji', 'emoji': '🤡'}])
+            LOG.info('telegram.reacted chat=%s source=%s', chat['id'], message['message_id'])
         text = envelope(answer, trace)
         markup = telegram_html(text)
         sent = self.send(key, message['message_id'], markup or text, parse_mode='HTML' if markup else None)

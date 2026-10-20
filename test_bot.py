@@ -381,6 +381,17 @@ class ConversationTests(unittest.TestCase):
             self.b.replay(request['message_id'])
         self.assertIn('[реакция 🤣]', [call.args[0] for call in printed.call_args_list])
 
+    def test_a_dumb_jab_gets_a_clown_and_an_answer(self):
+        self.b.setup.return_value = '[обида] [клоун]'
+        request = self.message('рофл, пошёл нахуй')
+        self.b.handle(request)
+        self.b.generate.assert_called()
+        methods = [call.args[0] for call in self.b.api.call_args_list]
+        self.assertEqual(methods[-2:], ['setMessageReaction', 'sendMessage'])
+        self.assertEqual(self.b.api.call_args_list[-2].kwargs['reaction'], [{'type': 'emoji', 'emoji': '🤡'}])
+        trace = json.loads(self.b.history.db.execute('SELECT trace FROM answers').fetchone()[0])
+        self.assertTrue(trace['clown'] and trace['insult'])
+
     def test_a_line_or_two_go_typed_not_typeset(self):
         self.assertEqual(bot.casual('sudo rm rf — это вот так. Ну.'), 'sudo rm rf - это вот так. Ну')
         self.assertEqual(bot.casual('ну и...'), 'ну и...')
