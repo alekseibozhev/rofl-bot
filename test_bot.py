@@ -273,6 +273,26 @@ class ConversationTests(unittest.TestCase):
         trace = json.loads(self.b.history.db.execute('SELECT trace FROM answers').fetchone()[0])
         self.assertEqual((trace['kind'], trace['wanted'], trace['found']), ('справка', 'тун тун сахур', True))
 
+    def test_news_asked_about_come_to_the_writer_as_headlines(self):
+        # «погромы во Франции не подтверждены» the bot said while Google News had curfews and sentences (#340039).
+        self.assertEqual(bot.news_of('[справка тун тун сахур] [новости протесты во Франции]'), 'протесты во Франции')
+        self.assertEqual(bot.news_of('[паста] [новости]'), '')
+        self.assertIsNone(bot.news_of('[паста] новости'))
+        self.b.setup.return_value = '[новости протесты во Франции]'
+        with patch('bot.headlines', return_value=[('Во Франции ввели комендантский час', 'https://x')]) as found:
+            self.b.handle(self.message('бот, что там во франции'))
+        found.assert_called_once_with('протесты во Франции')
+        self.assertTrue(self.prompt().startswith('Свежие новости (протесты во Франции) за сутки, заголовки из Google '
+                                                 'News:\n- Во Франции ввели комендантский час\n\n'))
+        self.assertIn('бывший СССР не трогай', self.prompt())
+        trace = json.loads(self.b.history.db.execute('SELECT trace FROM answers').fetchone()[0])
+        self.assertEqual((trace['news'], trace['headlines']), ('протесты во Франции', 1))
+        self.b.setup.return_value = '[паста] [новости]'
+        with patch('bot.headlines', side_effect=RuntimeError('нет сети')) as found:
+            self.b.handle(self.message('бот, доложи обстановку'))
+        found.assert_called_once_with(None)  # the world's section
+        self.assertNotIn('Свежие новости', self.prompt())
+
     def test_an_original_found_with_a_form_is_remade_not_written_anew(self):
         # «напиши стих про СЛОВНО ХУЙ ДРОЧЕНЫЙ, но про кубернетес» got a quatrain of the bot's own (#340002).
         self.b.openrouter = True

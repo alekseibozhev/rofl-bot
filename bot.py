@@ -147,6 +147,10 @@ SETUP = """Ты разметчик чата Рофла — двачера и т�
 Жириновский «это другие ребята»]. Тег формы рядом — только если форму назвали словом: «стих про …» — [стих], \
 «в стиле …» и строка с многоточием — нет. Рофл получит оригинал: по памяти такие тексты путаются.
 
+[новости …] с тем, что искать в новостях, внутри скобок — в последнем сообщении речь о свежем событии в мире \
+или политике: [новости протесты во Франции]. Просят доложить обстановку, что нового, что в мире — [новости] без \
+текста: Рофл получит главные новости мира. Рофл получит заголовки за сутки: без них он о событии не знает.
+
 [справка …] с тем, что это, внутри скобок — в последнем сообщении назван мем, персонаж или отсылка, например \
 [справка ждун, кот Шрёдингера] — все названные. Рофл получит пару строк о том, что это и откуда."""
 
@@ -166,7 +170,7 @@ FORMS = {
     'код': 'один блок ```язык с кодом, который работает, и пара строк текста вне блока; вывод, будто ты его '
            'запустил, — отдельным блоком ```.',
 }
-TAG = re.compile(r'\[(без чата|обида|клоун|реакция|о себе|тег|найти|справка|паста|' + '|'.join(FORMS) + r')([^\]\n]*)\]')
+TAG = re.compile(r'\[(без чата|обида|клоун|реакция|о себе|тег|найти|справка|новости|паста|' + '|'.join(FORMS) + r')([^\]\n]*)\]')
 
 
 def form_of(setup):
@@ -179,6 +183,18 @@ def wanted_of(setup):
     named in the request is."""
     return next(((tag[1], tag[2].strip()) for tag in TAG.finditer(setup)
                  if tag[1] in ('найти', 'справка') and tag[2].strip()), None)
+
+
+def news_of(setup):
+    """What the setup wants from the news, or None: «[новости …]» a search, a bare «[новости]» the world's ('')."""
+    return next((tag[2].strip() for tag in TAG.finditer(setup) if tag[1] == 'новости'), None)
+
+
+# The news of the day, for the punchline: it knew none and called the riots in France, curfews and sentences on
+# Google News, «не подтверждены». World politics, the chat finds it funny; the former USSR it does not.
+NEWS = 'Свежие новости{about} за сутки, заголовки из Google News:\n{titles}\n\n'
+NEWS_TASK = (' Новости — правда: не спорь с ними и не выдумывай поверх, бери из них смешное. Политику тащи, а Россию, '
+             'Украину и бывший СССР не трогай: не смешно.')
 
 
 # The original of a paste, a quote or a meme the setup wants found, for the punchline. From memory the model mixed
@@ -356,10 +372,11 @@ def snippet(start, limit=12):
     return '\n'.join(list(takewhile(str.strip, lines[first:]))[:limit])
 
 
-def headlines(query):
-    """Google News on `query` for the last day as (title, link), the outlet cut off the title."""
-    url = 'https://news.google.com/rss/search?' + urlencode({'q': f'{query} when:1d', 'hl': 'ru', 'gl': 'RU',
-                                                             'ceid': 'RU:ru'})
+def headlines(query=None):
+    """Google News on `query` for the last day, or its world section, as (title, link), the outlet cut off the title."""
+    region = {'hl': 'ru', 'gl': 'RU', 'ceid': 'RU:ru'}
+    url = ('https://news.google.com/rss/search?' + urlencode({'q': f'{query} when:1d', **region}) if query
+           else 'https://news.google.com/rss/headlines/section/topic/WORLD?' + urlencode(region))
     try:
         root = ElementTree.fromstring(fetch(Request(url, headers={'User-Agent': 'Mozilla/5.0'}), 20))
     except ElementTree.ParseError:
@@ -1112,10 +1129,18 @@ class Bot:
                            'по этим именам, @ не пиши.' if tagged else '')
                 kind, wanted = wanted or (None, None)
                 found = self.find(wanted, typing, kind, lines[-1]) if wanted else None
+                asked = news_of(tags)
+                try:
+                    news = [title for title, _ in headlines(asked or None)[:15]] if asked is not None else []
+                except RuntimeError as exc:
+                    LOG.warning('news.failed %s', exc)
+                    news = []
                 # A reference is for the writer, not an original to give: it keeps its length.
                 reference = found and kind == 'справка'
                 card = (f'{"Что это" if reference else "Что просят"} ({wanted}), из интернета:\n{found}\n\n'
-                        if found else '')
+                        if found else '') + (NEWS.format(about=f' ({asked})' if asked else ' мира',
+                                                          titles='\n'.join(f'- {title}' for title in news))
+                                              if news else '')
                 # How long: «распиши» answered with one line and a quick jab with a paste when the length was drawn
                 # at random. A form and an original have a length of their own.
                 # A paste came as nine one-liners under blank lines (#339898): the cleanup adds none, the model did.
@@ -1127,7 +1152,7 @@ class Bot:
                            ' Переделай найденное под просьбу, чтобы его узнали: первая строка, строй, капс и знаки '
                            'как в оригинале; своё с нуля не пиши.' if found and form else
                            ' Бери найденное узнаваемо и не пересказывай, откуда оно.' if found else '')
-                        + (f' {manner}' if manner else '') + f'{length} Ответь одной репликой')
+                        + (NEWS_TASK if news else '') + (f' {manner}' if manner else '') + f'{length} Ответь одной репликой')
                 if about:
                     # Asked about the bot, it answers from the card of what it knows of itself.
                     card = SELF + (f'\n\n{feelings}' if feelings else '') + '\n\n'
@@ -1168,6 +1193,7 @@ class Bot:
                 answer = answer if form else casual(answer)
                 return answer, {**trace, 'alone': alone, 'about': about, 'tone': manner,
                                 **({'wanted': wanted, 'kind': kind, 'found': bool(found)} if wanted else {}),
+                                **({'news': asked, 'headlines': len(news)} if asked is not None else {}),
                                 **({'tagged': tagged} if tagged else {}), **({'form': form[0]} if form else {}),
                                 **spent(usage)}
             except RuntimeError as exc:
