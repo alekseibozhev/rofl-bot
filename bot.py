@@ -185,14 +185,18 @@ READER = 'Ты находишь тексты в интернете и выпис
 # Only what people repeat: «опа, у меня тоже есть птички» is funny by itself, the battle round retold killed it.
 # The original whole: a reader that brought three lines of the Bush paste got a two-line answer back (#339914).
 # Of two versions of a paste it takes the best known one.
-FIND = ('Найди в интернете: {wanted}\n\nОтветь так:\nЧто повторяют: дословно то, что люди повторяют как мем. '
+# The request comes along as it is: the setup, told to quote, put «СЛОВНО ХУЙ ДРОЧЕНЫЙ» in as «стих про слово хуй»
+# and the search brought «Шёл хуй по хую» (#340002); on the words of the message it found the paste.
+REQUEST = ('Сообщение как есть:\n{request}\n\nНайди в интернете то, о чём в нём речь, — само это, а не то, '
+           'что с ним просят сделать; строку из сообщения ищи теми же словами. Разметчик понял так: {wanted}')
+FIND = ('{ask}\n\nОтветь так:\nЧто повторяют: дословно то, что люди повторяют как мем. '
         'Паста, цитата, песня — сам текст целиком, как его постят, своими словами не пересказывай; длинный — самая '
         'узнаваемая часть подряд, 10–15 строк. Вариантов несколько — бери самый известный. Мем-фраза — только сама '
         'фраза, без текста, откуда она.\nКак обыгрывают: одна-две строки — когда и как её вставляют.\n\nВ найденном '
         'нет ничего похожего — ответь одним словом НЕТ, не сочиняй.')
 # What a meme named in a request is: asked about «бомбардиро крокадило и тун тун сахур устроили протесты во франции»
 # (#339991), the writer knew neither and went at the asker, «Леха, ты…», in the live answer and three replays.
-ABOUT_MEME = ('Найди в интернете, что это: {wanted}\n\nОтветь в 2–4 строки: что это, откуда пошло, как выглядит и '
+ABOUT_MEME = ('{ask}\n\nОтветь в 2–4 строки: что это, откуда пошло, как выглядит и '
               'как его обыгрывают. Без шуток и оценок.\n\nВ найденном нет ничего похожего — ответь одним словом НЕТ, '
               'не сочиняй.')
 
@@ -979,7 +983,7 @@ class Bot:
         return self.generate([{'role': 'user', 'content': with_image(chat, image)}], chat_id=chat_id, topic=topic,
                              system=SETUP, temperature=0.7)
 
-    def find(self, wanted, chat_id=None, kind='найти'):
+    def find(self, wanted, chat_id=None, kind='найти', request=None):
         """The original of what the setup wants found, or for «справка» a few lines of what it is, as the reader
         copied it out of the search, or None: not found, or no search on the local model."""
         if not self.openrouter:
@@ -987,7 +991,10 @@ class Bot:
         # It thinks a little: without it the reader said НЕТ 5 times of 6 over sources that held the Bush paste,
         # with «low» it copied the paste out 6 times of 6.
         try:
-            ask = (ABOUT_MEME if kind == 'справка' else FIND).format(wanted=wanted)
+            about = kind == 'справка'
+            what = (REQUEST.format(request=request, wanted=wanted) if request
+                    else f'Найди в интернете{", что это" if about else ""}: {wanted}')
+            ask = (ABOUT_MEME if about else FIND).format(ask=what)
             found = self.generate([{'role': 'user', 'content': ask}], chat_id=chat_id,
                                   system=READER, temperature=0.3, search=True, effort='low')
         except RuntimeError as exc:
@@ -1098,7 +1105,7 @@ class Bot:
                 tagging = (f' Тегнуты: {", ".join(dict.fromkeys(people[user] for user in tagged))} — обращайся к ним '
                            'по этим именам, @ не пиши.' if tagged else '')
                 kind, wanted = wanted or (None, None)
-                found = self.find(wanted, typing, kind) if wanted else None
+                found = self.find(wanted, typing, kind, lines[-1]) if wanted else None
                 # A reference is for the writer, not an original to give: it keeps its length.
                 reference = found and kind == 'справка'
                 card = (f'{"Что это" if reference else "Что просят"} ({wanted}), из интернета:\n{found}\n\n'

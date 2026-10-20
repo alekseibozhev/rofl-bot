@@ -229,7 +229,10 @@ class ConversationTests(unittest.TestCase):
         self.b.rude = 1  # never on a request for an original
         self.b.handle(self.message('бот, в стиле: опа, у меня тоже есть птички'))
         search, punchline = self.b.generate.call_args_list
-        self.assertIn('Найди в интернете: мем «у меня тоже есть птички»', search.args[0][0]['content'])
+        # The message as it is, the setup's words only a hint: told to quote, it searched «стих про слово хуй».
+        self.assertIn('Сообщение как есть:\nUser 7: бот, в стиле: опа, у меня тоже есть птички\n',
+                      search.args[0][0]['content'])
+        self.assertIn('Разметчик понял так: мем «у меня тоже есть птички»', search.args[0][0]['content'])
         self.assertEqual(search.kwargs['system'], bot.READER)
         self.assertTrue(self.prompt().startswith('Что просят (мем «у меня тоже есть птички»), из интернета:\n'
                                                  'Что повторяют: Опа, у меня тоже есть птички'))
@@ -260,7 +263,7 @@ class ConversationTests(unittest.TestCase):
         self.b.rude = 1  # never on a request with a reference
         self.b.handle(self.message('бот, тун тун сахур устроил погромы во франции'))
         search = self.b.generate.call_args_list[0]
-        self.assertIn('Найди в интернете, что это: тун тун сахур', search.args[0][0]['content'])
+        self.assertIn('Разметчик понял так: тун тун сахур', search.args[0][0]['content'])
         self.assertIn('2–4 строки', search.args[0][0]['content'])
         self.assertEqual((search.kwargs['system'], search.kwargs['effort']), (bot.READER, 'low'))
         self.assertTrue(self.prompt().startswith(f'Что это (тун тун сахур), из интернета:\n{about}\n\n'))
