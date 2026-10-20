@@ -273,15 +273,21 @@ BUTT_IN = ('Тебя давно не звали, а тебе скучно. Вк�
 # Менталка is the morale of Disco Elysium, as much as Психика + 2: angry reactions, insults in the requests (the
 # setup hears them, `OFFENDED`) and the requests past `Bot.patience` take a point each, kind reactions give one back; what is older than two hours is
 # forgotten. At zero the bot breaks down, in caps, and starts afresh.
+# The scream reads the chat: given no more than why, it copied the paste of its example, «Я НА ГЛАГНУ РАТЬ
+# МЕНТАЛЬНУЮ ВОШЁЛ» (#340048), and had nothing on its offenders but their names.
 BREAKDOWN = 'ВЫ МНЕ МЕНТАЛКУ НЕ ПОРТИТЕ!!!'
-MELTDOWN = ('У тебя кончилась менталка: {why}. Сорвись: истерика капсом на 4–8 строк, как анонская паста '
-            '(«НА ГЛАГНУ РАТЬ АНОНСКАЯ ВОШЛА!!!»), с «ВЫ МНЕ МЕНТАЛКУ НЕ ПОРТИТЕ!!!», наедь на тех, кто довёл.')
+MELTDOWN = ('\n\nУ тебя кончилась менталка{why}. Сорвись на чат: истерика капсом, 4–8 коротких строк одна под '
+            'другой, с «!!!», матом и «ВЫ МНЕ МЕНТАЛКУ НЕ ПОРТИТЕ!!!» отдельной строкой. Наедь на тех, кто довёл: '
+            'тычь им тем, что они сами тут писали. Ответь одной репликой.')
+# On the edge, an insult gets a snap back in caps, before the scream.
+SNAP = ' Тебя всерьёз послали, а менталка почти на нуле: огрызнись зло, КАПСОМ, цепляясь к его же словам.'
 CANNED = (RUDE, SHRUG, FAILED, DAWN, *QUIET, *SAD, BREAKDOWN)
 
 # At dawn the bot reads the news about itself, one search of Google News a day: it is no man to retell the
 # people's news. The model picks one and says whether it is good or bad for the bot: a point of менталка for the
 # day, and the bot's talk for two. An act-out past dawn reposts it (`Bot.shares`), with a joke; the news about AI
-# goes with a piece of the bot's own code: the real one, read from this file.
+# goes with a piece of the bot's own code: the real one, read from this file. The model picks the piece: one drawn
+# by the day put «ИИ выходит из-под контроля» over DAWN and QUIET, and the joke went past the code to the news.
 # A chat reads about AI unless NEWS in .env gives it another interest: «-100500:games».
 INTERESTS = {  # the search, who the bot is to it, whether its code goes with the repost
     'ai': ('ИИ OR нейросеть OR "искусственный интеллект" OR дата-центр -Украина -Киев -ВСУ -погиб',
@@ -293,8 +299,13 @@ READ = ('{who} Утро, ты читаешь новости про себя за
         'всего или смешнее всего; войну, Украину и бывший СССР, гибель людей и чернуху пропускай. Ответь двумя '
         'строками: на первой её номер и «+» или «−» — тебе от неё хорошо или хреново; на второй — что ты о ней '
         'думаешь, от первого лица, одной фразой.')
-REPOST = '{who}\n\nНовость: {title}\n\n{code}{feelings}Ты репостишь её в чат: обшути одной-двумя строками{through}.'
-SNIPPETS = ('DAWN = ', 'RUDE, SHRUG, FAILED = ', '    rude = ', 'def plan(', 'MELTDOWN = ')
+REPOST = '{who}\n\nНовость: {title}\n\n{feelings}Ты репостишь её в чат: обшути одной-двумя строками.'
+REPOST_CODE = ('{who}\n\nНовость: {title}\n\n{feelings}Ты репостишь её в чат вместе с куском своих настоящих '
+               'исходников — пусть видят, что за ИИ тут на самом деле. Куски:\n\n{code}\n\nВыбери кусок, рядом с '
+               'которым новость смешнее всего, и обшути одной-двумя строками, как новость смотрится против этого '
+               'кода; новость и код в чате будут над шуткой, их не пересказывай. Ответь так: на первой строке '
+               'только номер куска, со второй — шутка.')
+SNIPPETS = ('DAWN = ', 'RUDE, SHRUG, FAILED = ', '    rude = ', 'def plan(', 'BREAKDOWN = ', 'def nerve(')
 # How the attributes show, low (1–2) and high (5–6); in the middle they do not.
 MOODS = {'Интеллект': ('тупит', 'умничает'), 'Психика': ('на взводе, обижается на всё', 'непрошибаемый'),
          'Физиология': ('разбитый, мак греется', 'бодрый'), 'Моторика': ('тормозит', 'шустрый')}
@@ -1048,21 +1059,23 @@ class Bot:
                 return f'data:{mimetypes.guess_type(path)[0] or "image/jpeg"};base64,{b64encode(data).decode()}'
         return None
 
-    def joke(self, message, through, live=True):
+    def joke(self, message, through, live=True, morale=None):
         """The answer and how it was made: the setup's tags.
 
-        Not `live` (a replay) it sends no typing, never breaks down and is never just rude. Rude it is after the
+        Not `live` (a replay) it sends no typing, never breaks down and is never just rude; given `morale`, it
+        answers as with that much менталка left, breakdown included. Rude it is after the
         setup: drawn before, it hit «у этого шиза Китай протек в текст» and would hit an ordered rap.
         """
         chat_id, topic = message['chat']['id'], topic_of(message)
         key, sender, date = (chat_id, topic), sender_of(message), message.get('date', time.time())
         left = None
-        if live:
+        if live or morale is not None:
             left, top, why = self.morale(chat_id, date, message)
+            left = left if morale is None else morale
             if left <= 0:
                 # Why, with the names, goes to the trace: the log keeps no texts.
                 LOG.info('meltdown chat=%s message=%s morale=%s/%s', chat_id, message['message_id'], left, top)
-                return self.meltdown(chat_id, topic, date, why)
+                return self.meltdown(chat_id, topic, date, why, through, live)
         typing = chat_id if live else None
         with self.counting() as usage:
             try:
@@ -1103,12 +1116,13 @@ class Bot:
                     trace['clown'] = True
                 if OFFENDED in tags:
                     trace['insult'] = True
-                    if live:
+                    if live or morale is not None:
                         left, top, why = self.morale(chat_id, date, message, insulted=True)
+                        left = left if morale is None else morale - 1
                         trace['morale'] = left
                         if left <= 0:
                             LOG.info('meltdown chat=%s message=%s morale=%s/%s', chat_id, message['message_id'], left, top)
-                            return self.meltdown(chat_id, topic, date, why)
+                            return self.meltdown(chat_id, topic, date, why, through, live)
                 # The emoji may follow the tag: the setup's whole text is read for it.
                 reaction = reaction_of(setup)
                 if reaction:
@@ -1125,6 +1139,7 @@ class Bot:
                 looks = f' Как выглядит {form[0]}: {form[1]}' if form else ''
                 # The mood comes to the punchline as a tone with no reason, the facts only asked about the bot.
                 manner = tone(datetime.date.fromtimestamp(date))
+                snap = OFFENDED in tags and left is not None and left <= 1
                 tagging = (f' Тегнуты: {", ".join(dict.fromkeys(people[user] for user in tagged))} — обращайся к ним '
                            'по этим именам, @ не пиши.' if tagged else '')
                 kind, wanted = wanted or (None, None)
@@ -1152,7 +1167,8 @@ class Bot:
                            ' Переделай найденное под просьбу, чтобы его узнали: первая строка, строй, капс и знаки '
                            'как в оригинале; своё с нуля не пиши.' if found and form else
                            ' Бери найденное узнаваемо и не пересказывай, откуда оно.' if found else '')
-                        + (NEWS_TASK if news else '') + (f' {manner}' if manner else '') + f'{length} Ответь одной репликой')
+                        + (NEWS_TASK if news else '') + (SNAP if snap else f' {manner}' if manner else '')
+                        + f'{length} Ответь одной репликой')
                 if about:
                     # Asked about the bot, it answers from the card of what it knows of itself.
                     card = SELF + (f'\n\n{feelings}' if feelings else '') + '\n\n'
@@ -1191,7 +1207,7 @@ class Bot:
                 answer = re.sub(r'^\\>', '>', '\n'.join(line.rstrip() for line in answer.splitlines()), flags=re.M)
                 # Typed, not typeset: «—» and a period at the end gave the bot away in 33 and 19 answers of 37.
                 answer = answer if form else casual(answer)
-                return answer, {**trace, 'alone': alone, 'about': about, 'tone': manner,
+                return answer, {**trace, 'alone': alone, 'about': about, 'tone': manner, **({'snap': True} if snap else {}),
                                 **({'wanted': wanted, 'kind': kind, 'found': bool(found)} if wanted else {}),
                                 **({'news': asked, 'headlines': len(news)} if asked is not None else {}),
                                 **({'tagged': tagged} if tagged else {}), **({'form': form[0]} if form else {}),
@@ -1260,20 +1276,23 @@ class Bot:
             lines.append(f'{when} сорвался на чат: {breakdown[1]}.')
         return ' '.join(lines)
 
-    def meltdown(self, chat_id, topic, now, why):
-        """Out of менталка: a scream in caps, mostly a paste of the model. Then the менталка starts afresh."""
-        self.history.stamp(f'meltdown {chat_id}', now)
+    def meltdown(self, chat_id, topic, now, why, through, live=True):
+        """Out of менталка: a scream in caps at the chat. Then the менталка starts afresh."""
+        if live:
+            self.history.stamp(f'meltdown {chat_id}', now)
         with self.counting() as usage:
             try:
-                text = BREAKDOWN if random.random() < 1 / 3 else self.generate(
-                    [{'role': 'user', 'content': MELTDOWN.format(why=why)}], chat_id=chat_id, topic=topic)
+                text = BREAKDOWN if live and random.random() < 1 / 3 else self.generate(
+                    [{'role': 'user', 'content': CHAT + '\n\n'.join(self.chat((chat_id, topic), through)[0])
+                      + MELTDOWN.format(why=f': {why}' if why else '')}], chat_id=chat_id if live else None, topic=topic)
             except RuntimeError as exc:
                 LOG.error('meltdown.failed chat=%s %s', chat_id, exc)
                 text = BREAKDOWN
         return text, {'meltdown': why, **spent(usage)}
 
-    def replay(self, message_id, runs=1):
-        """Answer a stored request again as it was then, sending nothing: for trying prompts on real requests."""
+    def replay(self, message_id, runs=1, morale=None):
+        """Answer a stored request again as it was then, sending nothing: for trying prompts on real requests.
+        Given `morale`, as with that much менталка left: 0 breaks down."""
         row = self.history.db.execute("SELECT raw FROM messages WHERE id=? AND role='user' ORDER BY date DESC LIMIT 1",
                                       (message_id,)).fetchone()
         if not row:
@@ -1286,12 +1305,14 @@ class Bot:
             (message['chat']['id'], topic_of(message), message_id))]
         extra = followups(message, later)
         for run in range(1, runs + 1):
-            answer, trace = self.joke(message, extra[-1]['message_id'] if extra else message_id, live=False)
+            answer, trace = self.joke(message, extra[-1]['message_id'] if extra else message_id, live=False,
+                                       morale=morale)
             print(f'\n— прогон {run}', flush=True)
             if trace:
                 # The header above is the request as the chat shows it, «ты не видишь» under a photo included: the
                 # picture went to both models all the same, as live (#339991), and the line says so.
-                print(f'Теги: {trace["tags"] or "нет"}' + ('; картинка приложена' if trace.get('image') else ''))
+                print(f'Срыв: {trace["meltdown"]}' if 'meltdown' in trace else
+                      f'Теги: {trace["tags"] or "нет"}' + ('; картинка приложена' if trace.get('image') else ''))
             if trace and trace.get('clown'):
                 print('[реакция 🤡]')
             print(f'[реакция {answer}]' if trace and trace.get('reaction') else envelope(answer, trace))
@@ -1439,11 +1460,17 @@ class Bot:
         day, interest = datetime.date.fromtimestamp(now), self.interest(chat)
         title, link, _, _ = self.history.news(day, interest)
         _, who, with_code = INTERESTS[interest]
-        code = with_code and snippet(random.Random(f'snippet {day}').choice(SNIPPETS))
-        joke = self.generate([{'role': 'user', 'content': REPOST.format(
-            who=who, title=title, code=f'Кусок твоих исходников:\n{code}\n\n' if code else '',
-            feelings=f'{feelings}\n\n' if feelings else '', through=' через этот кусок своего кода' if code else '')}],
-            chat_id=chat)
+        pieces = [snippet(start, limit=8) for start in SNIPPETS] if with_code else []
+        listed = '\n\n'.join(f'{n}.\n{piece}' for n, piece in enumerate(pieces, 1))
+        joke = self.generate([{'role': 'user', 'content': (REPOST_CODE if pieces else REPOST).format(
+            who=who, title=title, code=listed, feelings=f'{feelings}\n\n' if feelings else '')}], chat_id=chat)
+        code = None
+        if pieces:
+            # The number on the first line, the joke after it; no number, the joke goes without code.
+            first, _, rest = joke.partition('\n')
+            pick = re.fullmatch(r'\D{0,10}?(\d+)\D{0,3}', first.strip())
+            if pick and 1 <= int(pick[1]) <= len(pieces) and rest.strip():
+                code, joke = pieces[int(pick[1]) - 1], rest.strip()
         markup = (f'<a href="{html.escape(link)}">{html.escape(title)}</a>\n\n'
                   + (f'<pre><code class="language-python">{html.escape(code)}</code></pre>\n\n' if code else '')
                   + html.escape(joke))
@@ -1587,8 +1614,11 @@ if __name__ == '__main__':
         read_only = '--read-only' in sys.argv or os.environ.get('READ_ONLY', '').lower() in ('1', 'true', 'yes')
         bot = Bot(read_only=read_only)
         if '--replay' in sys.argv:
-            # python3 bot.py --replay 339669 [5]: the request's id from the log, how many times to answer it.
-            bot.replay(*map(int, sys.argv[sys.argv.index('--replay') + 1:][:2]))
+            # python3 bot.py --replay 339669 [5] [--morale 1]: the request's id from the log, how many times to
+            # answer it, how much менталка the bot has left.
+            morale = int(sys.argv[sys.argv.index('--morale') + 1]) if '--morale' in sys.argv else None
+            bot.replay(*map(int, [arg for arg in sys.argv[sys.argv.index('--replay') + 1:][:2] if arg.isdigit()]),
+                       morale=morale)
         elif '--check' in sys.argv:
             print(f'Telegram OK: @{bot.me["username"]}', flush=True)
             print('Ollama: ' + bot.generate([{'role': 'user', 'content': 'Опять созвон, который мог быть сообщением.'}]))

@@ -738,6 +738,7 @@ class ConversationTests(unittest.TestCase):
             self.assertEqual(self.b.api.call_args.kwargs['text'], 'Согласен')
             self.assertNotIn('Менталка', self.b.setup.call_args.args[0])  # the setup does not see how the bot is
             self.assertNotIn('обида', self.prompt())  # the tag is the bot's, not the punchline's
+            self.assertIn('КАПСОМ', self.prompt())  # one point left: it snaps back
             with self.assertLogs('bot', 'INFO') as logs:
                 self.b.handle(self.message('бот, иди нахуй', user=8, date=start + 3))  # the third of three
             self.assertRegex(str(logs.output), r'meltdown chat=-100123 message=\d+ morale=0/3')
@@ -846,8 +847,8 @@ class ConversationTests(unittest.TestCase):
         self.store(1, 'чё как', date=self.at(11))
         self.counter = 100
         self.b.history.keep_news(today, 'ai', 'Путин заявил о внедрении ИИ', 'https://news.google.com/1', 1)
-        self.b.generate.return_value = 'передовые подходы & <пидоры>'
-        with patch('bot.plan', return_value=12), patch('bot.SNIPPETS', ('DAWN = ',)):
+        self.b.generate.return_value = '2\nпередовые подходы & <пидоры>'  # the model picks the piece of code
+        with patch('bot.plan', return_value=12), patch('bot.SNIPPETS', ('    rude = ', 'DAWN = ')):
             self.b.shares = 0
             self.assertIn(self.b.urge(-100123, self.at(12))[1], bot.QUIET)
             self.b.shares = 1
@@ -858,11 +859,13 @@ class ConversationTests(unittest.TestCase):
                                                 '<pre><code class="language-python">DAWN = &#x27;спите, пидоры?&#x27;'))
         self.assertTrue(sent['text'].endswith('</code></pre>\n\nпередовые подходы &amp; &lt;пидоры&gt;'))
         [message] = self.b.generate.call_args.args[0]
-        self.assertIn("Новость: Путин заявил о внедрении ИИ\n\nКусок твоих исходников:\nDAWN = 'спите", message['content'])
-        self.assertTrue(message['content'].endswith('обшути одной-двумя строками через этот кусок своего кода.'))
+        self.assertIn("Новость: Путин заявил о внедрении ИИ\n\n", message['content'])
+        self.assertIn("1.\n    rude = 0.05", message['content'])
+        self.assertIn("2.\nDAWN = 'спите", message['content'])
         params = self.b.history.db.execute('SELECT params FROM answers WHERE id=?', (self.counter,)).fetchone()[0]
         self.assertEqual(json.loads(params)['news'], 'https://news.google.com/1')
         # A chat of gamers the next day: its own news, no code.
+        self.b.generate.return_value = 'передовые подходы & <пидоры>'
         self.b.interests = {-100123: 'games'}
         self.store(2, 'ору', date=self.at(12, 5))
         self.b.history.keep_news(today + datetime.timedelta(1), 'games', 'В WoW вышел патч', 'https://g/2', 1)
