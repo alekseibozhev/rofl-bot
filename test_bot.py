@@ -36,6 +36,11 @@ class ConversationTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def send(self, method, **kwargs):
+        if method == 'getChatMemberCount':
+            return 7
+        if method == 'getChatAdministrators':
+            return [{'user': {'id': 5, 'first_name': 'Roman', 'username': 'dazorb'}, 'status': 'creator'},
+                    {'user': {'id': 6, 'first_name': 'oracle', 'username': 'oracle_bot', 'is_bot': True}}]
         self.counter += 1
         return {'message_id': self.counter, 'date': int(time.time())}
 
@@ -195,9 +200,11 @@ class ConversationTests(unittest.TestCase):
         self.assertIn('Тегнуты: Anton — обращайся к ним по этим именам, @ не пиши.', self.prompt())
         self.b.setup.return_value = '[тег все]'
         self.b.handle(self.message('бот, потегай каждого'))
-        self.assertEqual(self.b.api.call_args.kwargs['text'], '@antoha_gs @anton_k @oxgrb\nСогласен')  # no bots
+        # The admins Telegram names are tagged too; of 7 in the chat it knows 3 people, Roman, itself and a bot.
+        self.assertEqual(self.b.api.call_args.kwargs['text'], '@antoha_gs @anton_k @dazorb @oxgrb\nСогласен')
+        self.assertIn('Ещё 1 человек в чате ты не знаешь', self.prompt())
         trace = json.loads(self.b.history.db.execute('SELECT trace FROM answers ORDER BY id DESC').fetchone()[0])
-        self.assertEqual(trace['tagged'], ['antoha_gs', 'anton_k', 'oxgrb'])
+        self.assertEqual(trace['tagged'], ['antoha_gs', 'anton_k', 'dazorb', 'oxgrb'])
         # The line of @ goes to Telegram only: kept, it was copied, and the setup tagged everyone unasked (#339988).
         stored = self.b.history.db.execute("SELECT content FROM messages WHERE role='assistant'").fetchall()
         self.assertEqual(stored, [('Согласен',), ('Согласен',)])

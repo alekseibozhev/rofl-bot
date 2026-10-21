@@ -232,6 +232,12 @@ def tagged_of(setup, people):
     return [user for user, name in people.items() if 'все' in asked or name.lower() in asked]
 
 
+def everyone_of(setup):
+    """Whether the setup tags the whole chat, «[тег все]»."""
+    return any(tag[1] == 'тег' and 'все' in {name.strip().lower() for name in tag[2].split(',')}
+               for tag in TAG.finditer(setup))
+
+
 def envelope(answer, trace):
     """What goes to Telegram: the answer with the @ of the people tagged before it. The history keeps the answer
     alone, both models read it: after two answers opening on «@anstol @antoha_gs …» the setup tagged everyone at «Рофл,
@@ -1128,6 +1134,14 @@ class Bot:
                 reaction = reaction_of(setup)
                 if reaction:
                     return reaction, {**trace, 'reaction': True, **spent(usage)}
+                # «Раздай всем участникам чата погоняла» got three of seven (#244): «Долбаеб даже всех участников чата
+                # перечислить не может». Telegram lists a bot no members, only the admins and how many there are.
+                unseen = 0
+                if everyone_of(tags):
+                    unseen = self.roster(chat_id, live)
+                    names = {**self.history.names(chat_id), self.me['username'].lower(): 'Рофл'}
+                    people = {user: name for user, name in names.items() if not user.endswith('bot')}
+                    unseen = max(0, unseen - len(names))
                 about, tagged, form, wanted = ABOUT in tags, tagged_of(tags, people), form_of(tags), wanted_of(tags)
                 long = any(tag[1] == 'паста' for tag in TAG.finditer(tags))
                 # «Расскажи анекдот» after an evening of one gag got the gag back: the punchline saw the chat full
@@ -1142,7 +1156,9 @@ class Bot:
                 manner = tone(datetime.date.fromtimestamp(date))
                 snap = OFFENDED in tags and left is not None and left <= 1
                 tagging = (f' Тегнуты: {", ".join(dict.fromkeys(people[user] for user in tagged))} — обращайся к ним '
-                           'по этим именам, @ не пиши.' if tagged else '')
+                           'по этим именам, @ не пиши.' if tagged else '') + (
+                    f' Ещё {unseen} человек в чате ты не знаешь: Telegram не показывает их боту, пока они не напишут.'
+                    if unseen else '')
                 kind, wanted = wanted or (None, None)
                 found = self.find(wanted, typing, kind, lines[-1]) if wanted else None
                 asked = news_of(tags)
@@ -1216,6 +1232,19 @@ class Bot:
             except RuntimeError as exc:
                 LOG.error('generation.failed %s', exc)
                 return FAILED, None
+
+    def roster(self, chat_id, live=True):
+        """How many are in the chat, the bot and bots included, or 0 if Telegram does not say. The admins, whom
+        Telegram does name, are remembered as if they wrote; a replay only counts."""
+        try:
+            count = self.api('getChatMemberCount', chat_id=chat_id)
+            if live:
+                self.history.remember(chat_id, *(admin['user'] for admin in
+                                                 self.api('getChatAdministrators', chat_id=chat_id)))
+        except RuntimeError as exc:
+            LOG.warning('roster.failed %s', exc)
+            return 0
+        return count
 
     def chat(self, key, through=sys.maxsize):
         """The chat up to message `through` as lines for the model, one name per person, and the names by username."""
