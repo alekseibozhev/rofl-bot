@@ -964,8 +964,9 @@ class Bot:
                                     for e in message.get('entities', []) + message.get('caption_entities', []))
         called = re.match(r'^(?:рофл|бот)(?:[\s,!:?]|$)', text, re.I)
         reply_to_me = reply.get('from', {}).get('id') == self.me['id']
-        has_other_mention = bool(re.search(r'@[a-zA-Z0-9_]{4,32}\b', text)) and not mentioned
-        return bool(mentioned or called or (reply_to_me and not has_other_mention))
+        # A reply to me that calls another bot is its question; a person tagged in it is for me to tag.
+        other_bot = bool(re.search(r'@[a-zA-Z0-9_]{1,29}bot\b', text, re.I)) and not mentioned
+        return bool(mentioned or called or (reply_to_me and not other_bot))
 
     def receive(self, message):
         """Store a group message as context. Returns what it asks for: a command, 'rofl' for the model, or None."""

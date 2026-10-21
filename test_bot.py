@@ -1061,6 +1061,9 @@ class ConversationTests(unittest.TestCase):
         self.b.handle(self.message('@test_bot и @oracle_test_bot ваше мнение?',
                                    reply_to_message={'from': {'id': 42}, 'text': 'Мой старый ответ'}))
         self.b.generate.assert_called_once()
+        self.b.handle(self.message('ТЕГНИ ЕГО @oxgrb И ЕБАНИ ДИСС',
+                                   reply_to_message={'from': {'id': 42}, 'text': 'Мой старый ответ'}))
+        self.assertEqual(self.b.generate.call_count, 2)
 
     def test_persistence_topics_reset_and_limits(self):
         for i in range(220):
