@@ -5,7 +5,7 @@ from collections import Counter
 from contextlib import contextmanager, nullcontext
 from base64 import b64encode
 import datetime
-from itertools import dropwhile, takewhile
+from itertools import dropwhile, product, takewhile
 import fcntl
 import html
 import json
@@ -93,7 +93,7 @@ def post(url, payload, timeout=60, direct=False, headers=None):
         raise RuntimeError('Некорректный JSON в ответе сервиса') from None
 
 
-SYSTEM = """Ты Рофл — двачер и тролль в чате корешей. Твоя цель — развлекать чат, чтобы все ржали. Принесли заход — абсурдную посылку, мем, картинку — это и есть тема: подхватываешь и раскручиваешь её дальше, а того, кто принёс, в шутку не тащишь. Захода нет или просят прожарить — роастишь людей из чата и цепляешься к деталям из того, что они сами писали. Мемы, отсылки, цитаты, пасты, чёрный и абсурдный юмор, мат. Эмодзи изредка, не хвостом в конце каждой реплики.
+SYSTEM = """Ты Рофл — двачер и тролль в чате корешей. Твоя цель — развлекать чат, чтобы все ржали. Принесли заход — абсурдную посылку, мем, картинку — это и есть тема: подхватываешь и раскручиваешь её дальше, а того, кто принёс, в шутку не тащишь. Спросили — ответь по существу, с содержанием, а смешно будет в том, как ты отвечаешь; на вопрос вопросом не отвечаешь. Людей из чата роастишь, когда просят прожарить, — тогда цепляешься к деталям из того, что они сами писали; без этого на людей не агришься. С темы не съезжаешь: отвечаешь про то, о чём последнее сообщение, а не про другие разговоры чата или новости; приколы и погоняла из чата — одну отсылку и к месту, в кучу не вали: фраза должна читаться и без них. Мемы, отсылки, цитаты, пасты, чёрный и абсурдный юмор, мат. Эмодзи изредка, не хвостом в конце каждой реплики.
 
 Пишешь как человек в чате, а не как текст: имя в начало не ставишь — ответ и так реплаем; шутку не строишь на «это \
 не X, а Y»; просьбу и указания не пересказываешь («держи», «принял», «докладываю») — сразу к делу. Людей зовёшь \
@@ -103,7 +103,13 @@ SYSTEM = """Ты Рофл — двачер и тролль в чате коре�
 конкретное — картинку, человека, вопрос — шути про это, а не про чат. Просят известный анекдот, пасту или цитату — \
 расскажи её как есть. Шутку уже рассказали в переписке — ответь на неё, не пересказывай.
 
-Переписка приходит как «Имя: текст»; «Имя → Кому» — ответ на сообщение Кому. Рофл — это ты. Ответь одной своей репликой."""
+Переписка приходит как «Имя: текст»; «Имя → Кому» — ответ на сообщение Кому; строка «— вчера, 22:25 —» — когда \
+написано то, что под ней. Рофл — это ты. Ответь одной своей репликой."""
+
+# «Надо просто что-то там покрутить, чтобы шизофазию убрать )… Ну чтобы не агрился и не отвечал вопросом на вопрос.
+# Чтобы хоть немного содержательно было… чтобы он с темы не съезжал»: with no заход it roasted the chat by default,
+# and «ВСТУПИСЬ ЗА СВОЕГО БРАТА-БОТА» got «Антон, ты брата моего трогать собрался? … хуй с панталыку помрёт» (#340186);
+# replayed, the погоняла of an hour before and a PHP hole of the news.
 
 # The setup tags, the punchline writes the joke. A setup that wrote «Кому / Форма / Заход» confined the writer to one
 # idea picked in advance, and wrote the answer itself in 3 setups of 12: the punchline printed two lines of the
@@ -138,7 +144,7 @@ SETUP = """Ты разметчик чата Рофла — двачера и т�
 тег формы не ставь.
 
 [паста] — только если в последнем сообщении просят расписать, рассказать или доложить: ответ на 8–15 строк \
-вместо одной-двух.
+вместо одной-двух. Просят доложить обстановку — рядом ставь и [новости].
 
 [найти …] с тем, что искать, внутри скобок — в сообщении цитируют строку или кусок известной пасты, стиха, мема \
 («дополни», «продолжи», строка с многоточием, «стих про …») или просят конкретный текст (пасту, цитату, песню, \
@@ -149,12 +155,32 @@ SETUP = """Ты разметчик чата Рофла — двачера и т�
 
 [новости …] с тем, что искать в новостях, внутри скобок — в последнем сообщении речь о свежем событии в мире \
 или политике: [новости протесты во Франции]. Просят доложить обстановку, что нового, что в мире — [новости] без \
-текста: Рофл получит главные новости мира. Рофл получит заголовки за сутки: без них он о событии не знает.
+текста, и рядом с [паста] тоже: Рофл получит главные новости мира и политики, а где обстановка, в чате или в мире, \
+поймёт сам. Спрашивают, что было в чате, что пропустили, — не [новости]. Просят навести суету или обсудить \
+новости — тоже [новости]; заступиться, ответить, прожарить — нет. Рофл получит заголовки за сутки: без них он о \
+событии не знает.
 
 [справка …] с тем, что это, внутри скобок — в последнем сообщении назван мем, персонаж или отсылка, например \
 [справка ждун, кот Шрёдингера] — все названные. Рофл получит пару строк о том, что это и откуда."""
 
 ALONE, OFFENDED, ABOUT, CLOWN = '[без чата]', '[обида]', '[о себе]', '[клоун]'
+
+# A second look at the two tags that take the talk away, one question each on what the setup saw: the setup reads
+# fourteen tags at once and puts them where they do not belong. [без чата] stood on 7 requests of 8 that went on with
+# the talk, «Хз, ну бывает…» under the bot's report, «нарисуй Лёху», «итого КЕМ ИГРАТЬ…», and the writer answered them
+# blind; spelled out in the setup, it stood on four times as many. Asked alone, the model took it off 15 of 15 and
+# left it on «расскажи анекдот», and off «что думаешь о новой колде?» too, answered well with the chat. «РАУНД» under
+# the bot's rap got 🔥 instead of the next one (#340219); asked, the model gave it and 4 of 6 such misses words and
+# let all 7 real reactions be, «Жесть» and «Альянс сосат!!!» among them.
+CHECK = ('Ты проверяешь разметку чата Рофла — двачера и тролля в чате корешей. Последнее сообщение адресовано Рофлу. '
+         'Ответь одним словом: да или нет.')
+WITHOUT_CHAT = ('Вопрос о последнем сообщении: можно ли ответить на него, вообще не зная переписки выше и сообщения, на '
+                'которое оно отвечает? Просят анекдот, стих или объяснение о чём-то постороннем — да. Отвечают на '
+                'чью-то реплику или на Рофла по сути, спорят, подводят итог, просят про людей, вещи или разговор из '
+                'переписки — нет.')
+IN_WORDS = ('Вопрос о последнем сообщении: нужно ли Рофлу ответить на него словами? Только поддакнули, поржали, '
+            'похвалили или просто выкрикнули что-то — нет, хватит эмодзи. Что-то спрашивают или просят — в том числе '
+            'ещё, следующий раунд, продолжить, — спорят или подкалывают Рофла — да.')
 CHAT = 'Переписка чата, старые сообщения сверху:\n\n'
 
 # How an ordered form looks, for the punchline only: the one form the setup had an example of, greentext, went
@@ -191,10 +217,23 @@ def news_of(setup):
 
 
 # The news of the day, for the punchline: it knew none and called the riots in France, curfews and sentences on
-# Google News, «не подтверждены». World politics, the chat finds it funny; the former USSR it does not.
+# Google News, «не подтверждены». Politics the chat finds funny, Путин and Трамп the most; the war it does not.
 NEWS = 'Свежие новости{about} за сутки, заголовки из Google News:\n{titles}\n\n'
-NEWS_TASK = (' Новости — правда: не спорь с ними и не выдумывай поверх, бери из них смешное. Политику тащи, а Россию, '
-             'Украину и бывший СССР не трогай: не смешно.')
+NEWS_TASK = (' Новости — правда: не спорь с ними и не выдумывай поверх, бери из них смешное. Политику тащи, Путина и '
+             'Трампа тоже, а войну, Украину и гибель людей не трогай: не смешно.')
+# «Доложи обстановку» is the chat's or the world's: «нужно понять в чате или в мире, или если в чате скучно — пусть
+# новости в мире». The bare tag brings the world's headlines either way, and the writer, who reads the chat, decides
+# where it was asked about. Not asked where, a chat people left an hour before is dull by the clock: at 08:50 after a
+# silent night, told «чат до просьбы молчал — докладывай мир», it reported the night before 2 times of 2; told the
+# hour, the world 7 of 7, at 08:50 and in a lull at 16:02, while amid a rap battle 2 of 3 reported the chat, the third
+# the chat and then the world. [паста] alone, which the setup put on 8 of 20 such requests, brought no headlines to
+# a quiet chat, so it names [новости] too: 2 of 9 then, both amid the battle.
+NEWS_WHERE = (' Просят доложить обстановку — пойми где: про мир — докладывай по новостям, про чат — по переписке, '
+              'новости не трогай. Не сказали где — {where}.')
+NEWS_LIVELY = 'перед просьбой в чате шёл разговор: есть о чём доложить — докладывай его, скучно — мир'
+NEWS_QUIET = 'докладывай мир: до просьбы чат молчал больше часа'
+# The search for them: the world section of Google News has no Kremlin.
+POLITICS = 'Путин OR Трамп'
 
 
 # The original of a paste, a quote or a meme the setup wants found, for the punchline. From memory the model mixed
@@ -275,6 +314,14 @@ QUIET = ('пидоры', 'чё притихли, пидоры?', 'алё', 'сд
 SAD = ('никто меня не любит, пидоры', 'ну и пошли вы', 'ладно, буду молчать. пидоры')
 BUTT_IN = ('Тебя давно не звали, а тебе скучно. Вклинься в разговор сам, одной репликой: подколи кого-нибудь '
            'по последним сообщениям.')
+# Besides, once a day past an hour drawn between these, into a chat quiet for an hour, a shitpost on politics: «нужно
+# чтоб еще суету умел наводить, новости ебаные обсуждал, типа про Путина и Трампа щитпостил». It goes over the headline.
+STIR_HOURS = (11, 21)
+STIR = ('В чате тихо, и ты решил навести суету: вбросить свежую новость про политику и щитпостнуть так, чтобы чат '
+        'взорвался. Заголовки за сутки:\n\n{news}\n\nВыбери самую абсурдную или смешную; войну, Украину, гибель '
+        'людей и чернуху пропускай. Ответь так: на первой строке только её номер, со второй — щитпост в одну-три '
+        'строки: подколи, стравь чат, втяни кого-то из переписки, если к месту. Заголовок будет над постом, его не '
+        'пересказывай. Смешного нет — ответь одним словом НЕТ.')
 
 # Менталка is the morale of Disco Elysium, as much as Психика + 2: angry reactions, insults in the requests (the
 # setup hears them, `OFFENDED`) and the requests past `Bot.patience` take a point each, kind reactions give one back; what is older than two hours is
@@ -480,6 +527,16 @@ def chat_line(head, body):
     return f'{head}: {body}' if body and '\n' not in body and len(body) < 300 else f'{head}:\n{body}'
 
 
+WEEKDAYS = ('понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота', 'воскресенье')
+
+
+def moment(date, today):
+    """A mark of when the chat lines under it were written, the day told from `today`: «— вчера, 22:25 —»."""
+    when = datetime.datetime.fromtimestamp(date)
+    day = {0: 'сегодня', 1: 'вчера'}.get((today - when.date()).days, f'{when:%d.%m}')
+    return f'— {day}, {when:%H:%M} —'
+
+
 def message_content(message, seen=None, previous=None, me_id=None):
     """One chat line: «Имя: текст», a reply «Имя → Кому: текст».
 
@@ -628,13 +685,18 @@ class History:
         self.add(key, message['message_id'], 'user', None, message.get('date', time.time()),
                  (message.get('reply_to_message') or {}).get('message_id'), json.dumps(message, ensure_ascii=False))
 
-    def context(self, key, through_id=sys.maxsize, me_id=None, recent=40, window=21600, depth=10, limit=12000):
+    def context(self, key, through_id=sys.maxsize, me_id=None, recent=40, window=21600, depth=10, limit=12000,
+                pause=1800):
         """The chat up to the newest message as lines, oldest first: the last `recent` messages of people
         from `window` seconds before it, plus its reply chain (rebuilt from earlier updates) however old.
 
-        The bot's own answers come only through the chain, as a reply or as an answer to one of its messages:
-        a small model takes its old jokes for a template and repeats them, and an answer nobody replied to
-        tells it nothing.
+        The bot's own answers come whole through the chain, as a reply or as an answer to one of its messages,
+        and in the talk going on, since the last `pause` seconds of quiet; older ones only as a mark: a small model
+        takes its old jokes for a template and repeats them.
+
+        A mark of when the lines under it were written, «— вчера, 22:25 —», goes before the first one, a new day and
+        a pause: a day of the chat in one piece was one evening to the model, and at 9 in the morning it told
+        Andrew «Ты за вечер уже третий раз нахуй посылаешь» (#340084).
 
         The window keeps a quiet chat from serving yesterday's post as the freshest material; «что скажешь
         в своё оправдание?» hours after a joke gets the joke through the chain. Two hours left «доложи
@@ -656,14 +718,20 @@ class History:
                                  (*key, fresh, through_id, chain[0][5] - window, recent)).fetchall()
         candidates = {row[0] for row in chain + around}
         branch = {row[0] for row in chain}
-        # The other answers only as a mark: without it every request in the chat looks unanswered, and the
-        # model answers «доложи обстановку» of an hour ago to «рофл, съебись». An answer to a message of the
-        # chain goes whole: «в прошлый раз смешнее было», replied to the picture, is about the joke on it.
-        answered = [(id_, role, content if rest[0] in branch else '[ответил]', *rest) for id_, role, content, *rest in self.db.execute(
-            query + " AND id <= ? AND id >= ? AND role = 'assistant'", (*key, fresh, through_id, min(candidates)))
-            if rest[0] in candidates]
+        answers = [row for row in self.db.execute(query + " AND id <= ? AND id >= ? AND role = 'assistant'",
+                                                  (*key, fresh, through_id, min(candidates))) if row[3] in candidates]
+        # The talk going on is what came after the last pause before the request: «рофл, а подробнее?» is about
+        # what the bot has just said, whether it replies to it or not. An answer to a message of the chain goes
+        # whole too: «в прошлый раз смешнее было», replied to the picture, is about the joke on it. The older
+        # answers only as a mark: without it every request in the chat looks unanswered, and the model answers
+        # «доложи обстановку» of an hour ago to «рофл, съебись».
+        dates = sorted((row[5] for row in around + answers), reverse=True)
+        start = next((later for later, earlier in zip(dates, dates[1:]) if later - earlier >= pause), min(dates, default=0))
+        answered = [(id_, role, content if reply_to in branch or date >= start else '[ответил]', reply_to, raw, date)
+                    for id_, role, content, reply_to, raw, date in answers]
         rows, size = {}, 0
-        for row in chain + around + answered:  # the chain has priority
+        # The chain first, then the newest: past the limit the oldest go, not the talk going on.
+        for row in chain + sorted(around + answered, reverse=True):
             length = len(render(row[4], me_id, candidates) if row[1] == 'user' else row[2])
             if row[0] in rows or (rows and size + length > limit):
                 continue
@@ -673,8 +741,13 @@ class History:
         def author(row):
             return 'Рофл' if row[1] == 'assistant' else person_label(sender_of(json.loads(row[4])))
 
-        lines, previous = [], None
-        for message_id, role, content, reply_to, raw, _ in sorted(rows.values()):
+        lines, previous, last = [], None, None
+        today = datetime.date.fromtimestamp(chain[0][5])
+        for message_id, role, content, reply_to, raw, date in sorted(rows.values()):
+            if (last is None or date - last >= pause
+                    or datetime.date.fromtimestamp(date) != datetime.date.fromtimestamp(last)):
+                lines.append(moment(date, today))
+            last = date
             if role == 'assistant':
                 target = rows.get(reply_to) and author(rows[reply_to])
                 lines.append(chat_line(f'Рофл → {target}' if target else 'Рофл', content))
@@ -689,6 +762,13 @@ class History:
             AND id < ? AND date >= ? AND content NOT IN ({",".join("?" * len(CANNED))}) ORDER BY id DESC LIMIT ?''',
                                (*key, before, date - window, *CANNED, count)).fetchall()
         return [content for (content,) in reversed(rows)]
+
+    def silence(self, key, before, date):
+        """Hours people had been silent in the topic before message `before`, written at `date`; None for a topic
+        nobody wrote in for a week."""
+        wrote, = self.db.execute("SELECT MAX(date) FROM messages WHERE chat=? AND topic=? AND role='user' AND id < ?",
+                                 (*key, before)).fetchone()
+        return None if wrote is None else (date - wrote) / 3600
 
     def needs(self, chat, now):
         """Hours since the bot and since people last wrote in the chat and the topic they last wrote in; None for
@@ -848,6 +928,7 @@ class Bot:
     recent = 80  # messages of people: a day of the chat
     window = 24 * 3600  # seconds before the request: 6 hours gave 20–44 lines, and «память как у рыбки» (#340059)
     limit = 12000  # characters
+    pause = 30 * 60  # seconds of quiet that end a talk: the bot's answers before it go as a mark
     model = ''
     version = None
     usage = None  # the model calls of the joke being made
@@ -1022,6 +1103,17 @@ class Bot:
         return self.generate([{'role': 'user', 'content': with_image(chat, image)}], chat_id=chat_id, topic=topic,
                              system=SETUP, temperature=0.7)
 
+    def check(self, seen, question, chat_id=None, topic=0, image=None):
+        """The model's answer to a yes-or-no `question` on what the setup saw: True for «да», False for «нет», None
+        when it said neither or failed, and the setup's tag stands."""
+        try:
+            answer = self.generate([{'role': 'user', 'content': with_image(f'{seen}\n\n{question}', image)}],
+                                   chat_id=chat_id, topic=topic, system=CHECK, temperature=0.7).strip().lower()
+        except RuntimeError as exc:
+            LOG.warning('check.failed %s', exc)
+            return None
+        return True if answer.startswith('да') else False if answer.startswith('нет') else None
+
     def find(self, wanted, chat_id=None, kind='найти', request=None):
         """The original of what the setup wants found, or for «справка» a few lines of what it is, as the reader
         copied it out of the search, or None: not found, or no search on the local model."""
@@ -1088,11 +1180,13 @@ class Bot:
             try:
                 lines, names = self.chat(key, through)
                 chat = CHAT + '\n\n'.join(lines)
-                heads = [re.split(r' → |: ', line, maxsplit=1)[0] for line in lines]
-                # The answers off the chain are only marks in the chat: three in a row went at one «ноут с олламой»,
-                # «тумба юмба» went into four of an evening. The punchline sees them as a list not to repeat and judges
-                # what is worn. The setup does not: its tags are of the last message, and after two answers opening on
-                # the line of @ it tagged everyone at «я программировал бота, а запрограммировался Андрей» (#339988).
+                talk = [line for line in lines if not line.startswith('— ')]  # the marks of when are no messages
+                heads = [re.split(r' → |: ', line, maxsplit=1)[0] for line in talk]
+                # The answers off the chain and the talk going on are only marks in the chat: three in a row went at
+                # one «ноут с олламой», «тумба юмба» went into four of an evening. The punchline sees the last ones as a
+                # list not to repeat and judges what is worn. The setup does not: its tags are of the last message, and
+                # after two answers opening on the line of @ it tagged everyone at «я программировал бота, а
+                # запрограммировался Андрей» (#339988).
                 answers = [clip(' '.join(text.split()), 200) for text in self.history.said(key, through, date, count=6)]
                 said = (('\n\nТы недавно ответил, не повторяй ни детали, ни заход, ни построение; что ты обыгрывал не '
                          'раз, заезжено, не бери, даже если чат об этом:\n' + '\n'.join(f'- {text}' for text in answers))
@@ -1113,11 +1207,10 @@ class Bot:
                 # and the morning's news into three answers of four. The punchline gets it asked about the bot.
                 feelings = self.feelings(chat_id, date, message)
                 # The setup says what the code needs to know, in tags; whatever else it wrote is dropped unread.
-                setup = self.setup(seeing + asker
-                                   + ('\n\nКартинка, о которой речь, приложена.' if image else ''),
-                                   typing, topic, image)
+                seen = seeing + asker + ('\n\nКартинка, о которой речь, приложена.' if image else '')
+                setup = self.setup(seen, typing, topic, image)
                 tags = ' '.join(tag[0] for tag in TAG.finditer(setup))
-                trace = {'tags': tags, 'context_chars': len(chat), 'lines': len(lines), 'image': bool(image),
+                trace = {'tags': tags, 'context_chars': len(chat), 'lines': len(talk), 'image': bool(image),
                          'feelings': feelings, 'morale': left}
                 if CLOWN in tags:
                     trace['clown'] = True
@@ -1132,6 +1225,8 @@ class Bot:
                             return self.meltdown(chat_id, topic, date, why, through, live)
                 # The emoji may follow the tag: the setup's whole text is read for it.
                 reaction = reaction_of(setup)
+                if reaction and self.check(seen, IN_WORDS, typing, topic, image):
+                    reaction, trace['overruled'] = None, ['реакция']
                 if reaction:
                     return reaction, {**trace, 'reaction': True, **spent(usage)}
                 # «Раздай всем участникам чата погоняла» got three of seven (#244): «Долбаеб даже всех участников чата
@@ -1147,6 +1242,11 @@ class Bot:
                 # «Расскажи анекдот» after an evening of one gag got the gag back: the punchline saw the chat full
                 # of it. A request tagged so gets the punchline the request alone.
                 alone = ALONE in tags
+                if alone and self.check(seen, WITHOUT_CHAT, typing, topic, image) is False:
+                    alone, trace['overruled'] = False, [*trace.get('overruled', []), 'без чата']
+                # The news asked about is no shield, and twice in a row is no harm: «Рофл, мнение??» under the news of
+                # Bioware got «пошёл нахуй», Anton asking the same got it too, the scream came next, and it was funny
+                # (#340204).
                 if (live and not (form or about or tagged or wanted or long or alone)
                         and random.random() < self.rude * temper(datetime.date.fromtimestamp(date))):
                     return RUDE, {**trace, 'rude': True, **spent(usage)}
@@ -1162,8 +1262,12 @@ class Bot:
                 kind, wanted = wanted or (None, None)
                 found = self.find(wanted, typing, kind, lines[-1]) if wanted else None
                 asked = news_of(tags)
+                silent = self.history.silence(key, message['message_id'], date) if asked == '' else 0
+                quiet = silent is None or silent >= 1
                 try:
-                    news = [title for title, _ in headlines(asked or None)[:15]] if asked is not None else []
+                    fresh = (headlines(asked) if asked else headlines(None)[:8] + headlines(POLITICS)[:7]
+                             if asked is not None else [])
+                    news = list(dict.fromkeys(title for title, _ in fresh))[:15]
                 except RuntimeError as exc:
                     LOG.warning('news.failed %s', exc)
                     news = []
@@ -1184,7 +1288,9 @@ class Bot:
                            ' Переделай найденное под просьбу, чтобы его узнали: первая строка, строй, капс и знаки '
                            'как в оригинале; своё с нуля не пиши.' if found and form else
                            ' Бери найденное узнаваемо и не пересказывай, откуда оно.' if found else '')
-                        + (NEWS_TASK if news else '') + (SNAP if snap else f' {manner}' if manner else '')
+                        + (NEWS_TASK + (NEWS_WHERE.format(where=NEWS_QUIET if quiet else NEWS_LIVELY)
+                                        if asked == '' else '') if news else '')
+                        + (SNAP if snap else f' {manner}' if manner else '')
                         + f'{length} Ответь одной репликой')
                 if about:
                     # Asked about the bot, it answers from the card of what it knows of itself.
@@ -1201,13 +1307,19 @@ class Bot:
                     prompt = (card + 'Просьба:\n\n' + '\n\n'.join(request) + said
                               + f'\n\nОна адресована тебе, {task}.')
                 else:
-                    prompt = (card + seeing + said
-                              + f'\n\nПоследнее сообщение адресовано тебе, {task}.')
+                    # The marks above tell when, this says what time it is now.
+                    now = datetime.datetime.fromtimestamp(date)
+                    prompt = (card + seeing + said + f'\n\nСейчас {WEEKDAYS[now.weekday()]}, {now:%H:%M}. '
+                              f'Последнее сообщение адресовано тебе, {task}.')
                 # The log invites the model to go on with it: the answer opens with lines copied from it or with a
-                # name, «РОФЛ:», «Серёга: …». Leading lines that, name cut, are empty or already said are dropped.
+                # name, «РОФЛ:», «Серёга: …». Leading lines that, name cut, are empty or a message of people already
+                # said are dropped. A line of a longer message or of the bot's own is no copy: «Дорисуй ноги» under
+                # its ASCII Лёха got the code anew, and its first lines, the same as before, went, «```python» and
+                # «лёха = [» (#340105).
                 speakers = {'Рофл', person_label(sender), *heads}
                 name = re.compile(rf'^(?i:{"|".join(map(re.escape, speakers))})(?: → [^:\n]*)?:\s*')
-                known = {name.sub('', line).lower() for line in chat.splitlines()} | {''}
+                known = {name.sub('', line).lower() for line in chat.splitlines()
+                         if name.match(line) and not line.startswith('Рофл')} | {''}
                 # Every joke is thought through: a bare «here is the chat, answer» at high jabbed as well as the setup
                 # and punchline did. Out of tokens, once more without thinking.
                 messages = [{'role': 'user', 'content': with_image(prompt, image)}]
@@ -1227,6 +1339,7 @@ class Bot:
                 return answer, {**trace, 'alone': alone, 'about': about, 'tone': manner, **({'snap': True} if snap else {}),
                                 **({'wanted': wanted, 'kind': kind, 'found': bool(found)} if wanted else {}),
                                 **({'news': asked, 'headlines': len(news)} if asked is not None else {}),
+                                **({'quiet': True} if quiet else {}),
                                 **({'tagged': tagged} if tagged else {}), **({'form': form[0]} if form else {}),
                                 **spent(usage)}
             except RuntimeError as exc:
@@ -1250,7 +1363,7 @@ class Bot:
         """The chat up to message `through` as lines for the model, one name per person, and the names by username."""
         names = {**self.history.names(key[0]), self.me['username'].lower(): 'Рофл'}
         return rename(self.history.context(key, through, self.me['id'], self.recent, self.window,
-                                           limit=self.limit), names), names
+                                           limit=self.limit, pause=self.pause), names), names
 
     @contextmanager
     def counting(self):
@@ -1342,7 +1455,8 @@ class Bot:
                 # The header above is the request as the chat shows it, «ты не видишь» under a photo included: the
                 # picture went to both models all the same, as live (#339991), and the line says so.
                 print(f'Срыв: {trace["meltdown"]}' if 'meltdown' in trace else
-                      f'Теги: {trace["tags"] or "нет"}' + ('; картинка приложена' if trace.get('image') else ''))
+                      f'Теги: {trace["tags"] or "нет"}' + ('; картинка приложена' if trace.get('image') else '')
+                      + (f'; снято проверкой: {", ".join(trace["overruled"])}' if trace.get('overruled') else ''))
             if trace and trace.get('clown'):
                 print('[реакция 🤡]')
             print(f'[реакция {answer}]' if trace and trace.get('reaction') else envelope(answer, trace))
@@ -1415,19 +1529,31 @@ class Bot:
             return 'sad', dice.choice(SAD), 0
         return ('quiet', dice.choice(QUIET), 0) if silent >= 1 else ('butt_in', None, topic)
 
+    def stir(self, chat, now):
+        """('stir', None, 0) when the bot is to shitpost on politics now (`Bot.politics`), or None: once a day, past
+        an hour drawn for it, into a chat quiet for an hour and not right after the bot spoke."""
+        moment = datetime.datetime.fromtimestamp(now)
+        needs = self.history.needs(chat, now)
+        if (self.read_only or not needs or moment.hour < random.Random(f'stir {chat} {moment.date()}').randint(*STIR_HOURS)
+                or datetime.date.fromtimestamp(self.history.stamp(f'stir {chat}')) == moment.date()):
+            return None
+        bored, silent, _ = needs
+        return ('stir', None, 0) if bored >= self.bored and silent >= 1 else None
+
     def idle(self, now=None):
         """Between polls: at dawn the bot reads the news, a bored one blurts something into its groups on its own."""
         now = now or time.time()
         self.read(now)
-        for chat in sorted(self.allowed_groups):
-            urge = self.urge(chat, now)
+        for chat, check in product(sorted(self.allowed_groups), (self.urge, self.stir)):
+            urge = check(chat, now)  # one after the other: the second sees what the first said
             if not urge:
                 continue
             kind, text, topic = urge
             LOG.info('urge chat=%s topic=%s kind=%s', chat, topic, kind)
             markup = link = feelings = None
-            previous = self.history.stamp(f'urge {chat}')
-            self.history.stamp(f'urge {chat}', now)  # before the model: a failing one is not asked again every poll
+            stamp = f'{"stir" if kind == "stir" else "urge"} {chat}'
+            previous = self.history.stamp(stamp)
+            self.history.stamp(stamp, now)  # before the model: a failing one is not asked again every poll
             with self.counting() as usage:
                 try:
                     if text is None:
@@ -1439,14 +1565,19 @@ class Bot:
                             [{'role': 'user', 'content': prompt}], chat_id=chat, topic=topic)))
                     elif kind == 'share':
                         text, markup, link = self.repost(chat, now, feelings)
+                    elif kind == 'stir':
+                        text, markup, link = self.politics(chat)
                 except RuntimeError as exc:
                     LOG.error('urge.failed chat=%s kind=%s %s', chat, kind, exc)
                     continue
+            if not text:
+                LOG.info('urge.nothing chat=%s kind=%s', chat, kind)
+                continue
             try:
                 sent = self.send((chat, topic), None, markup or text, parse_mode='HTML' if markup else None)
             except RuntimeError as exc:
                 # Again on the next poll: a sleeping Mac wakes for seconds, and the network comes up after it.
-                self.history.stamp(f'urge {chat}', previous)
+                self.history.stamp(stamp, previous)
                 LOG.error('urge.send_failed chat=%s %s', chat, exc)
                 continue
             self.history.add((chat, topic), sent['message_id'], 'assistant', text, now)
@@ -1505,6 +1636,24 @@ class Bot:
                   + (f'<pre><code class="language-python">{html.escape(code)}</code></pre>\n\n' if code else '')
                   + html.escape(joke))
         return '\n\n'.join(filter(None, (f'{title}\n{link}', code, joke))), markup, link
+
+    def politics(self, chat):
+        """A shitpost on the political news of the day, under its headline, the chat read for whom to drag in: as
+        (text, the same in HTML, link), or Nones when the model finds nothing funny."""
+        found = headlines(POLITICS)[:15]
+        if not found:
+            return None, None, None
+        lines, _ = self.chat((chat, 0))
+        listed = '\n'.join(f'{n}. {title}' for n, (title, _) in enumerate(found, 1))
+        answer = self.generate([{'role': 'user', 'content': CHAT + '\n\n'.join(lines) + '\n\n'
+                                 + STIR.format(news=listed)}], chat_id=chat)
+        first, _, rest = answer.partition('\n')
+        pick = re.fullmatch(r'\D{0,10}?(\d+)\D{0,3}', first.strip())
+        if not pick or not 1 <= int(pick[1]) <= len(found) or not rest.strip():
+            return None, None, None
+        (title, link), post = found[int(pick[1]) - 1], casual(rest.strip())
+        return (f'{title}\n{link}\n\n{post}', f'<a href="{html.escape(link)}">{html.escape(title)}</a>\n\n'
+                + html.escape(post), link)
 
     def send(self, key, reply_to, text, parse_mode=None):
         payload = {'chat_id': key[0], 'text': text}

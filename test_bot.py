@@ -4,7 +4,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import bot
 from bot import Bot, History, followups
@@ -26,6 +26,7 @@ class ConversationTests(unittest.TestCase):
         self.counter = 0
         self.b.api = Mock(side_effect=self.send)
         self.b.read = Mock()  # no news from the network unless a test asks
+        self.b.stir = Mock(return_value=None)
         self.b.model = 'deepseek/deepseek-v4.1-flash'
         tone = patch('bot.tone', return_value='')  # the day's tone, unless a test asks
         tone.start()
@@ -143,8 +144,8 @@ class ConversationTests(unittest.TestCase):
         self.b.generate.assert_not_called()
         self.b.api.assert_not_called()
         context = self.b.history.context((-100123, 0))
-        self.assertEqual(len(context), 2)
-        self.assertIn('пятницу', context[0])
+        self.assertEqual(len(context), 3)  # a mark of when, then the two
+        self.assertIn('пятницу', context[1])
         self.b.read_only = False
         self.b.handle(self.message('бот, ну так когда?'))
         self.assertIn('пятницу', self.prompt())
@@ -291,7 +292,8 @@ class ConversationTests(unittest.TestCase):
         found.assert_called_once_with('протесты во Франции')
         self.assertTrue(self.prompt().startswith('Свежие новости (протесты во Франции) за сутки, заголовки из Google '
                                                  'News:\n- Во Франции ввели комендантский час\n\n'))
-        self.assertIn('бывший СССР не трогай', self.prompt())
+        self.assertIn('Путина и Трампа тоже, а войну, Украину и гибель людей не трогай', self.prompt())
+        self.assertNotIn('Просят доложить обстановку', self.prompt())  # an event is the world's
         trace = json.loads(self.b.history.db.execute('SELECT trace FROM answers').fetchone()[0])
         self.assertEqual((trace['news'], trace['headlines']), ('протесты во Франции', 1))
         self.b.setup.return_value = '[паста] [новости]'
@@ -299,6 +301,23 @@ class ConversationTests(unittest.TestCase):
             self.b.handle(self.message('бот, доложи обстановку'))
         found.assert_called_once_with(None)  # the world's section
         self.assertNotIn('Свежие новости', self.prompt())
+        # The world's section has no Kremlin: Путин and Трамп come with it.
+        world, politics = [('Макрон улетел в Залив', 'https://w')], [('Путин и Трамп созвонились', 'https://p'),
+                                                                       ('Макрон улетел в Залив', 'https://w')]
+        with patch('bot.headlines', side_effect=[world, politics]) as found:
+            self.b.handle(self.message('бот, наведи суеты'))
+        self.assertEqual(found.call_args_list, [call(None), call(bot.POLITICS)])
+        self.assertIn('- Макрон улетел в Залив\n- Путин и Трамп созвонились\n\n', self.prompt())
+        # Bare, the обстановка may be the chat's: the writer, who reads the chat, tells which.
+        self.assertIn(bot.NEWS_WHERE.format(where=bot.NEWS_LIVELY), self.prompt())
+        # Not asked where after an hour of silence, the world's: a dull chat by the clock.
+        quiet = self.message('бот, доложи обстановку', date=int(time.time()) + 7200)
+        with patch('bot.headlines', side_effect=[world, politics]):
+            self.b.handle(quiet)
+        self.assertIn(bot.NEWS_WHERE.format(where=bot.NEWS_QUIET), self.prompt())
+        trace = json.loads(self.b.history.db.execute('SELECT trace FROM answers WHERE request=?',
+                                                     (quiet['message_id'],)).fetchone()[0])
+        self.assertTrue(trace['quiet'])
 
     def test_an_original_found_with_a_form_is_remade_not_written_anew(self):
         # «напиши стих про СЛОВНО ХУЙ ДРОЧЕНЫЙ, но про кубернетес» got a quatrain of the bot's own (#340002).
@@ -389,7 +408,8 @@ class ConversationTests(unittest.TestCase):
         self.b.setup.return_value = '[реакция 😂]'
         request = self.message('рофл, ору')
         self.b.handle(request)
-        self.b.generate.assert_not_called()
+        # The punchline is never asked; the model only says whether it wants words, and «Согласен» is no «да».
+        self.assertEqual([call.kwargs['system'] for call in self.b.generate.call_args_list], [bot.CHECK])
         self.assertEqual(self.b.api.call_args.args, ('setMessageReaction',))
         self.assertEqual(self.b.api.call_args.kwargs, {'chat_id': -100123, 'message_id': request['message_id'],
                                                        'reaction': [{'type': 'emoji', 'emoji': '🤣'}]})
@@ -407,6 +427,42 @@ class ConversationTests(unittest.TestCase):
         with patch('builtins.print') as printed:
             self.b.replay(request['message_id'])
         self.assertIn('[реакция 🤣]', [call.args[0] for call in printed.call_args_list])
+
+    def test_the_tags_that_take_the_talk_away_get_a_second_look(self):
+        # [без чата] stood on 7 requests of 8 that went on with the talk, and the writer answered them blind; «РАУНД»
+        # under the bot's rap got 🔥 instead of the next one (#340219). One question each, on what the setup saw.
+        checks = []
+        def generate(messages, **kwargs):
+            if kwargs.get('system') != bot.CHECK:
+                return 'Согласен'
+            checks.append(messages[0]['content'])
+            if isinstance(self.answer, Exception):
+                raise self.answer
+            return self.answer
+        self.b.generate = Mock(side_effect=generate)
+        self.b.handle(self.message('Андрюха опять вторая личность', user=8))
+        self.b.setup.return_value = '[без чата]'
+        self.answer = 'Нет.'
+        self.b.handle(self.message('Хз, ну бывает', reply_to_message={'from': {'id': 42}, 'text': 'Андрюха второй'}))
+        self.assertEqual(checks[-1], self.b.setup.call_args.args[0] + '\n\n' + bot.WITHOUT_CHAT)
+        self.assertIn('Андрюха опять вторая личность', self.prompt())  # the chat stays
+        trace = json.loads(self.b.history.db.execute('SELECT trace FROM answers ORDER BY rowid DESC').fetchone()[0])
+        self.assertEqual((trace['alone'], trace['overruled'], trace['tags']), (False, ['без чата'], '[без чата]'))
+        for self.answer in ('да', 'хз', RuntimeError('нет сети')):  # «да», or no answer: the setup's tag stands
+            self.b.handle(self.message('бот, расскажи анекдот'))
+            self.assertTrue(self.prompt().startswith('Просьба:'))
+        # A reaction that wants words gets them.
+        self.b.setup.return_value = '[реакция 🔥]'
+        self.answer = 'да'
+        self.b.handle(self.message('РАУНД', reply_to_message={'message_id': self.counter, 'from': {'id': 42},
+                                                              'text': 'куплет'}))
+        self.assertTrue(checks[-1].endswith(bot.IN_WORDS))
+        self.assertEqual(self.b.api.call_args.kwargs['text'], 'Согласен')
+        trace = json.loads(self.b.history.db.execute('SELECT trace FROM answers ORDER BY rowid DESC').fetchone()[0])
+        self.assertEqual(trace['overruled'], ['реакция'])
+        self.answer = 'нет'
+        self.b.handle(self.message('рофл, ору'))
+        self.assertEqual(self.b.api.call_args.args, ('setMessageReaction',))
 
     def test_a_dumb_jab_gets_a_clown_and_an_answer(self):
         self.b.setup.return_value = '[обида] [клоун]'
@@ -491,14 +547,15 @@ class ConversationTests(unittest.TestCase):
         self.b.handle(self.message('бот, а теперь?'))
         self.assertIn('Ты недавно ответил, не повторяй ни детали, ни заход, ни построение; что ты обыгрывал не раз, '
                       'заезжено, не бери, даже если чат об этом:\n- Согласен\n\n', self.prompt())
-        self.assertNotIn('пошёл нахуй', self.prompt())  # a canned answer is no joke to avoid
+        self.assertNotIn('пошёл нахуй', self.prompt().partition('Ты недавно ответил')[2])  # a canned one is no joke
         for n in range(7):
             self.b.generate.return_value = f'тумба юмба {n}'
             self.b.handle(self.message('бот, а дальше?'))
-        # The setup tags the last message: the answers of the bot are none of its business.
+        # The setup tags the last message: what is worn is none of its business. The talk it reads has the
+        # bot's answers in it, as the chat saw them.
         setup = self.b.setup.call_args.args[0]
         self.assertNotIn('недавно ответил', setup)
-        self.assertNotIn('тумба юмба', setup)
+        self.assertEqual(setup.count('тумба юмба'), 6)
         # The writer judges what is worn, the chat above it and the task last: the joke is its to make.
         prompt = self.prompt()
         self.assertIn('Ты недавно ответил, не повторяй ни детали, ни заход, ни построение; что ты обыгрывал не раз, '
@@ -508,15 +565,63 @@ class ConversationTests(unittest.TestCase):
                                         'Ответь одной репликой.'))
 
     def test_an_answer_to_a_message_of_the_chain_goes_whole(self):
-        photo = self.message('', caption='рофл, зацени мем', photo=[{'file_id': 'f', 'width': 9, 'height': 9}])
-        self.b.generate.return_value = 'трансы — Трансформеры'
-        self.b.handle(photo)
-        self.b.generate.return_value = 'Согласен'
-        self.b.handle(self.message('бот, ну?'))
+        with patch('time.time', return_value=time.time() - 7200):  # two hours ago: another talk
+            photo = self.message('', caption='рофл, зацени мем', photo=[{'file_id': 'f', 'width': 9, 'height': 9}])
+            self.b.generate.return_value = 'трансы — Трансформеры'
+            self.b.handle(photo)
+            self.b.generate.return_value = 'Согласен'
+            self.b.handle(self.message('бот, ну?'))
         self.b.handle(self.message('рофл, в прошлый раз смешнее было', reply_to_message=photo))
         prompt = self.prompt()
         self.assertIn('Рофл → User 7: трансы - Трансформеры', prompt)
-        self.assertIn('Рофл → User 7: [ответил]', prompt)  # the answer to «бот, ну?» is off the chain
+        self.assertIn('Рофл → User 7: [ответил]', prompt)  # the answer to «бот, ну?» is off the chain and the talk
+
+    def test_the_talk_going_on_has_the_bots_answers_whole(self):
+        # «рофл, а почему шершень?» is about what the bot has just said, whether it replies to it or not.
+        with patch('time.time', return_value=time.time() - 3 * 3600):
+            self.b.generate.return_value = 'ноут с олламой - обогреватель'
+            self.b.handle(self.message('бот, оцени ноут'))
+        self.b.generate.return_value = 'Эндрю - дырявый шершень, Антон - сундучный рептилоид'
+        self.b.handle(self.message('бот, раздай погоняла'))
+        self.b.handle(self.message('рофл, а почему шершень?', user=8))
+        prompt = self.prompt()
+        self.assertIn('User 7: бот, раздай погоняла\n\nРофл → User 7: Эндрю - дырявый шершень, Антон - сундучный '
+                      'рептилоид\n\nUser 8: рофл, а почему шершень?', prompt)
+        self.assertIn('Рофл → User 7: [ответил]', prompt)  # three hours ago, another talk
+        self.assertNotIn('обогреватель', prompt.partition('Ты недавно ответил')[0])
+
+    def test_the_chat_comes_with_marks_of_when_and_the_writer_knows_what_time_it_is(self):
+        # At 9 in the morning the bot told Andrew «Ты за вечер уже третий раз нахуй посылаешь» (#340084): a day of
+        # the chat in one piece was one evening to the model.
+        self.store(1, 'Пошел нахуй', date=self.at(22, 25, days=-1), name='Andrew')
+        self.store(2, 'заливаешь в мозг пропаганду?', date=self.at(23, 33, days=-1), name='Andrew')
+        self.store(3, 'Страшное видео', date=self.at(23, 43, days=-1), name='Алексей')
+        self.store(4, 'Пошел нахуй', date=self.at(9, 5), name='Andrew')
+        self.counter = 10
+        self.b.handle(self.message('бот, сколько раз он тебя послал?', date=self.at(9, 6)))
+        prompt = self.prompt()
+        self.assertIn('сверху:\n\n— вчера, 22:25 —\n\nAndrew: Пошел нахуй\n\n— вчера, 23:33 —\n\nAndrew: заливаешь в '
+                      'мозг пропаганду?\n\nАлексей: Страшное видео\n\n— сегодня, 09:05 —\n\nAndrew: Пошел нахуй\n\n'
+                      'User 7: бот, сколько раз он тебя послал?\n\n', prompt)
+        self.assertTrue(prompt.endswith(f'Сейчас {bot.WEEKDAYS[datetime.date.today().weekday()]}, 09:06. Последнее '
+                                        'сообщение адресовано тебе, пишет User 7. Одна-две строки. Ответь одной '
+                                        'репликой.'))
+        self.assertEqual(bot.moment(self.at(14, 44, days=-3), datetime.date.today()),
+                         f'— {datetime.date.today() - datetime.timedelta(3):%d.%m}, 14:44 —')
+        trace = json.loads(self.b.history.db.execute('SELECT trace FROM answers').fetchone()[0])
+        self.assertEqual(trace['lines'], 5)  # the marks are no messages
+
+    def test_code_redone_keeps_its_first_lines(self):
+        # «Дорисуй ноги» under the bot's ASCII Лёха got the code anew, and its first lines, the same as before, were
+        # cut as copied from the chat: «```python» and «лёха = [» (#340105).
+        self.b.setup.return_value = '[код]'
+        self.b.generate.return_value = '```python\nлёха = ["( o o )"]\nprint(*лёха)\n```'
+        self.b.handle(self.message('рофл, нарисуй Лёху'))
+        drawn = {'message_id': self.counter, 'from': {'id': 42}, 'text': 'лёха'}
+        self.b.generate.return_value = '```python\nлёха = ["( o o )"]\nноги = "|| ||"\nprint(*лёха, ноги)\n```'
+        self.b.handle(self.message('Дорисуй ноги', reply_to_message=drawn))
+        self.assertEqual(self.b.api.call_args.kwargs['text'], '<pre><code class="language-python">лёха = ["( o o )"]\n'
+                                                              'ноги = "|| ||"\nprint(*лёха, ноги)</code></pre>')
 
     def test_replay_answers_a_stored_request_and_sends_nothing(self):
         self.b.handle(self.message('доту опять катали', user=8))
@@ -883,6 +988,38 @@ class ConversationTests(unittest.TestCase):
         self.assertIn('задрот', self.prompt())
         self.assertNotIn('исходников', self.prompt())
 
+    def test_once_a_day_the_bot_stirs_a_quiet_chat_with_a_shitpost_on_politics(self):
+        del self.b.stir  # the real one
+        self.store(1, 'чё как', date=self.at(9))
+        self.counter = 100
+        found = [('Трамп назвал Путина отличным парнем', 'https://p/1'), ('Песков ответил', 'https://p/2')]
+        self.b.generate.return_value = '1\nВсё, Кирюха, твой кумир официально & <отличный парень>.'
+        with patch('bot.plan', return_value=None), patch('bot.headlines', return_value=found) as search:
+            self.b.idle(self.at(10, 59))  # before any hour it draws
+            search.assert_not_called()
+            self.b.idle(self.at(22))
+            self.b.idle(self.at(23))  # once a day
+        search.assert_called_once_with(bot.POLITICS)
+        sent = self.b.api.call_args.kwargs
+        self.assertEqual(self.b.api.call_count, 1)
+        self.assertEqual((sent['parse_mode'], sent['text']),
+                         ('HTML', '<a href="https://p/1">Трамп назвал Путина отличным парнем</a>\n\n'
+                                  'Всё, Кирюха, твой кумир официально &amp; &lt;отличный парень&gt;'))
+        content = self.prompt()
+        self.assertIn('User 9: чё как', content)  # the chat, for whom to drag in
+        self.assertIn('1. Трамп назвал Путина отличным парнем\n2. Песков ответил', content)
+        self.assertIn('войну, Украину, гибель людей и чернуху пропускай', content)
+        trace = json.loads(self.b.history.db.execute('SELECT trace FROM answers WHERE id=101').fetchone()[0])
+        self.assertEqual(trace['urge'], 'stir')
+        # Nothing funny the next day: nothing posted, and not asked again that day.
+        self.b.generate.return_value = 'НЕТ'
+        self.store(2, 'ору', date=self.at(9, days=1))
+        with patch('bot.plan', return_value=None), patch('bot.headlines', return_value=found):
+            self.b.idle(self.at(22, days=1))
+            self.b.idle(self.at(23, days=1))
+        self.assertEqual(self.b.api.call_count, 1)
+        self.assertEqual(self.b.generate.call_count, 2)
+
     def test_the_bot_quotes_its_real_code(self):
         self.assertTrue(bot.snippet('DAWN = ').startswith("DAWN = 'спите, пидоры?'\nQUIET = ("))
         self.assertTrue(bot.snippet('    rude = ').startswith('    rude = 0.05'))
@@ -969,9 +1106,9 @@ class ConversationTests(unittest.TestCase):
         self.b.handle(self.message('бот, ответь за меня', reply_to_message=task))
         prompt = self.prompt()
         self.assertEqual(prompt.count('КОНЕЦ'), 1)
-        self.assertIn('сверху:\n\noracle (бот):\nЗадача для', prompt)  # its «я» is not Рофл's
-        self.assertIn('User 7 → oracle (бот): бот, укажи пункт\n\nРофл → User 7: [ответил]\n\nUser 7 → oracle (бот)', prompt)
-        self.assertNotIn('Согласен', prompt.partition('Ты недавно ответил')[0])  # an answer nobody replied to stays out
+        self.assertRegex(prompt, r'сверху:\n\n— \w+, \d\d:\d\d —\n\noracle \(бот\):\nЗадача для')  # its «я» is not Рофл's
+        # The answer nobody replied to goes whole: it is the talk going on.
+        self.assertIn('User 7 → oracle (бот): бот, укажи пункт\n\nРофл → User 7: Согласен\n\nUser 7 → oracle (бот)', prompt)
         self.assertIn('\n\nUser 7 → oracle (бот) «Задача для @anton_k: пункт.', prompt)
 
     def test_mention_then_forwarded_news_answers_the_news(self):
@@ -1041,10 +1178,10 @@ class ConversationTests(unittest.TestCase):
                                    reply_to_message={'message_id': 1, 'from': {'id': 9, 'first_name': 'Олег'}, 'text': 'задача'}))
         self.b.generate.assert_not_called()
         self.b.handle(self.message('бот, что там про облако?', message_thread_id=338943))
-        self.assertIn('сверху:\n\nОлег: задача\n\nUser 7 → Олег: @oracle_test_bot Укажи', self.prompt())
+        self.assertRegex(self.prompt(), r'сверху:\n\n— \w+, \d\d:\d\d —\n\nОлег: задача\n\nUser 7 → Олег: @oracle_test_bot Укажи')
         self.assertNotIn('message_thread_id', self.b.api.call_args.kwargs)
         self.b.handle(self.message('бот, а в топике?', message_thread_id=77, is_topic_message=True))
-        self.assertIn('сверху:\n\nUser 7: бот, а в топике?\n\nПоследнее', self.prompt())
+        self.assertRegex(self.prompt(), r'сверху:\n\n— \w+, \d\d:\d\d —\n\nUser 7: бот, а в топике\?\n\nСейчас [^.]+\. Последнее')
         self.assertEqual(self.b.api.call_args.kwargs['message_thread_id'], 77)
 
     def test_name_includes_username_so_mentions_match_people(self):
@@ -1081,11 +1218,12 @@ class ConversationTests(unittest.TestCase):
         self.b.history = History(self.path)
         self.assertEqual(self.b.history.stamp('offset'), 1234)
         context = self.b.history.context((-100123, 0))
-        self.assertEqual(len(context), 40)
+        self.assertEqual(len(context), 41)  # a mark of when and 40 messages
+        self.assertTrue(context[0].startswith('— '))
         self.assertEqual(context[-1], 'User 9: реплика 219')
         self.b.handle(self.message('/reset'))
         self.assertEqual(self.b.history.context((-100123, 0)), [])
-        self.assertEqual(len(self.b.history.context((-100123, 5))), 1)
+        self.assertEqual(len(self.b.history.context((-100123, 5))), 2)  # a mark of when and the message
         for i in range(600, 630):
             self.store(i, 'x' * 2000, topic=5)
         self.assertLessEqual(sum(map(len, self.b.history.context((-100123, 5)))), 12000)
@@ -1116,17 +1254,18 @@ class ConversationTests(unittest.TestCase):
         self.assertIn('кеш-трейс', prompt)
 
     def test_background_is_a_day_and_the_chain_is_however_old(self):
-        self.store(1, 'качаю инженерку в вове', date=time.time() - 30 * 3600, name='Алексей')
-        self.b.history.add((-100123, 0), 2, 'assistant', 'Инженерка для крыс 🐀', time.time() - 30 * 3600, 1)
-        self.store(3, 'вчерашняя задача на пять пунктов', date=time.time() - 25 * 3600, name='oracle')
-        self.store(4, 'Нормально кринжа насрал', date=time.time() - 3600, name='Kirill')
+        self.store(1, 'качаю инженерку в вове', date=self.at(14, days=-1), name='Алексей')
+        self.b.history.add((-100123, 0), 2, 'assistant', 'Инженерка для крыс 🐀', self.at(14, days=-1), 1)
+        self.store(3, 'вчерашняя задача на пять пунктов', date=self.at(19, days=-1), name='oracle')
+        self.store(4, 'Нормально кринжа насрал', date=self.at(19), name='Kirill')
         self.counter = 10
-        self.b.handle(self.message('бот, что скажешь в своё оправдание?',
+        self.b.handle(self.message('бот, что скажешь в своё оправдание?', date=self.at(20),
                                    reply_to_message={'message_id': 2, 'from': {'id': 42}, 'text': 'Инженерка для крыс 🐀'}))
-        self.assertIn('сверху:\n\nАлексей: качаю инженерку в вове\n\nРофл → Алексей: Инженерка для крыс 🐀\n\n'
-                      'Kirill: Нормально кринжа насрал\n\nUser 7 → Рофл «Инженерка для крыс 🐀»: бот, что скажешь', self.prompt())
+        self.assertIn('сверху:\n\n— вчера, 14:00 —\n\nАлексей: качаю инженерку в вове\n\nРофл → Алексей: Инженерка для '
+                      'крыс 🐀\n\n— сегодня, 19:00 —\n\nKirill: Нормально кринжа насрал\n\n— сегодня, 20:00 —\n\n'
+                      'User 7 → Рофл «Инженерка для крыс 🐀»: бот, что скажешь', self.prompt())
         self.assertNotIn('вчерашняя задача', self.prompt())  # older than a day and not in the chain
-        self.b.handle(self.message('бот, а ты?'))
+        self.b.handle(self.message('бот, а ты?', date=self.at(20, 1)))
         self.assertNotIn('качаю инженерку', self.prompt())  # the old chain stays with the request it belonged to
 
     def test_post_turns_failures_into_runtime_errors(self):
