@@ -245,7 +245,8 @@ python3 bot.py --stats 3
   в логе по `telegram.ignored chat_id=…`.
 - `OLLAMA_URL`, `OLLAMA_MODEL`
 - `OPENROUTER_API_KEY`, `OPENROUTER_MODEL` — если модель задана, бот отвечает ей вместо
-  Ollama, без рассуждений, через `https_proxy` (напрямую OpenRouter отдаёт 403).
+  Ollama, без рассуждений, через `https_proxy` (напрямую OpenRouter отдаёт 403). Модель, которая не
+  умеет без них (Muse, Gemini, Grok, GLM отвечают 400), думает по минимуму.
 - `NEWS` — о чём читают утренние новости группы, кроме основной: «ID:интерес» через запятую
   (`-100500:games`), интересы — `INTERESTS` в `bot.py`. Остальные читают про ИИ.
 - `https_proxy` — прокси для Telegram, OpenRouter и Google News; Ollama всегда напрямую.

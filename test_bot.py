@@ -383,6 +383,18 @@ class ConversationTests(unittest.TestCase):
         self.b.handle(self.message('бот, а он?'))
         self.assertIn('Андрюха', self.prompt())
 
+    def test_a_model_that_cannot_stop_thinking_thinks_the_least(self):
+        self.b.openrouter, self.b.openrouter_key, self.b.model = True, 'sk-or-test', 'meta/muse-spark-1.3'
+        good = {'choices': [{'message': {'content': 'Здарова'}, 'finish_reason': 'stop'}], 'usage': {}}
+        with patch('bot.post', side_effect=[RuntimeError('HTTP 400'), good, good]) as post, self.assertLogs('bot'):
+            self.assertEqual(Bot.generate(self.b, [{'role': 'user', 'content': 'Привет'}]), 'Здарова')
+            Bot.generate(self.b, [{'role': 'user', 'content': 'Привет'}])
+        reasoning = [call.args[1]['reasoning'] for call in post.call_args_list]
+        self.assertEqual(reasoning, [{'enabled': False}, {'effort': 'minimal'}, {'effort': 'minimal'}])
+        with patch('bot.post', side_effect=RuntimeError('HTTP 401')), self.assertLogs('bot'):
+            with self.assertRaises(RuntimeError):
+                Bot.generate(self.b, [])
+
     def test_an_ordered_form_comes_to_the_punchline_with_how_it_looks(self):
         self.b.setup.return_value = '[рэп]'
         self.b.handle(self.message('бот, рэпанись батл про User 8'))

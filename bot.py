@@ -930,6 +930,7 @@ class Bot:
     limit = 12000  # characters
     pause = 30 * 60  # seconds of quiet that end a talk: the bot's answers before it go as a mark
     model = ''
+    thinkers = frozenset()  # the models that answered thinking off with a 400
     version = None
     usage = None  # the model calls of the joke being made
 
@@ -995,7 +996,19 @@ class Bot:
         return (result.get('message') or {}).get('content'), stats
 
     def ask_openrouter(self, messages, temperature, effort=None, search=False):
-        # Thinking only slows a one-line joke down; the setup gets a little.
+        # Thinking only slows a one-line joke down; the setup gets a little. Muse, Gemini, Grok and GLM cannot stop:
+        # «Reasoning is mandatory for this endpoint and cannot be disabled», a 400; they think the least from then on.
+        if not effort and self.model in self.thinkers:
+            effort = 'minimal'
+        try:
+            return self.ask_openrouter_once(messages, temperature, effort, search)
+        except RuntimeError as exc:
+            if effort or str(exc) != 'HTTP 400':
+                raise
+        self.thinkers = self.thinkers | {self.model}
+        return self.ask_openrouter_once(messages, temperature, 'minimal', search)
+
+    def ask_openrouter_once(self, messages, temperature, effort, search):
         payload = {
             'model': self.model, 'messages': messages, 'temperature': temperature,
             # A rap thought through on 3000 tokens came out empty twice of two.
