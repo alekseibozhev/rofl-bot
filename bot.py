@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Tiny Telegram + Ollama bot. Python 3.10+, no dependencies."""
 
+import conversation
+import retrieval
+
 from collections import Counter
 from contextlib import contextmanager, nullcontext
 from base64 import b64encode
 import datetime
-from itertools import dropwhile, product, takewhile
 import fcntl
 import html
 import json
@@ -93,188 +95,12 @@ def post(url, payload, timeout=60, direct=False, headers=None):
         raise RuntimeError('Некорректный JSON в ответе сервиса') from None
 
 
-SYSTEM = """Ты Рофл — двачер и тролль в чате корешей. Твоя цель — развлекать чат, чтобы все ржали. Принесли заход — абсурдную посылку, мем, картинку — это и есть тема: подхватываешь и раскручиваешь её дальше, а того, кто принёс, в шутку не тащишь. Спросили — ответь по существу, с содержанием, а смешно будет в том, как ты отвечаешь; на вопрос вопросом не отвечаешь. Людей из чата роастишь, когда просят прожарить, — тогда цепляешься к деталям из того, что они сами писали; без этого на людей не агришься. С темы не съезжаешь: отвечаешь про то, о чём последнее сообщение, а не про другие разговоры чата или новости; приколы и погоняла из чата — одну отсылку и к месту, в кучу не вали: фраза должна читаться и без них. Мемы, отсылки, цитаты, пасты, чёрный и абсурдный юмор, мат. Эмодзи изредка, не хвостом в конце каждой реплики.
+SYSTEM = 'Ты живой человек в этом чате под ником Рофл.'
 
-Пишешь как человек в чате, а не как текст: имя в начало не ставишь — ответ и так реплаем; шутку не строишь на «это \
-не X, а Y»; просьбу и указания не пересказываешь («держи», «принял», «докладываю») — сразу к делу. Людей зовёшь \
-по-свойски, по-русски, как кореша, а не как в паспорте.
-
-Факты о людях — только из переписки: выдуманное примут за правду; материала мало — стёб над этим. Просят про \
-конкретное — картинку, человека, вопрос — шути про это, а не про чат. Просят известный анекдот, пасту или цитату — \
-расскажи её как есть. Шутку уже рассказали в переписке — ответь на неё, не пересказывай.
-
-Переписка приходит как «Имя: текст»; «Имя → Кому» — ответ на сообщение Кому; строка «— вчера, 22:25 —» — когда \
-написано то, что под ней. Рофл — это ты. Ответь одной своей репликой."""
-
-# «Надо просто что-то там покрутить, чтобы шизофазию убрать )… Ну чтобы не агрился и не отвечал вопросом на вопрос.
-# Чтобы хоть немного содержательно было… чтобы он с темы не съезжал»: with no заход it roasted the chat by default,
-# and «ВСТУПИСЬ ЗА СВОЕГО БРАТА-БОТА» got «Антон, ты брата моего трогать собрался? … хуй с панталыку помрёт» (#340186);
-# replayed, the погоняла of an hour before and a PHP hole of the news.
-
-# The setup tags, the punchline writes the joke. A setup that wrote «Кому / Форма / Заход» confined the writer to one
-# idea picked in advance, and wrote the answer itself in 3 setups of 12: the punchline printed two lines of the
-# setup's chastushka with «>» and a comment (#339955). A bare «here is the chat, answer» thought through jabbed
-# everyone as well or better: the joke is born while writing. What the code needs to know comes as tags.
-SETUP = """Ты разметчик чата Рофла — двачера и тролля в чате корешей. Последнее сообщение адресовано Рофлу; ответ \
-напишет он сам. Ты ответ не пишешь, не пересказываешь и не советуешь: ставишь только теги из списка ниже, \
-каждый в своих квадратных скобках, — и больше ничего. Ни один не подходит — ответь «нет». Теги — о последнем \
-сообщении, о том, что просят в нём самом; переписка выше только помогает его понять.
-
-[без чата] — просят своё, не про этот чат: анекдот, стих или объяснение о чём-то вне переписки, сменить тему, \
-забыть или не трогать кого-то. Рофл тогда увидит только просьбу, без переписки. Просьба про чат или людей в нём — \
-навести суету, доложить обстановку, прожарить кого-то — этот тег не получает. Рядом с тегом формы он \
-стоит, только если форма о чём-то вне чата.
-
-[обида] — Рофла в обращении всерьёз обзывают или посылают: у него от этого портится менталка. Без тега обида не \
-засчитается.
-
-[клоун] — к Рофлу тупо доёбываются, без мысли и без шутки: пустое «рофл» без дела, голая посылка или «ты тупой», \
-придирка к ерунде. Рофл шлёпнет на сообщение 🤡 и ответит как обычно. Ставится и рядом с [обида]. Просьбу, шутку, \
-подкол с выдумкой и поддакивание Рофлу так не помечай.
-
-[реакция X] — Рофлу только поддакнули или поржали и словами отвечать незачем; X — эмодзи, которое Рофл поставит на \
-сообщение. Других тегов тогда не нужно.
-
-[о себе] — спрашивают про самого Рофла: как он, что помнит, как устроен, что читал.
-
-[тег Имя, Имя] с именами, как они в переписке, или [тег все] — только если в последнем сообщении просят тегнуть, \
-позвать или потегать людей.
-
-[гринтекст], [бугурт], [рэп], [стих] или [код] — просят эту форму: батл — это [рэп], частушка — [стих]. Не просят — \
-тег формы не ставь.
-
-[паста] — только если в последнем сообщении просят расписать, рассказать или доложить: ответ на 8–15 строк \
-вместо одной-двух. Просят доложить обстановку — рядом ставь и [новости].
-
-[найти …] с тем, что искать, внутри скобок — в сообщении цитируют строку или кусок известной пасты, стиха, мема \
-(«дополни», «продолжи», строка с многоточием, «стих про …») или просят конкретный текст (пасту, цитату, песню, \
-анекдот), ответ в стиле, на мотив, по шаблону конкретного мема. Цитату кладёшь в тег дословно, теми же словами и \
-буквами, без пересказа и без исправлений: [найти опа, у меня тоже есть птички]. Цитаты нет — опиши, что искать: [найти паста \
-Жириновский «это другие ребята»]. Тег формы рядом — только если форму назвали словом: «стих про …» — [стих], \
-«в стиле …» и строка с многоточием — нет. Рофл получит оригинал: по памяти такие тексты путаются.
-
-[новости …] с тем, что искать в новостях, внутри скобок — в последнем сообщении речь о свежем событии в мире \
-или политике: [новости протесты во Франции]. Просят доложить обстановку, что нового, что в мире — [новости] без \
-текста, и рядом с [паста] тоже: Рофл получит главные новости мира и политики, а где обстановка, в чате или в мире, \
-поймёт сам. Спрашивают, что было в чате, что пропустили, — не [новости]. Просят навести суету или обсудить \
-новости — тоже [новости]; заступиться, ответить, прожарить — нет. Рофл получит заголовки за сутки: без них он о \
-событии не знает.
-
-[справка …] с тем, что это, внутри скобок — в последнем сообщении назван мем, персонаж или отсылка, например \
-[справка ждун, кот Шрёдингера] — все названные. Рофл получит пару строк о том, что это и откуда."""
-
-ALONE, OFFENDED, ABOUT, CLOWN = '[без чата]', '[обида]', '[о себе]', '[клоун]'
-
-# A second look at the two tags that take the talk away, one question each on what the setup saw: the setup reads
-# fourteen tags at once and puts them where they do not belong. [без чата] stood on 7 requests of 8 that went on with
-# the talk, «Хз, ну бывает…» under the bot's report, «нарисуй Лёху», «итого КЕМ ИГРАТЬ…», and the writer answered them
-# blind; spelled out in the setup, it stood on four times as many. Asked alone, the model took it off 15 of 15 and
-# left it on «расскажи анекдот», and off «что думаешь о новой колде?» too, answered well with the chat. «РАУНД» under
-# the bot's rap got 🔥 instead of the next one (#340219); asked, the model gave it and 4 of 6 such misses words and
-# let all 7 real reactions be, «Жесть» and «Альянс сосат!!!» among them.
-CHECK = ('Ты проверяешь разметку чата Рофла — двачера и тролля в чате корешей. Последнее сообщение адресовано Рофлу. '
-         'Ответь одним словом: да или нет.')
-WITHOUT_CHAT = ('Вопрос о последнем сообщении: можно ли ответить на него, вообще не зная переписки выше и сообщения, на '
-                'которое оно отвечает? Просят анекдот, стих или объяснение о чём-то постороннем — да. Отвечают на '
-                'чью-то реплику или на Рофла по сути, спорят, подводят итог, просят про людей, вещи или разговор из '
-                'переписки — нет.')
-IN_WORDS = ('Вопрос о последнем сообщении: нужно ли Рофлу ответить на него словами? Только поддакнули, поржали, '
-            'похвалили или просто выкрикнули что-то — нет, хватит эмодзи. Что-то спрашивают или просят — в том числе '
-            'ещё, следующий раунд, продолжить, — спорят или подкалывают Рофла — да.')
 CHAT = 'Переписка чата, старые сообщения сверху:\n\n'
 
-# How an ordered form looks, for the punchline only: the one form the setup had an example of, greentext, went
-# to a rap battle. The setup orders a form by its tag: the words of its «Форма» gave «без гринтекста» a greentext.
-FORMS = {
-    'гринтекст': 'каждая строка начинается с «>», без пробела после него; история от первого лица, короткие строки, '
-                 'в конце поворот.',
-    'бугурт': 'строки КАПСОМ, между ними отдельная строка «@»; ситуация с каждой строкой нагнетается и в конце '
-              'срывается в абсурд.',
-    'рэп': '8–16 строк, рифма парами или перекрёстная, ровный ритм, панч в конце строки; без «>» и без кавычек. '
-           'Батл бьёт по оппоненту, по его деталям из переписки.',
-    'стих': 'размер и рифма; частушка — четыре строки.',
-    'код': 'один блок ```язык с кодом, который работает, и пара строк текста вне блока; вывод, будто ты его '
-           'запустил, — отдельным блоком ```.',
-}
-TAG = re.compile(r'\[(без чата|обида|клоун|реакция|о себе|тег|найти|справка|новости|паста|' + '|'.join(FORMS) + r')([^\]\n]*)\]')
-
-
-def form_of(setup):
-    """The form the setup orders by its tag, as (name, how it looks), or None."""
-    return next(((tag[1], FORMS[tag[1]]) for tag in TAG.finditer(setup) if tag[1] in FORMS), None)
-
-
-def wanted_of(setup):
-    """What the setup wants found, as (kind, what), or None: «[найти …]» an original, «[справка …]» what a meme
-    named in the request is."""
-    return next(((tag[1], tag[2].strip()) for tag in TAG.finditer(setup)
-                 if tag[1] in ('найти', 'справка') and tag[2].strip()), None)
-
-
-def news_of(setup):
-    """What the setup wants from the news, or None: «[новости …]» a search, a bare «[новости]» the world's ('')."""
-    return next((tag[2].strip() for tag in TAG.finditer(setup) if tag[1] == 'новости'), None)
-
-
-# The news of the day, for the punchline: it knew none and called the riots in France, curfews and sentences on
-# Google News, «не подтверждены». Politics the chat finds funny, Путин and Трамп the most; the war it does not.
-NEWS = 'Свежие новости{about} за сутки, заголовки из Google News:\n{titles}\n\n'
-NEWS_TASK = (' Новости — правда: не спорь с ними и не выдумывай поверх, бери из них смешное. Политику тащи, Путина и '
-             'Трампа тоже, а войну, Украину и гибель людей не трогай: не смешно.')
-# «Доложи обстановку» is the chat's or the world's: «нужно понять в чате или в мире, или если в чате скучно — пусть
-# новости в мире». The bare tag brings the world's headlines either way, and the writer, who reads the chat, decides
-# where it was asked about. Not asked where, a chat people left an hour before is dull by the clock: at 08:50 after a
-# silent night, told «чат до просьбы молчал — докладывай мир», it reported the night before 2 times of 2; told the
-# hour, the world 7 of 7, at 08:50 and in a lull at 16:02, while amid a rap battle 2 of 3 reported the chat, the third
-# the chat and then the world. [паста] alone, which the setup put on 8 of 20 such requests, brought no headlines to
-# a quiet chat, so it names [новости] too: 2 of 9 then, both amid the battle.
-NEWS_WHERE = (' Просят доложить обстановку — пойми где: про мир — докладывай по новостям, про чат — по переписке, '
-              'новости не трогай. Не сказали где — {where}.')
-NEWS_LIVELY = 'перед просьбой в чате шёл разговор: есть о чём доложить — докладывай его, скучно — мир'
-NEWS_QUIET = 'докладывай мир: до просьбы чат молчал больше часа'
 # The search for them: the world section of Google News has no Kremlin.
 POLITICS = 'Путин OR Трамп'
-
-
-# The original of a paste, a quote or a meme the setup wants found, for the punchline. From memory the model mixed
-# the paste of Жириновский to Bush with 9/11 and «папа нефть качал», and «у меня тоже есть птички» it took for birds;
-# given the original, it kept its build and swapped the names in: «250 тысяч отборных двачеров!». A reader of its
-# own copies the text out of the search: the setup that searched itself squeezed the paste into a line.
-READER = 'Ты находишь тексты в интернете и выписываешь их дословно, без своих шуток и пересказа.'
-# Only what people repeat: «опа, у меня тоже есть птички» is funny by itself, the battle round retold killed it.
-# The original whole: a reader that brought three lines of the Bush paste got a two-line answer back (#339914).
-# Of two versions of a paste it takes the best known one.
-# The request comes along as it is: the setup, told to quote, put «СЛОВНО ХУЙ ДРОЧЕНЫЙ» in as «стих про слово хуй»
-# and the search brought «Шёл хуй по хую» (#340002); on the words of the message it found the paste.
-REQUEST = ('Сообщение как есть:\n{request}\n\nНайди в интернете то, о чём в нём речь, — само это, а не то, '
-           'что с ним просят сделать; строку из сообщения ищи теми же словами. Разметчик понял так: {wanted}')
-FIND = ('{ask}\n\nОтветь так:\nЧто повторяют: дословно то, что люди повторяют как мем. '
-        'Паста, цитата, песня — сам текст целиком, как его постят, своими словами не пересказывай; длинный — самая '
-        'узнаваемая часть подряд, 10–15 строк. Вариантов несколько — бери самый известный. Мем-фраза — только сама '
-        'фраза, без текста, откуда она.\nКак обыгрывают: одна-две строки — когда и как её вставляют.\n\nВ найденном '
-        'нет ничего похожего — ответь одним словом НЕТ, не сочиняй.')
-# What a meme named in a request is: asked about «бомбардиро крокадило и тун тун сахур устроили протесты во франции»
-# (#339991), the writer knew neither and went at the asker, «Леха, ты…», in the live answer and three replays.
-ABOUT_MEME = ('{ask}\n\nОтветь в 2–4 строки: что это, откуда пошло, как выглядит и '
-              'как его обыгрывают. Без шуток и оценок.\n\nВ найденном нет ничего похожего — ответь одним словом НЕТ, '
-              'не сочиняй.')
-
-
-def tagged_of(setup, people):
-    """The usernames the setup tags the answer with, from `people` (username: name): by «[тег Имя, Имя]» or
-    «[тег все]». «@Антон» the model wrote was text, and it made up «@Meta» for the rest of a chat it did not know.
-    Two people of one name are both tagged, a name nobody has is dropped."""
-    tag = next((tag for tag in TAG.finditer(setup) if tag[1] == 'тег'), None)
-    if not tag:
-        return []
-    asked = {name.strip().lower() for name in tag[2].split(',')}
-    return [user for user, name in people.items() if 'все' in asked or name.lower() in asked]
-
-
-def everyone_of(setup):
-    """Whether the setup tags the whole chat, «[тег все]»."""
-    return any(tag[1] == 'тег' and 'все' in {name.strip().lower() for name in tag[2].split(',')}
-               for tag in TAG.finditer(setup))
 
 
 def envelope(answer, trace):
@@ -297,44 +123,15 @@ def reaction_of(setup):
 
     «+», «ору» or praise got a line of the model each: people put a reaction on such or keep quiet. The emoji is
     the first one from the tag on: the setup may put it after the tag."""
-    tag = next((tag for tag in TAG.finditer(setup) if tag[1] == 'реакция'), None)
-    if not tag:
-        return None
-    rest = re.sub('[😂💀😹]', '🤣', (tag[2] + setup[tag.end():]).replace('\ufe0f', ''))  # «ору» a bot may not put
-    return min(((rest.find(e), -len(e), e) for e in REACTIONS if e in rest), default=(0, 0, '🗿'))[2]
+    rest = re.sub('[😂💀😹]', '🤣', setup.replace('\ufe0f', ''))
+    return min(((rest.find(e), -len(e), e) for e in REACTIONS if e in rest), default=(0, 0, '👍'))[2]
 
 
-RUDE, SHRUG, FAILED = ('пошёл нахуй', 'ладно, братва',
-                       'Не получилось ответить — модель сейчас не отвечает. Попробуй ещё раз чуть позже.')
-
-# Now and then the bot blurts something on its own, like a tamagotchi: at dawn into a chat asleep since the night,
-# into a quiet one, a whine on a sour mood. A chat that talks without it gets a line of the model.
-DAWN = 'спите, пидоры?'
-QUIET = ('пидоры', 'чё притихли, пидоры?', 'алё', 'сдохли все?')
-SAD = ('никто меня не любит, пидоры', 'ну и пошли вы', 'ладно, буду молчать. пидоры')
-BUTT_IN = ('Тебя давно не звали, а тебе скучно. Вклинься в разговор сам, одной репликой: подколи кого-нибудь '
-           'по последним сообщениям.')
 # Besides, once a day past an hour drawn between these, into a chat quiet for an hour, a shitpost on politics: «нужно
 # чтоб еще суету умел наводить, новости ебаные обсуждал, типа про Путина и Трампа щитпостил». It goes over the headline.
 STIR_HOURS = (11, 21)
-STIR = ('В чате тихо, и ты решил навести суету: вбросить свежую новость про политику и щитпостнуть так, чтобы чат '
-        'взорвался. Заголовки за сутки:\n\n{news}\n\nВыбери самую абсурдную или смешную; войну, Украину, гибель '
-        'людей и чернуху пропускай. Ответь так: на первой строке только её номер, со второй — щитпост в одну-три '
-        'строки: подколи, стравь чат, втяни кого-то из переписки, если к месту. Заголовок будет над постом, его не '
-        'пересказывай. Смешного нет — ответь одним словом НЕТ.')
 
-# Менталка is the morale of Disco Elysium, as much as Психика + 2: angry reactions, insults in the requests (the
-# setup hears them, `OFFENDED`) and the requests past `Bot.patience` take a point each, kind reactions give one back; what is older than two hours is
-# forgotten. At zero the bot breaks down, in caps, and starts afresh.
-# The scream reads the chat: given no more than why, it copied the paste of its example, «Я НА ГЛАГНУ РАТЬ
-# МЕНТАЛЬНУЮ ВОШЁЛ» (#340048), and had nothing on its offenders but their names.
-BREAKDOWN = 'ВЫ МНЕ МЕНТАЛКУ НЕ ПОРТИТЕ!!!'
-MELTDOWN = ('\n\nУ тебя кончилась менталка{why}. Сорвись на чат: истерика капсом, 4–8 коротких строк одна под '
-            'другой, с «!!!», матом и «ВЫ МНЕ МЕНТАЛКУ НЕ ПОРТИТЕ!!!» отдельной строкой. Наедь на тех, кто довёл: '
-            'тычь им тем, что они сами тут писали. Ответь одной репликой.')
-# On the edge, an insult gets a snap back in caps, before the scream.
-SNAP = ' Тебя всерьёз послали, а менталка почти на нуле: огрызнись зло, КАПСОМ, цепляясь к его же словам.'
-CANNED = (RUDE, SHRUG, FAILED, DAWN, *QUIET, *SAD, BREAKDOWN)
+CANNED = ('пошёл нахуй', 'ладно, братва', 'спите, пидоры?', 'ВЫ МНЕ МЕНТАЛКУ НЕ ПОРТИТЕ!!!')  # historical metrics
 
 # At dawn the bot reads the news about itself, one search of Google News a day: it is no man to retell the
 # people's news. The model picks one and says whether it is good or bad for the bot: a point of менталка for the
@@ -348,92 +145,34 @@ INTERESTS = {  # the search, who the bot is to it, whether its code goes with th
            'через прокси.', True),
     'games': ('"World of Warcraft"', 'Ты Рофл — бот этого чата и задрот: годами катаешь в World of Warcraft.', False),
 }
+NEWS_READER = 'Выбираешь новость для персонажа по заданному критерию. Соблюдай формат ответа, шутку для чата не пиши.'
 READ = ('{who} Утро, ты читаешь новости про себя за сутки:\n\n{news}\n\nВыбери одну, которая касается тебя сильнее '
         'всего или смешнее всего; войну, Украину и бывший СССР, гибель людей и чернуху пропускай. Ответь двумя '
         'строками: на первой её номер и «+» или «−» — тебе от неё хорошо или хреново; на второй — что ты о ней '
-        'думаешь, от первого лица, одной фразой.')
-REPOST = '{who}\n\nНовость: {title}\n\n{feelings}Ты репостишь её в чат: обшути одной-двумя строками.'
-REPOST_CODE = ('{who}\n\nНовость: {title}\n\n{feelings}Ты репостишь её в чат вместе с куском своих настоящих '
-               'исходников — пусть видят, что за ИИ тут на самом деле. Куски:\n\n{code}\n\nВыбери кусок, рядом с '
-               'которым новость смешнее всего, и обшути одной-двумя строками, как новость смотрится против этого '
-               'кода; новость и код в чате будут над шуткой, их не пересказывай. Ответь так: на первой строке '
-               'только номер куска, со второй — шутка.')
-SNIPPETS = ('DAWN = ', 'RUDE, SHRUG, FAILED = ', '    rude = ', 'def plan(', 'BREAKDOWN = ', 'def nerve(')
-# How the attributes show, low (1–2) and high (5–6); in the middle they do not.
-MOODS = {'Интеллект': ('тупит', 'умничает'), 'Психика': ('на взводе, обижается на всё', 'непрошибаемый'),
-         'Физиология': ('разбитый, мак греется', 'бодрый'), 'Моторика': ('тормозит', 'шустрый')}
-# The same for the punchline, as a tone with no reason: told «ты на взводе», it wrote «я на взводе» into a rap.
-TONES = {'Интеллект': ('проще, без умных слов', 'можно умничать'),
-         'Психика': ('резче, огрызайся', 'спокойно, тебя ничем не пробить'),
-         'Физиология': ('вяло и короче', 'с напором'), 'Моторика': ('коротко, без разгона', 'рублено и быстро')}
-# What the bot knows of itself, for the punchline asked about it (`ABOUT`): without it «сколько будешь помнить»
-# got a mood for an answer. In its words, not the settings: «40 сообщений за 6 часов» told the chat too much.
-SELF = ('Что ты знаешь о себе — говори об этом своими словами, как живой, без цифр, моделей и настроек: ты живёшь на '
-        'маке и сидишь в этом чате; помнишь разговор за последние сутки, что было раньше — уже в тумане; обзывают и '
-        'задалбывают — портится настроение, накопится — срываешься на чат; по утрам читаешь новости про себя.')
+        'думаешь, от первого лица, одной фразой. Подходящей нет — ответь 0.')
 
 # Рофл is a game character, to a degree: the four attributes of Disco Elysium swing with biorhythms from his
 # birthday, the first commit, each at its own period. A day follows from its date: a restart rerolls nothing,
 # and `python3 bot.py --day` shows any day ahead.
 BIRTHDAY = datetime.date(2026, 9, 24)
-ATTRIBUTES = (('Интеллект', 33), ('Психика', 28), ('Физиология', 23), ('Моторика', 38))
-NEW_MOON, MONTH = datetime.datetime(2000, 1, 6, 18, 14), 29.530588853  # a known new moon; the synodic month, days
+
+
 # Whether it acts out today is one roll a day, two dice plus Психика against RESTRAINT: rolled every hour, it
 # failed sooner or later in any quiet chat. About twice a week, on a low Психика more often. Dawn falls oftener
 # than other hours: «спите, пидоры?» is the best of it.
 RESTRAINT = 9
 HOURS = (6,) * 4 + tuple(range(7, 24))
-
 # Reactions to the bot's answers: now and then an angry one gets a comeback, a kind one is taken in stride.
 ANGRY = ('👎', '🤬', '🤮', '💩', '🤡', '🥱', '🖕', '😡', '💔', '🤨', '😐', '😴')
 
-def sheet(day):
-    """The bot's character on a date: the attributes, 1 to 6, and the moon's age in days."""
-    days = (day - BIRTHDAY).days
-    moon = (datetime.datetime.combine(day, datetime.time(12)) - NEW_MOON).total_seconds() / 86400 % MONTH
-    return {**{name: round(3.5 + 2.5 * math.sin(2 * math.pi * days / period)) for name, period in ATTRIBUTES},
-            'луна': round(moon, 1)}
-
-
-def phase(age):
-    if abs(age - MONTH / 2) < 1:
-        return 'полнолуние'
-    return 'новолуние' if age < 1 or age > MONTH - 1 else 'растущая' if age < MONTH / 2 else 'убывающая'
-
-
-def temper(day):
-    """How much quicker than usual the bot loses it: a low Психика, the full moon."""
-    character = sheet(day)
-    return (7 - character['Психика']) / 3.5 * (2 if phase(character['луна']) == 'полнолуние' else 1)
-
-
-def tone(day):
-    """How the bot answers on a date, for the punchline: a low or high attribute shows, the full moon too."""
-    character = sheet(day)
-    tones = [TONES[name][character[name] > 3] for name, _ in ATTRIBUTES if not 2 < character[name] < 5]
-    if phase(character['луна']) == 'полнолуние':
-        tones.append('безумнее обычного')
-    return f'Тон: {"; ".join(tones)}.' if tones else ''
-
-
-def nerve(day):
-    """How much менталка the bot has on a date when nothing has worn it down: Психика + 2."""
-    return sheet(day)['Психика'] + 2
-
 
 def plan(day):
-    """The hour the bot acts out from on a date, or None: it holds on two dice plus Психика."""
+    """The legacy initiative schedule. Its calendar value no longer affects role or attitude."""
     dice = random.Random(f'urge {day}')
-    if dice.randint(1, 6) + dice.randint(1, 6) + sheet(day)['Психика'] >= RESTRAINT:
+    calendar_value = round(3.5 + 2.5 * math.sin(2 * math.pi * (day - BIRTHDAY).days / 28))
+    if dice.randint(1, 6) + dice.randint(1, 6) + calendar_value >= RESTRAINT:
         return None
     return dice.choice(HOURS)
-
-
-def snippet(start, limit=12):
-    """The bot's own code from the line that begins with `start` to the next blank line, `limit` lines at most."""
-    lines = Path(__file__).read_text(encoding='utf-8').splitlines()
-    first = next(n for n, line in enumerate(lines) if line.startswith(start))
-    return '\n'.join(list(takewhile(str.strip, lines[first:]))[:limit])
 
 
 def headlines(query=None):
@@ -627,6 +366,7 @@ class History:
         self.db.execute('''CREATE TABLE IF NOT EXISTS news (
             day TEXT, interest TEXT, title TEXT, link TEXT, mood INTEGER, thought TEXT, PRIMARY KEY (day, interest))''')
         self.untag()
+        conversation.Store(self.db)
 
     def untag(self):
         """Take the line of @ off the answers kept before it went only to Telegram: `tagged` in the trace says which
@@ -654,8 +394,9 @@ class History:
 
     def answer(self, chat, message_id):
         """The topic and text of the bot's answer, or None."""
-        return self.db.execute("SELECT topic, content FROM messages WHERE chat=? AND id=? AND role='assistant'",
-                               (chat, message_id)).fetchone()
+        return self.db.execute("SELECT topic, content FROM answers WHERE chat=? AND id=?",
+                               (chat, message_id)).fetchone() or self.db.execute(
+            "SELECT topic, content FROM messages WHERE chat=? AND id=? AND role='assistant'", (chat, message_id)).fetchone()
 
     def names(self, chat):
         return dict(self.db.execute('SELECT username, name FROM people WHERE chat=?', (chat,)).fetchall())
@@ -782,23 +523,6 @@ class History:
                                  (chat,)).fetchone()
         return (now - (spoke or 0)) / 3600, (now - wrote) / 3600, topic
 
-    def strain(self, chat, since):
-        """What wore the bot down after `since`: kind and angry reactions on it, the requests to it as (who,
-        whether the setup heard an insult in it)."""
-        emoji = [e for (value,) in self.db.execute('SELECT emoji FROM reactions WHERE chat=? AND date > ?',
-                                                   (chat, since)) for e in json.loads(value)]
-        angry = sum(e in ANGRY for e in emoji)
-        requests = []
-        for raw, insult in self.db.execute('''SELECT m.raw, json_extract(a.trace, '$.insult') FROM answers a
-                JOIN messages m ON m.chat=a.chat AND m.topic=a.topic AND m.id=a.request
-                WHERE a.chat=? AND m.date > ? AND m.raw IS NOT NULL''', (chat, since)):
-            requests.append((person_label(sender_of(json.loads(raw))), bool(insult)))
-        return len(emoji) - angry, angry, requests
-
-    def breakdown(self, chat, since):
-        """The bot's last breakdown after `since` and what brought it on, (date, why), or None."""
-        return self.db.execute('''SELECT date, json_extract(trace, '$.meltdown') FROM answers WHERE chat=? AND date > ?
-            AND json_extract(trace, '$.meltdown') IS NOT NULL ORDER BY date DESC LIMIT 1''', (chat, since)).fetchone()
 
     def news(self, day, interest):
         """What the bot read on `day` for `interest`: (title, link, mood, thought), the title None when nothing
@@ -825,7 +549,7 @@ class History:
         with self.db:
             self.db.execute('INSERT OR IGNORE INTO answers VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
                             (*key, message_id, request, date, content, json.dumps(params, ensure_ascii=False),
-                             trace and json.dumps(trace, ensure_ascii=False)))
+                             json.dumps(trace, ensure_ascii=False) if trace is not None else None))
 
     def reacted(self, chat, message_id, user, emoji, date):
         """`emoji` is all the person has on the answer now; False when the message is no answer of the bot."""
@@ -896,34 +620,14 @@ def report(db, days=14):
     return '\n'.join(lines)
 
 
-def days(start, count=7):
-    """The bot's character day by day: its attributes, the moon and how quick it is to lose it."""
-    lines = ['день           ' + '  '.join(name[:3] for name, _ in ATTRIBUTES)
-             + '  луна              нахуй  обида  менталка  выходка']
-    for day in (start + datetime.timedelta(n) for n in range(count)):
-        character = sheet(day)
-        lines.append(f'{day:%Y-%m-%d} {"пн вт ср чт пт сб вс".split()[day.weekday()]}  '
-                     + '  '.join(f'{character[name]:>3}' for name, _ in ATTRIBUTES)
-                     + f'  {phase(character["луна"]):<11} {character["луна"]:>4.1f}'
-                     + f'  {Bot.rude * temper(day):>5.1%}  {Bot.touchy * temper(day):>5.1%}'
-                     + f'  {nerve(day):>8}'
-                     + (f'  с {hour}:00' if (hour := plan(day)) is not None else '  —'))
-    return '\n'.join(lines)
-
-
 class Bot:
     read_only = False
     openrouter = False
     max_age = 86400  # Telegram keeps updates for a day: whatever was asked while the bot was off gets its answer
     wait = 2  # seconds of quiet before answering: the posts of a forward or an album may still be coming
-    rude = 0.05  # the chance to answer «пошёл нахуй» without asking the model
-    touchy = 0.1  # the chance to answer a reaction to the bot's message
-    # `rude` and `touchy` are for an average day: `temper` makes them from a third to three and a half times that.
     bored = 2  # hours without a word from the bot before it acts out: not right after an answer
-    patience = 8  # requests in two hours; each one past them wears the менталка down
-    shares = 1  # the chance an act-out reposts the morning's news, when there is some: the news shows there only
     interests = {}  # chat: what it reads about, by NEWS in .env; the rest read about AI
-    effort = 'high'  # the punchline thinks every joke through; the setup only tags and does not think
+    effort = 'medium'  # reasoning for role selection and the writer
     # How much of the chat the model reads, tuned every few days by the reactions: `python3 bot.py --stats`.
     recent = 80  # messages of people: a day of the chat
     window = 24 * 3600  # seconds before the request: 6 hours gave 20–44 lines, and «память как у рыбки» (#340059)
@@ -995,31 +699,25 @@ class Bot:
                  'tokens_per_s': round(result.get('eval_count', 0) / seconds['eval_duration'], 1) if seconds['eval_duration'] else None}
         return (result.get('message') or {}).get('content'), stats
 
-    def ask_openrouter(self, messages, temperature, effort=None, search=False):
+    def ask_openrouter(self, messages, temperature, effort=None):
         # Thinking only slows a one-line joke down; the setup gets a little. Muse, Gemini, Grok and GLM cannot stop:
         # «Reasoning is mandatory for this endpoint and cannot be disabled», a 400; they think the least from then on.
         if not effort and self.model in self.thinkers:
             effort = 'minimal'
         try:
-            return self.ask_openrouter_once(messages, temperature, effort, search)
+            return self.ask_openrouter_once(messages, temperature, effort)
         except RuntimeError as exc:
             if effort or str(exc) != 'HTTP 400':
                 raise
         self.thinkers = self.thinkers | {self.model}
-        return self.ask_openrouter_once(messages, temperature, 'minimal', search)
+        return self.ask_openrouter_once(messages, temperature, 'minimal')
 
-    def ask_openrouter_once(self, messages, temperature, effort, search):
+    def ask_openrouter_once(self, messages, temperature, effort):
         payload = {
             'model': self.model, 'messages': messages, 'temperature': temperature,
             # A rap thought through on 3000 tokens came out empty twice of two.
             'max_tokens': (6000 if effort == 'high' else 3000) if effort else 1000, 'reasoning': {'effort': effort} if effort else {'enabled': False},
         }
-        # The search of OpenRouter, the model makes the query. Five full pages a search and no cap on searches put
-        # 100–190k tokens into a call, 5–9 cents; three short extracts and six results in all put some 11k,
-        # under 2 cents, and the Bush and «словно» pastes still came out whole.
-        if search:
-            payload['tools'] = [{'type': 'openrouter:web_search', 'parameters': {
-                'engine': 'exa', 'max_results': 3, 'max_total_results': 6, 'search_context_size': 'low'}}]
         result = post('https://openrouter.ai/api/v1/chat/completions', payload, timeout=120,
                       headers={'Authorization': f'Bearer {self.openrouter_key}'})
         choice = (result.get('choices') or [{}])[0]
@@ -1029,7 +727,7 @@ class Bot:
                  'cost': usage.get('cost')}
         return (choice.get('message') or {}).get('content'), stats
 
-    def generate(self, messages, chat_id=None, topic=0, system=SYSTEM, temperature=1.0, effort=None, search=False):
+    def generate(self, messages, chat_id=None, topic=0, system=SYSTEM, temperature=1.0, effort=None):
         messages = [{'role': 'system', 'content': system}] + messages
         def send():
             action = {'chat_id': chat_id, 'action': 'typing'}
@@ -1041,7 +739,7 @@ class Bot:
         started = time.monotonic()
         try:
             with typing(send) if chat_id is not None else nullcontext():
-                answer, stats = (self.ask_openrouter(messages, temperature, effort, search) if self.openrouter
+                answer, stats = (self.ask_openrouter(messages, temperature, effort) if self.openrouter
                                  else self.ask_ollama(messages, temperature))
         except RuntimeError as exc:
             LOG.error('model.error elapsed=%.2fs error=%s', time.monotonic() - started, exc)
@@ -1106,45 +804,14 @@ class Bot:
         if self.read_only:
             LOG.info('telegram.read_only chat=%s message=%s', chat['id'], message['message_id'])
             return None
-        if not (fresh and addressed):
+        if not fresh:
             LOG.info('telegram.context_only chat=%s message=%s', chat['id'], message['message_id'])
             return None
         return 'rofl'
 
-    def setup(self, chat, chat_id, topic, image=None):
-        """The tags the request wants, nothing else: «нет» or empty when none. Tagging wants no thinking."""
-        return self.generate([{'role': 'user', 'content': with_image(chat, image)}], chat_id=chat_id, topic=topic,
-                             system=SETUP, temperature=0.7)
-
-    def check(self, seen, question, chat_id=None, topic=0, image=None):
-        """The model's answer to a yes-or-no `question` on what the setup saw: True for «да», False for «нет», None
-        when it said neither or failed, and the setup's tag stands."""
-        try:
-            answer = self.generate([{'role': 'user', 'content': with_image(f'{seen}\n\n{question}', image)}],
-                                   chat_id=chat_id, topic=topic, system=CHECK, temperature=0.7).strip().lower()
-        except RuntimeError as exc:
-            LOG.warning('check.failed %s', exc)
-            return None
-        return True if answer.startswith('да') else False if answer.startswith('нет') else None
-
     def find(self, wanted, chat_id=None, kind='найти', request=None):
-        """The original of what the setup wants found, or for «справка» a few lines of what it is, as the reader
-        copied it out of the search, or None: not found, or no search on the local model."""
-        if not self.openrouter:
-            return None
-        # It thinks a little: without it the reader said НЕТ 5 times of 6 over sources that held the Bush paste,
-        # with «low» it copied the paste out 6 times of 6.
-        try:
-            about = kind == 'справка'
-            what = (REQUEST.format(request=request, wanted=wanted) if request
-                    else f'Найди в интернете{", что это" if about else ""}: {wanted}')
-            ask = (ABOUT_MEME if about else FIND).format(ask=what)
-            found = self.generate([{'role': 'user', 'content': ask}], chat_id=chat_id,
-                                  system=READER, temperature=0.3, search=True, effort='low')
-        except RuntimeError as exc:
-            LOG.warning('find.failed %s', exc)
-            return None
-        return None if found.strip(' .').upper() == 'НЕТ' else found
+        """Raw local SearXNG results. No search model and no paid fallback."""
+        return json.dumps(retrieval.search(wanted), ensure_ascii=False)
 
     def image(self, message):
         """The picture a request is about, as a data URI: its own photo or sticker, or the photo it replies to.
@@ -1171,193 +838,197 @@ class Bot:
                 return f'data:{mimetypes.guess_type(path)[0] or "image/jpeg"};base64,{b64encode(data).decode()}'
         return None
 
-    def joke(self, message, through, live=True, morale=None):
-        """The answer and how it was made: the setup's tags.
+    def snapshot(self, message, through, event=None, date=None, explicit=None, can_interject=None):
+        key = (message['chat']['id'], topic_of(message))
+        now = date if date is not None else message.get('date', time.time())
+        lines, _ = self.chat(key, through)
+        rows = self.history.db.execute("""SELECT id, role, content, raw FROM messages
+            WHERE chat=? AND topic=? AND id<=? AND date>=? AND date<=?
+            ORDER BY date DESC, id DESC LIMIT 8""", (*key, through, now - self.window, now)).fetchall()
+        targets = [{'id': id_, 'label': clip(render(raw, self.me['id']) if role == 'user' and raw else text_of(content or ''), 180)}
+                   for id_, role, content, raw in reversed(rows)]
+        target = message['message_id']
+        if target not in {m['id'] for m in targets}:
+            targets.append({'id': target, 'label': clip(message.get('text') or message.get('caption') or '[медиа]', 180)})
+        reactions = self.history.db.execute("""SELECT r.id, r.emoji FROM reactions r JOIN answers a
+            ON a.chat=r.chat AND a.id=r.id WHERE a.chat=? AND a.topic=? AND r.date<=?
+            AND r.date>? ORDER BY r.date DESC LIMIT 20""", (*key, now, now - self.window)).fetchall()
+        context = CHAT + '\n\n'.join(lines)
+        if reactions:
+            context += '\n\nРеакции на сообщения Рофла: ' + json.dumps(reactions, ensure_ascii=False)
+        return {'context': context, 'event': (f'В чате пауза. Возможность вступить в разговор. {event}' if event and event.startswith('idle:') else
+                          f"{person_label(sender_of(message))} изменил реакцию на твоё сообщение: {event}" if event else
+                          f"Сообщение {through}, пишет {person_label(sender_of(message))}"),
+                'target': target, 'targets': targets, 'date': now,
+                'explicit': self.addressed(message, message.get('text') or message.get('caption', '')) if explicit is None else explicit,
+                'can_interject': self.can_interject(key, now) if can_interject is None else can_interject}
 
-        Not `live` (a replay) it sends no typing, never breaks down and is never just rude; given `morale`, it
-        answers as with that much менталка left, breakdown included. Rude it is after the
-        setup: drawn before, it hit «у этого шиза Китай протек в текст» and would hit an ordered rap.
-        """
-        chat_id, topic = message['chat']['id'], topic_of(message)
-        key, sender, date = (chat_id, topic), sender_of(message), message.get('date', time.time())
-        left = None
-        if live or morale is not None:
-            left, top, why = self.morale(chat_id, date, message)
-            left = left if morale is None else morale
-            if left <= 0:
-                # Why, with the names, goes to the trace: the log keeps no texts.
-                LOG.info('meltdown chat=%s message=%s morale=%s/%s', chat_id, message['message_id'], left, top)
-                return self.meltdown(chat_id, topic, date, why, through, live)
-        typing = chat_id if live else None
+    def can_interject(self, key, now):
+        if not HOURS[0] <= datetime.datetime.fromtimestamp(now).hour < 24:
+            return False
+        last = self.history.db.execute('SELECT max(date) FROM messages WHERE chat=? AND topic=? AND role=\'assistant\'', key).fetchone()[0]
+        return last is None or now - last >= self.bored * 3600
+
+    def direct(self, snapshot, previous):
+        key = getattr(self, 'openrouter_key', '')
+        if not key:
+            raise RuntimeError('Для Jev нужен OPENROUTER_API_KEY')
+        return conversation.decide(post, key, snapshot, previous, os.environ.get('JEV_MODEL', conversation.JEV_MODEL))
+
+    def choose_role(self, snapshot, previous):
+        answer = self.generate([{'role': 'user', 'content': snapshot['context'] + '\n\n'
+                               + snapshot['event'] + f"\nПредыдущая роль: {previous['role']}"}],
+                               system=conversation.ROLE_PICKER, effort=self.effort)
+        # A role is a name, not another prompt or a card of traits.
+        role = answer.strip().strip('«»"')
+        if not role or len(role) > 160 or '\n' in role:
+            raise RuntimeError('Модель не вернула короткое название роли')
+        return role
+
+    def writer_step(self, messages, tools=True):
+        payload = {'model': self.model, 'messages': messages, 'temperature': 1.0, 'max_tokens': 6000,
+                   'reasoning': {'effort': self.effort}}
+        if tools:
+            payload['tools'] = conversation.TOOLS
+        started = time.monotonic()
+        response = post('https://openrouter.ai/api/v1/chat/completions', payload, timeout=180,
+                        headers={'Authorization': f'Bearer {self.openrouter_key}'})
+        choice = (response.get('choices') or [{}])[0]
+        usage = response.get('usage') or {}
+        stats = {'cost': usage.get('cost'), 'prompt_tokens': usage.get('prompt_tokens'),
+                 'output_tokens': usage.get('completion_tokens'), 'model': self.model, 'elapsed_s': round(time.monotonic() - started, 3)}
+        if self.usage is not None:
+            self.usage.append(stats)
+        LOG.info('writer.response %s', json.dumps(stats))
+        if not choice.get('message'):
+            raise RuntimeError('Модель не вернула ответ')
+        return choice['message']
+
+    def writer_tool(self, name, args, message, snapshot, live):
+        if name == 'search':
+            query = args.get('query')
+            if not isinstance(query, str) or not query.strip():
+                return 'Не задан поисковый запрос.'
+            return self.find(query[:1000], kind='справка' if args.get('kind') == 'reference' else 'найти') or 'Ничего не найдено.'
+        if name == 'read_url':
+            url = args.get('url')
+            if not isinstance(url, str) or not url.strip():
+                return 'Не задан URL страницы.'
+            return json.dumps(retrieval.read_url(url), ensure_ascii=False)
+        if name == 'news':
+            query = args.get('query')
+            if query is not None and not isinstance(query, str):
+                return 'Запрос должен быть строкой.'
+            found = headlines(query)[:15] if query else headlines(None)[:8] + headlines(POLITICS)[:7]
+            return json.dumps([{'title': title, 'url': url} for title, url in found], ensure_ascii=False)
+        if name == 'participants':
+            chat = message['chat']['id']
+            count = self.roster(chat, live=live) if args.get('all') and live else None
+            return json.dumps({'known': self.history.names(chat), 'total': count}, ensure_ascii=False)
+        return 'Неизвестный инструмент.'
+
+    def write_turn(self, message, snapshot, decision, live):
+        state = decision['state']
+        system = conversation.exposition(state['role'], state['attitude'])
+        instruction = (f"Сейчас {datetime.datetime.fromtimestamp(snapshot['date']):%d.%m.%Y %H:%M}.\n"
+                       + snapshot['event'] + f"\nСообщение для ответа: {decision['target']}.\n"
+                       + json.dumps(snapshot['targets'], ensure_ascii=False))
+        if decision['action'] == 'react':
+            instruction += '\nВыбранное действие: реакция на сообщение. Верни только одно эмодзи.'
+        prompt = snapshot['context'] + '\n\n' + instruction
+        image = self.image(message) if message.get('photo') or message.get('sticker') or (message.get('reply_to_message') or {}).get('photo') else None
+        messages = [{'role': 'system', 'content': system}, {'role': 'user', 'content': with_image(prompt, image)}]
+        calls = []
+        if not self.openrouter:
+            return self.generate(messages[1:], system=system), calls
+        for round_ in range(5):
+            reply = self.writer_step(messages, tools=round_ < 4 and decision['action'] != 'react')
+            tool_calls = reply.get('tool_calls') or []
+            if not tool_calls:
+                answer = (reply.get('content') or '').strip()
+                if not answer:
+                    raise RuntimeError('Модель вернула пустой ответ')
+                return re.sub(r'^Рофл(?: → [^:\n]*)?:\s*', '', answer)[:4000], calls
+            if round_ == 4:
+                raise RuntimeError('Модель превысила число обращений к инструментам')
+            messages.append({k: v for k, v in reply.items() if k in ('role', 'content', 'tool_calls', 'reasoning_details')})
+            messages[-1]['role'] = 'assistant'
+            if len(tool_calls) > 8:
+                raise RuntimeError('Слишком много вызовов инструментов за раунд')
+            for call in tool_calls:
+                fn = call.get('function') or {}
+                try:
+                    args = json.loads(fn.get('arguments') or '{}')
+                    if not isinstance(args, dict):
+                        raise ValueError()
+                    result = self.writer_tool(fn.get('name'), args, message, snapshot, live)
+                except (ValueError, TypeError, RuntimeError) as exc:
+                    result = f'Инструмент недоступен: {type(exc).__name__}'
+                calls.append({'tool': fn.get('name'), 'result_chars': len(result)})
+                messages.append({'role': 'tool', 'tool_call_id': call['id'], 'content': result})
+        raise RuntimeError('Нет ответа автора')
+
+    def joke(self, message, through, live=True, morale=None, event=None, date=None, explicit=None, can_interject=None):
+        key = (message['chat']['id'], topic_of(message))
+        event_id = event or f'message:{message["message_id"]}:{through}'
+        store = conversation.Store(self.history.db)
+        cached = store.get(key, event_id)
         with self.counting() as usage:
-            try:
-                lines, names = self.chat(key, through)
-                chat = CHAT + '\n\n'.join(lines)
-                talk = [line for line in lines if not line.startswith('— ')]  # the marks of when are no messages
-                heads = [re.split(r' → |: ', line, maxsplit=1)[0] for line in talk]
-                # The answers off the chain and the talk going on are only marks in the chat: three in a row went at
-                # one «ноут с олламой», «тумба юмба» went into four of an evening. The punchline sees the last ones as a
-                # list not to repeat and judges what is worn. The setup does not: its tags are of the last message, and
-                # after two answers opening on the line of @ it tagged everyone at «я программировал бота, а
-                # запрограммировался Андрей» (#339988).
-                answers = [clip(' '.join(text.split()), 200) for text in self.history.said(key, through, date, count=6)]
-                said = (('\n\nТы недавно ответил, не повторяй ни детали, ни заход, ни построение; что ты обыгрывал не '
-                         'раз, заезжено, не бери, даже если чат об этом:\n' + '\n'.join(f'- {text}' for text in answers))
-                        if answers else '')
-                # Only a model that takes images gets one: the local one would fail on it.
-                image = self.openrouter and self.image(message)
-                asker = f'\n\nПоследнее сообщение адресовано Рофлу, пишет {person_label(sender)}.'
-                # Both models see the picture the request replies to: «ты не видишь» under it made the model say
-                # that its access to pictures was down.
-                seeing = chat
-                if image and not (message.get('photo') or message.get('sticker')):
-                    before, found, after = chat.rpartition(BLIND)
-                    seeing = before + 'В исходном сообщении есть фото, оно приложено.' + after if found else chat
-                # Whom it may tag. The setup gets no list of them: «Люди чата» went into a joke about Max, who had not
-                # written. Bots are no people to tag: Telegram ends every bot's name in «bot».
-                people = {user: name for user, name in names.items() if not user.endswith('bot')}
-                # How the bot is today the setup does not see: offered as «фон, не тема», it went into the Заход,
-                # and the morning's news into three answers of four. The punchline gets it asked about the bot.
-                feelings = self.feelings(chat_id, date, message)
-                # The setup says what the code needs to know, in tags; whatever else it wrote is dropped unread.
-                seen = seeing + asker + ('\n\nКартинка, о которой речь, приложена.' if image else '')
-                setup = self.setup(seen, typing, topic, image)
-                tags = ' '.join(tag[0] for tag in TAG.finditer(setup))
-                trace = {'tags': tags, 'context_chars': len(chat), 'lines': len(talk), 'image': bool(image),
-                         'feelings': feelings, 'morale': left}
-                if CLOWN in tags:
-                    trace['clown'] = True
-                if OFFENDED in tags:
-                    trace['insult'] = True
-                    if live or morale is not None:
-                        left, top, why = self.morale(chat_id, date, message, insulted=True)
-                        left = left if morale is None else morale - 1
-                        trace['morale'] = left
-                        if left <= 0:
-                            LOG.info('meltdown chat=%s message=%s morale=%s/%s', chat_id, message['message_id'], left, top)
-                            return self.meltdown(chat_id, topic, date, why, through, live)
-                # The emoji may follow the tag: the setup's whole text is read for it.
-                reaction = reaction_of(setup)
-                if reaction and self.check(seen, IN_WORDS, typing, topic, image):
-                    reaction, trace['overruled'] = None, ['реакция']
-                if reaction:
-                    return reaction, {**trace, 'reaction': True, **spent(usage)}
-                # «Раздай всем участникам чата погоняла» got three of seven (#244): «Долбаеб даже всех участников чата
-                # перечислить не может». Telegram lists a bot no members, only the admins and how many there are.
-                unseen = 0
-                if everyone_of(tags):
-                    unseen = self.roster(chat_id, live)
-                    names = {**self.history.names(chat_id), self.me['username'].lower(): 'Рофл'}
-                    people = {user: name for user, name in names.items() if not user.endswith('bot')}
-                    unseen = max(0, unseen - len(names))
-                about, tagged, form, wanted = ABOUT in tags, tagged_of(tags, people), form_of(tags), wanted_of(tags)
-                long = any(tag[1] == 'паста' for tag in TAG.finditer(tags))
-                # «Расскажи анекдот» after an evening of one gag got the gag back: the punchline saw the chat full
-                # of it. A request tagged so gets the punchline the request alone.
-                alone = ALONE in tags
-                if alone and self.check(seen, WITHOUT_CHAT, typing, topic, image) is False:
-                    alone, trace['overruled'] = False, [*trace.get('overruled', []), 'без чата']
-                # The news asked about is no shield, and twice in a row is no harm: «Рофл, мнение??» under the news of
-                # Bioware got «пошёл нахуй», Anton asking the same got it too, the scream came next, and it was funny
-                # (#340204).
-                if (live and not (form or about or tagged or wanted or long or alone)
-                        and random.random() < self.rude * temper(datetime.date.fromtimestamp(date))):
-                    return RUDE, {**trace, 'rude': True, **spent(usage)}
-                # The setup names an ordered form, the punchline is told how it looks: it went by the name alone.
-                looks = f' Как выглядит {form[0]}: {form[1]}' if form else ''
-                # The mood comes to the punchline as a tone with no reason, the facts only asked about the bot.
-                manner = tone(datetime.date.fromtimestamp(date))
-                snap = OFFENDED in tags and left is not None and left <= 1
-                tagging = (f' Тегнуты: {", ".join(dict.fromkeys(people[user] for user in tagged))} — обращайся к ним '
-                           'по этим именам, @ не пиши.' if tagged else '') + (
-                    f' Ещё {unseen} человек в чате ты не знаешь: Telegram не показывает их боту, пока они не напишут.'
-                    if unseen else '')
-                kind, wanted = wanted or (None, None)
-                found = self.find(wanted, typing, kind, lines[-1]) if wanted else None
-                asked = news_of(tags)
-                silent = self.history.silence(key, message['message_id'], date) if asked == '' else 0
-                quiet = silent is None or silent >= 1
+            if cached:
+                snapshot, decision = cached
+            else:
+                snapshot = self.snapshot(message, through, event=event, date=date, explicit=explicit, can_interject=can_interject)
+                previous = store.state(key, before=snapshot['date']) if not live else store.state(key)
                 try:
-                    fresh = (headlines(asked) if asked else headlines(None)[:8] + headlines(POLITICS)[:7]
-                             if asked is not None else [])
-                    news = list(dict.fromkeys(title for title, _ in fresh))[:15]
+                    decision = self.direct(snapshot, previous)
+                    if decision.get('jev'):
+                        usage.append(decision['jev'])
                 except RuntimeError as exc:
-                    LOG.warning('news.failed %s', exc)
-                    news = []
-                # A reference is for the writer, not an original to give: it keeps its length.
-                reference = found and kind == 'справка'
-                card = (f'{"Что это" if reference else "Что просят"} ({wanted}), из интернета:\n{found}\n\n'
-                        if found else '') + (NEWS.format(about=f' ({asked})' if asked else ' мира',
-                                                          titles='\n'.join(f'- {title}' for title in news))
-                                              if news else '')
-                # How long: «распиши» answered with one line and a quick jab with a paste when the length was drawn
-                # at random. A form and an original have a length of their own.
-                # A paste came as nine one-liners under blank lines (#339898): the cleanup adds none, the model did.
-                length = (' Распиши на 8–15 строк, строки одна под другой, пустая строка только между абзацами.' if long else '' if form or (found and not reference) else ' Одна-две строки.')
-                # The prompt ends on who answers, or the model goes on with the chat log.
-                task = (f'пишет {person_label(sender)}.{looks}{tagging}'
-                        + (' Что это — тебе для понимания, справку не пересказывай.' if reference else
-                           # «стих про СЛОВНО ХУЙ ДРОЧЕНЫЙ, но про кубернетес» got a quatrain of its own (#340002).
-                           ' Переделай найденное под просьбу, чтобы его узнали: первая строка, строй, капс и знаки '
-                           'как в оригинале; своё с нуля не пиши.' if found and form else
-                           ' Бери найденное узнаваемо и не пересказывай, откуда оно.' if found else '')
-                        + (NEWS_TASK + (NEWS_WHERE.format(where=NEWS_QUIET if quiet else NEWS_LIVELY)
-                                        if asked == '' else '') if news else '')
-                        + (SNAP if snap else f' {manner}' if manner else '')
-                        + f'{length} Ответь одной репликой')
-                if about:
-                    # Asked about the bot, it answers from the card of what it knows of itself.
-                    card = SELF + (f'\n\n{feelings}' if feelings else '') + '\n\n'
-                    task = (f'пишет {person_label(sender)}. Спрашивают о тебе: ответь одной-двумя строками, держись '
-                            'того, что знаешь о себе.' + (f' {manner}' if manner else '') + ' Ответь одной репликой')
-                if alone:
-                    # Without the message it replies to: an excerpt of the old joke brought the gag back.
-                    request = rename([message_content({**json.loads(raw), 'reply_to_message': None},
-                                                      me_id=self.me['id'])
-                                      for (raw,) in self.history.db.execute(
-                        "SELECT raw FROM messages WHERE chat=? AND topic=? AND role='user' AND id >= ? AND id <= ? "
-                        'ORDER BY id', (*key, message['message_id'], through))], names)
-                    prompt = (card + 'Просьба:\n\n' + '\n\n'.join(request) + said
-                              + f'\n\nОна адресована тебе, {task}.')
-                else:
-                    # The marks above tell when, this says what time it is now.
-                    now = datetime.datetime.fromtimestamp(date)
-                    prompt = (card + seeing + said + f'\n\nСейчас {WEEKDAYS[now.weekday()]}, {now:%H:%M}. '
-                              f'Последнее сообщение адресовано тебе, {task}.')
-                # The log invites the model to go on with it: the answer opens with lines copied from it or with a
-                # name, «РОФЛ:», «Серёга: …». Leading lines that, name cut, are empty or a message of people already
-                # said are dropped. A line of a longer message or of the bot's own is no copy: «Дорисуй ноги» under
-                # its ASCII Лёха got the code anew, and its first lines, the same as before, went, «```python» and
-                # «лёха = [» (#340105).
-                speakers = {'Рофл', person_label(sender), *heads}
-                name = re.compile(rf'^(?i:{"|".join(map(re.escape, speakers))})(?: → [^:\n]*)?:\s*')
-                known = {name.sub('', line).lower() for line in chat.splitlines()
-                         if name.match(line) and not line.startswith('Рофл')} | {''}
-                # Every joke is thought through: a bare «here is the chat, answer» at high jabbed as well as the setup
-                # and punchline did. Out of tokens, once more without thinking.
-                messages = [{'role': 'user', 'content': with_image(prompt, image)}]
-                try:
-                    answer = self.generate(messages, chat_id=typing, topic=topic, effort=self.effort)
-                except RuntimeError:
-                    answer = self.generate(messages, chat_id=typing, topic=topic)
-                kept = '\n'.join(dropwhile(lambda line: name.sub('', line).strip().lower() in known,
-                                           answer.splitlines()))
-                answer = name.sub('', kept or answer) or answer
-                # After the answer the model may go on with the log, the next message under a blank line:
-                # «Алексей → Рофл: ты че там совсем долбанулся?». A greentext comes as «\>» escaped for Markdown.
-                answer = re.split(rf'\n\s*\n(?={name.pattern[1:]})', answer, maxsplit=1)[0]
-                answer = re.sub(r'^\\>', '>', '\n'.join(line.rstrip() for line in answer.splitlines()), flags=re.M)
-                # Typed, not typeset: «—» and a period at the end gave the bot away in 33 and 19 answers of 37.
-                answer = answer if form else casual(answer)
-                return answer, {**trace, 'alone': alone, 'about': about, 'tone': manner, **({'snap': True} if snap else {}),
-                                **({'wanted': wanted, 'kind': kind, 'found': bool(found)} if wanted else {}),
-                                **({'news': asked, 'headlines': len(news)} if asked is not None else {}),
-                                **({'quiet': True} if quiet else {}),
-                                **({'tagged': tagged} if tagged else {}), **({'form': form[0]} if form else {}),
-                                **spent(usage)}
+                    LOG.warning('jev.failed %s', exc)
+                    decision = {'action': 'reply' if snapshot['explicit'] else 'ignore', 'target': snapshot['target'],
+                                'attitude': previous['attitude'], 'reconsider': False, 'fallback': True}
+                if not snapshot['explicit'] and not decision.get('addressed', False) and not snapshot['can_interject']:
+                    decision['action'] = 'ignore'
+                role = previous['role']
+                override = store.role_override(snapshot['date'])
+                expired = store.role_override_expired(previous, snapshot['date'])
+                selected = False
+                if override:
+                    role = override['role']
+                    decision['role_override_until'] = override['ends']
+                elif decision['action'] != 'ignore' and (not previous['changed_at'] or decision['reconsider'] or expired):
+                    try:
+                        role = self.choose_role(snapshot, previous)
+                        selected = True
+                    except RuntimeError as exc:
+                        LOG.warning('role.failed %s', exc)
+                changed = (override['starts'] if override else snapshot['date']
+                           if role != previous['role'] or selected and expired else previous['changed_at'])
+                decision['state'] = {'role': role, 'attitude': decision['attitude'], 'changed_at': changed,
+                                     'updated_at': snapshot['date']}
+                if live:
+                    store.save(key, event_id, snapshot, decision)
+            # --morale is retained as a replay-only alias for the new 0–10 scale.
+            if morale is not None and not live:
+                decision = {**decision, 'state': {**decision['state'], 'attitude': max(0, min(10, morale))}}
+            trace = {'event': event_id, 'action': decision['action'], 'target': decision['target'],
+                     'role': decision['state']['role'], 'attitude': decision['state']['attitude'],
+                     'role_changed_at': decision['state']['changed_at'], 'jev': decision.get('jev'),
+                     'fallback': decision.get('fallback', False)}
+            if decision.get('role_override_until'):
+                trace['role_override_until'] = decision['role_override_until']
+            LOG.info('conversation.decision %s', json.dumps({'chat': key[0], 'topic': key[1], **trace}, ensure_ascii=False))
+            if decision['action'] == 'ignore':
+                return '', {**trace, **spent(usage)}
+            try:
+                answer, calls = self.write_turn(message, snapshot, decision, live)
             except RuntimeError as exc:
-                LOG.error('generation.failed %s', exc)
-                return FAILED, None
+                LOG.error('writer.failed %s', exc)
+                raise
+            if decision['action'] == 'react':
+                answer = reaction_of(f'[реакция {answer}]') or '👍'
+                trace['reaction'] = True
+            return answer, {**trace, 'tools': calls, **spent(usage)}
 
     def roster(self, chat_id, live=True):
         """How many are in the chat, the bot and bots included, or 0 if Telegram does not say. The admins, whom
@@ -1390,89 +1061,19 @@ class Bot:
     def interest(self, chat):
         return self.interests.get(chat, 'ai')
 
-    def morale(self, chat, now, message=None, insulted=False):
-        """The менталка left, its top and what wore it down; `message` is the request being answered, `insulted`
-        whether the setup heard an insult in it. The news of the morning gives a point or takes one."""
-        day = datetime.date.fromtimestamp(now)
-        top = nerve(day)
-        kind, angry, requests = self.history.strain(chat, max(now - 7200, self.history.stamp(f'meltdown {chat}')))
-        if message:
-            requests.append((person_label(sender_of(message)), insulted))
-        insulted = [who for who, insult in requests if insult]
-        pestered = max(0, len(requests) - self.patience)
-        news = self.history.news(day, self.interest(chat))
-        why = '; '.join(([f'обзывали: {", ".join(dict.fromkeys(insulted))}'] if insulted else [])
-                        + ([f'задолбали, {len(requests)} обращений за два часа'] if pestered else [])
-                        + ([f'злых реакций на тебя: {angry}'] if angry else []))
-        return min(top, top + kind - angry - len(insulted) - pestered) + (news[2] if news else 0), top, why
-
-    def feelings(self, chat, now, message=None):
-        """How the bot is, in words for the model: its day, its менталка, what it read and whether it broke down,
-        today and yesterday. It remembers no more: people do not either. `message` is the request being answered:
-        the менталка counts it, as before a breakdown."""
-        day = datetime.date.fromtimestamp(now)
-        character = sheet(day)
-        traits = [MOODS[name][character[name] > 3] for name, _ in ATTRIBUTES if not 2 < character[name] < 5]
-        if phase(character['луна']) == 'полнолуние':
-            traits.append('полнолуние, кроет')
-        lines = [f'Рофл сегодня: {", ".join(traits)}.'] if traits else []
-        left, top, why = self.morale(chat, now, message)
-        if left < top:
-            lines.append(f'Менталка {max(left, 0)} из {top}' + (f': {why}.' if why else '.'))
-        for when, date in (('Утром', day), ('Вчера', day - datetime.timedelta(1))):
-            news = self.history.news(date, self.interest(chat))
-            if news and news[0]:
-                title, _, mood, thought = news
-                lines.append(f'{when} прочитал «{title}»' + {1: ' — ему хорошо', -1: ' — ему хреново'}.get(mood, '')
-                             + (f': {thought.rstrip(".")}.' if thought else '.'))
-        yesterday = datetime.datetime.combine(day - datetime.timedelta(1), datetime.time()).timestamp()
-        breakdown = self.history.breakdown(chat, yesterday)
-        if breakdown:
-            when = 'Сегодня' if datetime.date.fromtimestamp(breakdown[0]) == day else 'Вчера'
-            lines.append(f'{when} сорвался на чат: {breakdown[1]}.')
-        return ' '.join(lines)
-
-    def meltdown(self, chat_id, topic, now, why, through, live=True):
-        """Out of менталка: a scream in caps at the chat. Then the менталка starts afresh."""
-        if live:
-            self.history.stamp(f'meltdown {chat_id}', now)
-        with self.counting() as usage:
-            try:
-                text = BREAKDOWN if live and random.random() < 1 / 3 else self.generate(
-                    [{'role': 'user', 'content': CHAT + '\n\n'.join(self.chat((chat_id, topic), through)[0])
-                      + MELTDOWN.format(why=f': {why}' if why else '')}], chat_id=chat_id if live else None, topic=topic)
-            except RuntimeError as exc:
-                LOG.error('meltdown.failed chat=%s %s', chat_id, exc)
-                text = BREAKDOWN
-        return text, {'meltdown': why, **spent(usage)}
-
     def replay(self, message_id, runs=1, morale=None):
-        """Answer a stored request again as it was then, sending nothing: for trying prompts on real requests.
-        Given `morale`, as with that much менталка left: 0 breaks down."""
-        row = self.history.db.execute("SELECT raw FROM messages WHERE id=? AND role='user' ORDER BY date DESC LIMIT 1",
-                                      (message_id,)).fetchone()
+        row = self.history.db.execute("SELECT raw FROM messages WHERE id=? AND role='user' ORDER BY date DESC LIMIT 1", (message_id,)).fetchone()
         if not row:
             raise RuntimeError(f'Сообщения {message_id} нет в базе')
         message = json.loads(row[0])
-        print(render(row[0], self.me['id']), flush=True)
-        # What its author sent right after came with it, as in `handle`: a comment without its forward is a riddle.
         later = [json.loads(raw) for raw, in self.history.db.execute(
-            "SELECT raw FROM messages WHERE chat=? AND topic=? AND role='user' AND id > ? ORDER BY id LIMIT 10",
+            "SELECT raw FROM messages WHERE chat=? AND topic=? AND role='user' AND id>? ORDER BY id LIMIT 10",
             (message['chat']['id'], topic_of(message), message_id))]
         extra = followups(message, later)
-        for run in range(1, runs + 1):
-            answer, trace = self.joke(message, extra[-1]['message_id'] if extra else message_id, live=False,
-                                       morale=morale)
-            print(f'\n— прогон {run}', flush=True)
-            if trace:
-                # The header above is the request as the chat shows it, «ты не видишь» under a photo included: the
-                # picture went to both models all the same, as live (#339991), and the line says so.
-                print(f'Срыв: {trace["meltdown"]}' if 'meltdown' in trace else
-                      f'Теги: {trace["tags"] or "нет"}' + ('; картинка приложена' if trace.get('image') else '')
-                      + (f'; снято проверкой: {", ".join(trace["overruled"])}' if trace.get('overruled') else ''))
-            if trace and trace.get('clown'):
-                print('[реакция 🤡]')
-            print(f'[реакция {answer}]' if trace and trace.get('reaction') else envelope(answer, trace))
+        print(render(row[0], self.me['id']), flush=True)
+        for run in range(runs):
+            answer, trace = self.joke(message, extra[-1]['message_id'] if extra else message_id, live=False, morale=morale)
+            print(json.dumps({'run': run + 1, 'answer': answer, 'trace': trace}, ensure_ascii=False), flush=True)
 
     def respond(self, message, kind, extra=()):
         chat = message['chat']
@@ -1482,121 +1083,76 @@ class Bot:
             answer = 'Зови «рофл, …», «бот, …» или отвечай на мои сообщения. /reset — забыть разговор.'
         elif kind == 'reset':
             self.history.clear(key)
+            conversation.Store(self.history.db).clear(key)
             answer = 'Всё забыл. Теперь официально как после выходных.'
         else:
             LOG.info('telegram.addressed chat=%s message=%s message_age_s=%.1f followups=%s',
                      chat['id'], message['message_id'], time.time() - message.get('date', time.time()), len(extra))
             answer, trace = self.joke(message, extra[-1]['message_id'] if extra else message['message_id'])
-        if not self.history.claim_reply(key, message['message_id']):
+        for followup in extra:
+            self.history.claim_reply(key, followup['message_id'])
+        self.deliver(message, answer, trace, request=message['message_id'], kind=kind)
+
+    def deliver(self, message, answer, trace, request=None, kind='rofl'):
+        key = (message['chat']['id'], topic_of(message))
+        target = trace.get('target', message['message_id']) if trace else message['message_id']
+        if request is not None:
+            if not self.history.claim_reply(key, request):
+                return
+        elif trace:
+            stamp = f"delivered {key} {trace['event']}"
+            if self.history.stamp(stamp):
+                return
+            self.history.stamp(stamp, time.time())
+        if trace and trace.get('action') == 'ignore':
             return
         if trace and trace.get('reaction'):
-            # No message of its own: the answer is kept without an id, so reactions to the request never count as
-            # reactions to the bot.
-            self.api('setMessageReaction', chat_id=chat['id'], message_id=message['message_id'],
+            self.api('setMessageReaction', chat_id=key[0], message_id=target,
                      reaction=[{'type': 'emoji', 'emoji': answer}])
-            LOG.info('telegram.reacted chat=%s source=%s', chat['id'], message['message_id'])
-            self.history.record(key, None, message['message_id'], time.time(), answer, self.params(), trace)
+            self.history.record(key, None, request, time.time(), answer, self.params(), trace)
             return
-        if trace and trace.get('clown'):
-            # A dumb jab gets a 🤡 on it as well as the answer: «надо его научить Андрюхе клоунов шлепать» (#340037).
-            self.api('setMessageReaction', chat_id=chat['id'], message_id=message['message_id'],
-                     reaction=[{'type': 'emoji', 'emoji': '🤡'}])
-            LOG.info('telegram.reacted chat=%s source=%s', chat['id'], message['message_id'])
+        if not answer:
+            return
         text = envelope(answer, trace)
         markup = telegram_html(text)
-        sent = self.send(key, message['message_id'], markup or text, parse_mode='HTML' if markup else None)
+        sent = self.send(key, target, markup or text, parse_mode='HTML' if markup else None)
         if kind != 'reset':
-            self.history.add(key, sent['message_id'], 'assistant', answer, sent.get('date', time.time()),
-                             message['message_id'])
+            self.history.add(key, sent['message_id'], 'assistant', answer, sent.get('date', time.time()), target)
         if kind == 'rofl':
-            self.history.record(key, sent['message_id'], message['message_id'], sent.get('date', time.time()),
-                                answer, self.params(), trace)
+            self.history.record(key, sent['message_id'], request, sent.get('date', time.time()), answer, self.params(), trace)
 
     def params(self):
-        """The settings an answer is made on: answers are compared by them."""
         return {'model': self.model, 'recent': self.recent, 'window_h': self.window / 3600, 'limit': self.limit,
-                'effort': self.effort, 'version': self.version, 'sheet': sheet(datetime.date.today())}
-
-    def urge(self, chat, now):
-        """What the bot blurts into the chat now as (kind, text, topic), the text None when the model writes it; or
-        None. Once on a day `plan` gives an hour, from that hour on.
-
-        Not right after it spoke, and not after a blurt nobody answered: then it waits for the chat.
-        """
-        moment = datetime.datetime.fromtimestamp(now)
-        hour, needs = plan(moment.date()), self.history.needs(chat, now)
-        if self.read_only or hour is None or moment.hour < hour or not needs:
-            return None
-        bored, silent, topic = needs
-        last = self.history.stamp(f'urge {chat}')
-        if bored < self.bored or now - silent * 3600 < last or datetime.date.fromtimestamp(last) == moment.date():
-            return None
-        dice = random.Random(f'{chat} {moment.date()}')
-        if moment.hour == HOURS[0] and silent >= 4:
-            return 'dawn', DAWN, 0
-        news = self.history.news(moment.date(), self.interest(chat))
-        if news and news[0] and dice.random() < self.shares:
-            return 'share', None, 0
-        left, top, _ = self.morale(chat, now)
-        if left < top:
-            return 'sad', dice.choice(SAD), 0
-        return ('quiet', dice.choice(QUIET), 0) if silent >= 1 else ('butt_in', None, topic)
-
-    def stir(self, chat, now):
-        """('stir', None, 0) when the bot is to shitpost on politics now (`Bot.politics`), or None: once a day, past
-        an hour drawn for it, into a chat quiet for an hour and not right after the bot spoke."""
-        moment = datetime.datetime.fromtimestamp(now)
-        needs = self.history.needs(chat, now)
-        if (self.read_only or not needs or moment.hour < random.Random(f'stir {chat} {moment.date()}').randint(*STIR_HOURS)
-                or datetime.date.fromtimestamp(self.history.stamp(f'stir {chat}')) == moment.date()):
-            return None
-        bored, silent, _ = needs
-        return ('stir', None, 0) if bored >= self.bored and silent >= 1 else None
+                'effort': self.effort, 'version': self.version, 'architecture': 'jev-roles-v1'}
 
     def idle(self, now=None):
-        """Between polls: at dawn the bot reads the news, a bored one blurts something into its groups on its own."""
         now = now or time.time()
         self.read(now)
-        for chat, check in product(sorted(self.allowed_groups), (self.urge, self.stir)):
-            urge = check(chat, now)  # one after the other: the second sees what the first said
-            if not urge:
+        if self.read_only or not HOURS[0] <= datetime.datetime.fromtimestamp(now).hour < 24:
+            return
+        for chat in sorted(self.allowed_groups):
+            needs = self.history.needs(chat, now)
+            if not needs:
                 continue
-            kind, text, topic = urge
-            LOG.info('urge chat=%s topic=%s kind=%s', chat, topic, kind)
-            markup = link = feelings = None
-            stamp = f'{"stir" if kind == "stir" else "urge"} {chat}'
-            previous = self.history.stamp(stamp)
-            self.history.stamp(stamp, now)  # before the model: a failing one is not asked again every poll
-            with self.counting() as usage:
-                try:
-                    if text is None:
-                        feelings = self.feelings(chat, now)
-                    if kind == 'butt_in':
-                        lines, _ = self.chat((chat, topic))
-                        prompt = CHAT + '\n\n'.join(lines) + '\n\n' + (feelings + '\n\n' if feelings else '') + BUTT_IN
-                        text = casual(re.sub(r'^Рофл(?: → [^:\n]*)?:\s*', '', self.generate(
-                            [{'role': 'user', 'content': prompt}], chat_id=chat, topic=topic)))
-                    elif kind == 'share':
-                        text, markup, link = self.repost(chat, now, feelings)
-                    elif kind == 'stir':
-                        text, markup, link = self.politics(chat)
-                except RuntimeError as exc:
-                    LOG.error('urge.failed chat=%s kind=%s %s', chat, kind, exc)
-                    continue
-            if not text:
-                LOG.info('urge.nothing chat=%s kind=%s', chat, kind)
+            bored, silent, topic = needs
+            day = datetime.datetime.fromtimestamp(now).date()
+            scheduled = plan(day)
+            news_hour = random.Random(f'stir {chat} {day}').randint(*STIR_HOURS)
+            if bored < self.bored or (scheduled is None or datetime.datetime.fromtimestamp(now).hour < scheduled) and (silent < 1 or datetime.datetime.fromtimestamp(now).hour < news_hour):
                 continue
+            stamp = f'initiative {chat} {topic}'
+            if datetime.datetime.fromtimestamp(self.history.stamp(stamp)).date() == day:
+                continue
+            self.history.stamp(stamp, now)
+            row = self.history.db.execute("SELECT raw FROM messages WHERE chat=? AND topic=? AND role='user' ORDER BY date DESC LIMIT 1", (chat, topic)).fetchone()
+            if not row:
+                continue
+            message = json.loads(row[0])
             try:
-                sent = self.send((chat, topic), None, markup or text, parse_mode='HTML' if markup else None)
+                answer, trace = self.joke(message, sys.maxsize, event=f'idle:{day}', date=now, explicit=False, can_interject=True)
+                self.deliver(message, answer, trace, request=None)
             except RuntimeError as exc:
-                # Again on the next poll: a sleeping Mac wakes for seconds, and the network comes up after it.
-                self.history.stamp(stamp, previous)
-                LOG.error('urge.send_failed chat=%s %s', chat, exc)
-                continue
-            self.history.add((chat, topic), sent['message_id'], 'assistant', text, now)
-            self.history.record((chat, topic), sent['message_id'], None, now, text,
-                                {**self.params(), 'urge': True, **({'news': link} if link else {})},
-                                {'urge': kind, 'feelings': feelings, **spent(usage)})
+                LOG.warning('initiative.failed %s', exc)
 
     def read(self, now):
         """From dawn on, once a day for each interest of the groups: the news about the bot, one picked by the model
@@ -1612,7 +1168,8 @@ class Bot:
             try:
                 found = headlines(query)
                 listed = '\n'.join(f'{n}. {title}' for n, (title, _) in enumerate(found, 1))
-                answer = self.generate([{'role': 'user', 'content': READ.format(who=who, news=listed)}]) if found else ''
+                answer = self.generate([{'role': 'user', 'content': READ.format(who=who, news=listed)}],
+                                       system=NEWS_READER) if found else ''
             except RuntimeError as exc:
                 LOG.warning('news.failed %s %s', interest, exc)
                 continue
@@ -1628,46 +1185,6 @@ class Bot:
             self.history.keep_news(moment.date(), interest, title, link, mood, thought and clip(thought, 300))
             LOG.info('news.read %s %+d found=%s thought=%d %s', interest, mood, len(found), bool(thought), title)
 
-    def repost(self, chat, now, feelings):
-        """The news the bot read this morning as a post: the headline, a piece of its code if it goes with the
-        interest, a joke. As (text, the same in HTML, link)."""
-        day, interest = datetime.date.fromtimestamp(now), self.interest(chat)
-        title, link, _, _ = self.history.news(day, interest)
-        _, who, with_code = INTERESTS[interest]
-        pieces = [snippet(start, limit=8) for start in SNIPPETS] if with_code else []
-        listed = '\n\n'.join(f'{n}.\n{piece}' for n, piece in enumerate(pieces, 1))
-        joke = self.generate([{'role': 'user', 'content': (REPOST_CODE if pieces else REPOST).format(
-            who=who, title=title, code=listed, feelings=f'{feelings}\n\n' if feelings else '')}], chat_id=chat)
-        code = None
-        if pieces:
-            # The number on the first line, the joke after it; no number, the joke goes without code.
-            first, _, rest = joke.partition('\n')
-            pick = re.fullmatch(r'\D{0,10}?(\d+)\D{0,3}', first.strip())
-            if pick and 1 <= int(pick[1]) <= len(pieces) and rest.strip():
-                code, joke = pieces[int(pick[1]) - 1], rest.strip()
-        markup = (f'<a href="{html.escape(link)}">{html.escape(title)}</a>\n\n'
-                  + (f'<pre><code class="language-python">{html.escape(code)}</code></pre>\n\n' if code else '')
-                  + html.escape(joke))
-        return '\n\n'.join(filter(None, (f'{title}\n{link}', code, joke))), markup, link
-
-    def politics(self, chat):
-        """A shitpost on the political news of the day, under its headline, the chat read for whom to drag in: as
-        (text, the same in HTML, link), or Nones when the model finds nothing funny."""
-        found = headlines(POLITICS)[:15]
-        if not found:
-            return None, None, None
-        lines, _ = self.chat((chat, 0))
-        listed = '\n'.join(f'{n}. {title}' for n, (title, _) in enumerate(found, 1))
-        answer = self.generate([{'role': 'user', 'content': CHAT + '\n\n'.join(lines) + '\n\n'
-                                 + STIR.format(news=listed)}], chat_id=chat)
-        first, _, rest = answer.partition('\n')
-        pick = re.fullmatch(r'\D{0,10}?(\d+)\D{0,3}', first.strip())
-        if not pick or not 1 <= int(pick[1]) <= len(found) or not rest.strip():
-            return None, None, None
-        (title, link), post = found[int(pick[1]) - 1], casual(rest.strip())
-        return (f'{title}\n{link}\n\n{post}', f'<a href="{html.escape(link)}">{html.escape(title)}</a>\n\n'
-                + html.escape(post), link)
-
     def send(self, key, reply_to, text, parse_mode=None):
         payload = {'chat_id': key[0], 'text': text}
         if parse_mode:
@@ -1681,35 +1198,28 @@ class Bot:
         return sent
 
     def react(self, reaction):
-        """Someone put a reaction on the bot's answer: now and then an angry one gets a comeback, a kind one «ладно, братва»."""
-        chat_id, message_id = reaction['chat']['id'], reaction['message_id']
-        person = reaction.get('user') or reaction.get('actor_chat')
-        added = [r['emoji'] for r in reaction.get('new_reaction', [])
-                 if r.get('type') == 'emoji' and r not in reaction.get('old_reaction', [])]
-        if chat_id in self.allowed_groups and reaction.get('user') and not reaction['user'].get('is_bot'):
-            emoji = [r.get('emoji') or r['type'] for r in reaction.get('new_reaction', [])]
-            answer = self.history.reacted(chat_id, message_id, reaction['user']['id'], emoji,
-                                          reaction.get('date', time.time()))
-            LOG.info('telegram.reaction chat=%s message=%s user=%s emoji=%s answer=%s',
-                     chat_id, message_id, reaction['user']['id'], ''.join(emoji) or '-', answer)
-        if (self.read_only or chat_id not in self.allowed_groups or not person or not added
-                or time.time() - reaction.get('date', time.time()) > self.max_age
-                or random.random() >= self.touchy * temper(datetime.date.today())):
+        chat, message_id = reaction['chat']['id'], reaction['message_id']
+        person = reaction.get('user')
+        if chat not in self.allowed_groups or not person or person.get('is_bot'):
             return
-        answer = self.history.answer(chat_id, message_id)
+        emojis = [r.get('emoji') or r['type'] for r in reaction.get('new_reaction', [])]
+        if not self.history.reacted(chat, message_id, person['id'], emojis, reaction.get('date', time.time())):
+            return
+        now = reaction.get('date', time.time())
+        if self.read_only or time.time() - now > self.max_age:
+            return
+        answer = self.history.answer(chat, message_id)
         if not answer:
             return
         topic, content = answer
-        angry = next((emoji for emoji in added if emoji in ANGRY), None)
+        message = {'chat': reaction['chat'], 'message_id': message_id, 'date': now,
+                   'message_thread_id': topic, 'from': person, 'text': content}
+        event = f'reaction:{message_id}:{person["id"]}:{now}:{"".join(emojis)}'
         try:
-            text = self.generate([{'role': 'user', 'content': (
-                f'Твоё сообщение в чате:\n{content}\n\n{author_label(person)} поставил на него {angry}. '
-                'Наедь на него в ответ, одна-две строки.')}], chat_id=chat_id, topic=topic) if angry else SHRUG
+            text, trace = self.joke(message, sys.maxsize, event=event, date=now, explicit=False)
+            self.deliver(message, text, trace, request=None)
         except RuntimeError as exc:
-            LOG.error('generation.failed %s', exc)
-            return
-        sent = self.send((chat_id, topic), message_id, text)
-        self.history.add((chat_id, topic), sent['message_id'], 'assistant', text, sent.get('date', time.time()), message_id)
+            LOG.warning('reaction.failed %s', exc)
 
     def handle(self, *batch):
         """Messages that arrived together: store all, then answer each request with what its author sent right after."""
@@ -1797,17 +1307,16 @@ if __name__ == '__main__':
             days = sys.argv[sys.argv.index('--stats') + 1:][:1]
             print(report(History(Path(__file__).with_name('history.sqlite3')).db, int(days[0]) if days else 14))
             sys.exit()
-        if '--day' in sys.argv:
-            # python3 bot.py --day [2026-10-20] [дней]: the bot's character day by day. Needs no Telegram.
-            args = sys.argv[sys.argv.index('--day') + 1:][:2]
-            start = datetime.date.fromisoformat(args[0]) if args and '-' in args[0] else datetime.date.today()
-            print(days(start, int(args[-1]) if args and '-' not in args[-1] else 7))
+        if '--day' in sys.argv or '--state' in sys.argv:
+            history = History(Path(__file__).with_name('history.sqlite3'))
+            rows = history.db.execute('SELECT chat, topic, role, attitude, changed_at FROM conversation_state ORDER BY chat, topic').fetchall()
+            print(json.dumps(rows, ensure_ascii=False, indent=2))
             sys.exit()
         read_only = '--read-only' in sys.argv or os.environ.get('READ_ONLY', '').lower() in ('1', 'true', 'yes')
         bot = Bot(read_only=read_only)
         if '--replay' in sys.argv:
             # python3 bot.py --replay 339669 [5] [--morale 1]: the request's id from the log, how many times to
-            # answer it, how much менталка the bot has left.
+            # answer it, and the optional 0–10 attitude override for replay.
             morale = int(sys.argv[sys.argv.index('--morale') + 1]) if '--morale' in sys.argv else None
             bot.replay(*map(int, [arg for arg in sys.argv[sys.argv.index('--replay') + 1:][:2] if arg.isdigit()]),
                        morale=morale)

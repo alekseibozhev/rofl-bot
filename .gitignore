@@ -6,3 +6,7 @@ history.sqlite3*
 .bot.lock
 .DS_Store
 .idea/
+
+searxng/.env
+searxng/config/*.toml
+searxng/config/*.bak

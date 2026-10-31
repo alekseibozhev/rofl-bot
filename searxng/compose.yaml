@@ -1,0 +1,15 @@
+name: rofl-search
+services:
+  searxng:
+    image: docker.io/searxng/searxng@sha256:f4aa660c54d062dedb268be84e821ea24e39f48c7a496af8dd02cc9eedb93847
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8888:8080"
+    environment:
+      SEARXNG_BASE_URL: http://127.0.0.1:8888/
+      SEARXNG_SECRET: ${SEARXNG_SECRET:?Create searxng/.env from .env.example}
+    volumes:
+      - ./config:/etc/searxng
+      - search-data:/var/cache/searxng
+volumes:
+  search-data:
