@@ -26,12 +26,16 @@ class ConversationTests(unittest.TestCase):
         self.b.openrouter_key = 'test-key'
         self.b.model = 'test-model'
         self.b.api = Mock(return_value={'message_id': 1000, 'date': time.time()})
+        self.b.send_typing = Mock()
         self.b.generate = Mock(return_value='Глад Валакас')
         self.b.writer_step = Mock(return_value={'role': 'assistant', 'content': 'Шо?'})
         self.b.format_answer = Mock(side_effect=lambda text: (text, {'mock': True}))
         self.b.read = Mock()
         self.b.direct = Mock(side_effect=self.decision)
         self.b.select_context = Mock(return_value={'fallback': True})
+        prepare_patch = patch('bot.vision.prepare', return_value='data:image/jpeg;base64,PREPARED')
+        self.prepare_image = prepare_patch.start()
+        self.addCleanup(prepare_patch.stop)
         self.message_id = 0
 
     def decision(self, snapshot, previous):
@@ -88,6 +92,115 @@ class ConversationTests(unittest.TestCase):
         store = conversation.Store(self.b.history.db)
         self.assertEqual([store.state(k)['role'] for k in [(-1, 0), (-2, 0), (-1, 5)]], ['Глад', 'Ким', 'Гарри'])
 
+    def test_personal_attitudes_are_shared_across_topics_but_not_people_or_chats(self):
+        self.turn()
+        other = self.message()
+        other['from']['id'] = 99  # Even the same display name must not merge people.
+        self.turn(other)
+        self.assertEqual(self.b.direct.call_args.args[1]['attitude'], 5)
+        self.turn(self.message(topic=5))
+        self.assertEqual(self.b.direct.call_args.args[1]['attitude'], 7)
+        self.turn(self.message(chat=-2))
+        self.assertEqual(self.b.direct.call_args.args[1]['attitude'], 5)
+        store = conversation.Store(self.b.history.db)
+        self.assertEqual(store.attitude(-1, 7), 7)
+        self.assertEqual(store.attitude(-1, 123), 5)
+
+    def test_jev_and_writer_receive_the_personal_subject(self):
+        self.turn()
+        snapshot, previous = self.b.direct.call_args.args
+        body = conversation.payload(snapshot, previous)
+        self.assertEqual(body['state']['attitude_user_id'], 7)
+        system = self.b.writer_step.call_args.args[0][0]['content']
+        self.assertIn('Отношение к собеседнику user_id=7: 7/10', system)
+        self.assertNotIn('Отношение к чату', system)
+
+    def test_unsolicited_reply_uses_target_attitude_but_updates_event_author(self):
+        first = self.message('старая реплика')
+        self.turn(first)
+        current = self.message('новая реплика')
+        current['from']['id'] = 99
+        self.b.direct.side_effect = lambda s, p: {
+            **self.decision(s, p), 'target': first['message_id'], 'attitude': 2, 'addressed': False}
+        _, trace = self.turn(current, explicit=False, can_interject=True)
+        self.assertEqual((trace['attitude_user_id'], trace['attitude']), (7, 7))
+        self.assertEqual(conversation.Store(self.b.history.db).attitude(-1, 99), 2)
+        self.assertIn('user_id=7: 7/10', self.b.writer_step.call_args.args[0][0]['content'])
+
+    def test_reaction_updates_reactor_not_original_request_author(self):
+        self.turn()
+        self.b.history.record((-1, 0), 100, 1, time.time(), 'мой ответ', {}, {})
+        self.b.direct.side_effect = lambda s, p: {**self.decision(s, p), 'attitude': 2}
+        self.b.react({'chat': {'id': -1}, 'message_id': 100, 'date': time.time(),
+                      'user': {'id': 99, 'first_name': 'Другой'},
+                      'new_reaction': [{'type': 'emoji', 'emoji': '🤡'}]})
+        snapshot, previous = self.b.direct.call_args.args
+        self.assertEqual(snapshot['event_user_id'], 99)
+        self.assertEqual(previous['attitude'], 5)
+        self.assertIn('[100, 99,', snapshot['reactions_context'])
+        self.assertIn('user_id=99: 2/10', self.b.writer_step.call_args.args[0][0]['content'])
+        store = conversation.Store(self.b.history.db)
+        self.assertEqual((store.attitude(-1, 7), store.attitude(-1, 99)), (7, 2))
+
+    def test_idle_and_anonymous_sender_do_not_update_personal_attitudes(self):
+        self.turn()
+        self.b.direct.side_effect = lambda s, p: {**self.decision(s, p), 'attitude': 1}
+        self.turn(self.message(), event='idle:test', explicit=False, can_interject=True)
+        self.assertIsNone(self.b.direct.call_args.args[0]['event_user_id'])
+        anon = self.message()
+        anon['sender_chat'] = {'id': -100, 'title': 'Канал'}
+        _, trace = self.turn(anon)
+        self.assertIsNone(trace['attitude_user_id'])
+        self.assertEqual(trace['attitude'], 5)
+        rows = self.b.history.db.execute('SELECT user, attitude FROM participant_attitudes').fetchall()
+        self.assertEqual(rows, [(7, 7)])
+
+    def test_personal_fallback_preserves_existing_attitude(self):
+        self.turn()
+        self.b.direct.side_effect = RuntimeError('offline')
+        _, trace = self.turn()
+        self.assertEqual(trace['attitude'], 7)
+        self.assertEqual(conversation.Store(self.b.history.db).attitude(-1, 7), 7)
+
+    def test_personal_replay_uses_historical_value_across_topics_and_does_not_write(self):
+        self.turn(self.message(date=100))
+        self.b.direct.side_effect = lambda s, p: {**self.decision(s, p), 'attitude': 2}
+        self.turn(self.message(topic=5, date=300))
+        self.turn(self.message(date=200), live=False)
+        self.assertEqual(self.b.direct.call_args.args[1]['attitude'], 7)
+        self.assertEqual(conversation.Store(self.b.history.db).attitude(-1, 7), 2)
+
+    def test_personal_cached_replay_survives_newer_attitude_and_restart(self):
+        first = self.message(date=100)
+        self.turn(first)
+        self.b.direct.side_effect = lambda s, p: {**self.decision(s, p), 'attitude': 2}
+        self.turn(self.message(date=200))
+        self.b.history.db.close()
+        self.b.history = bot.History(self.path)
+        _, trace = self.b.joke(first, first['message_id'], live=False)
+        self.assertEqual((trace['attitude_user_id'], trace['attitude']), (7, 7))
+        self.assertEqual(conversation.Store(self.b.history.db).attitude(-1, 7), 2)
+
+    def test_legacy_score_is_not_used_as_personal_attitude(self):
+        store = conversation.Store(self.b.history.db)
+        state = {**store.initial(), 'attitude': 10, 'updated_at': 50}
+        store.save((-1, 0), 'legacy', {'date': 50}, {'state': state})
+        self.assertEqual(store.attitude(-1, 7, before=100), 5)
+        self.turn(self.message(date=100))
+        self.assertEqual(self.b.direct.call_args.args[1]['attitude'], 5)
+
+    def test_duplicate_or_older_decision_cannot_overwrite_personal_attitude(self):
+        first = self.message(date=100)
+        self.turn(first)
+        store = conversation.Store(self.b.history.db)
+        snapshot, decision = store.get((-1, 0), 'message:1:1')
+        decision['relationship']['attitude'] = 1
+        store.save((-1, 0), 'message:1:1', snapshot, decision)
+        self.assertEqual(store.attitude(-1, 7), 7)
+        self.b.direct.side_effect = lambda s, p: {**self.decision(s, p), 'attitude': 2}
+        self.turn(self.message(topic=5, date=50))
+        self.assertEqual(store.attitude(-1, 7), 7)
+
     def test_first_ignored_message_does_not_consume_role_selection(self):
         self.b.direct.side_effect = lambda s, p: {**self.decision(s, p), 'action': 'ignore'}
         self.turn()
@@ -122,6 +235,215 @@ class ConversationTests(unittest.TestCase):
         self.b.writer_step.assert_not_called()
         self.b.api.assert_not_called()
         self.assertEqual(self.b.history.db.execute('SELECT count(*) FROM conversation_decisions').fetchone()[0], 1)
+
+    def test_pictures_follow_jev_ignore_react_and_reply_with_visual_context(self):
+        self.b.image = Mock(return_value='data:image/png;base64,AA==')
+        for media in ({'photo': [{'file_id': 'photo'}]},
+                      {'document': {'file_id': 'doc', 'mime_type': 'image/png'}}):
+            for action in ('ignore', 'react', 'reply'):
+                with self.subTest(media=media, action=action):
+                    self.b.direct.side_effect = lambda s, p, action=action: {
+                        **self.decision(s, p), 'action': action, 'addressed': False}
+                    message = self.message('')
+                    message.update(media)
+                    answer, trace = self.turn(message, can_interject=True)
+                    self.assertEqual(trace['action'], action)
+                    self.assertEqual(trace['target'], message['message_id'])
+                    self.assertNotIn('reply_policy', trace)
+                    self.assertFalse(self.b.direct.call_args.args[0]['explicit'])
+                    self.assertEqual(self.b.direct.call_args.args[0]['_jev_image'], self.prepare_image.return_value)
+                    if action == 'ignore':
+                        self.assertEqual(answer, '')
+                    if action == 'reply':
+                        self.assertEqual(answer, 'Шо?')
+                        self.assertIn('image_url', json.dumps(self.b.writer_step.call_args.args[0]))
+
+    def test_picture_without_address_stays_silent_on_jev_failure(self):
+        self.b.image = Mock(return_value='data:image/png;base64,AA==')
+        self.b.direct.side_effect = RuntimeError('offline')
+        message = self.message('')
+        message['photo'] = [{'file_id': 'photo'}]
+        _, trace = self.turn(message, can_interject=False)
+        self.assertEqual(trace['action'], 'ignore')
+        self.assertTrue(trace['fallback'])
+        addressed = self.message('бот, посмотри')
+        addressed['photo'] = message['photo']
+        _, trace = self.turn(addressed, can_interject=False)
+        self.assertEqual(trace['action'], 'reply')
+        _, trace = self.turn(message, event='idle:test', explicit=False, can_interject=False)
+        self.assertEqual(trace['action'], 'ignore')
+        sticker = self.message('')
+        sticker['sticker'] = {'file_id': 'sticker'}
+        _, trace = self.turn(sticker, can_interject=False)
+        self.assertEqual(trace['action'], 'ignore')
+
+    def test_explicit_picture_overrides_silence_and_reaction_then_selects_context(self):
+        self.b.image = Mock(return_value='data:image/jpeg;base64,ORIGINAL')
+        for action in ('ignore', 'react'):
+            for media in ('photo', 'document', 'reply_photo'):
+                with self.subTest(action=action, media=media):
+                    parent = self.message('Предыстория картинки')
+                    self.b.history.add_message((-1, 0), parent)
+                    message = self.message('')
+                    message['caption'] = '@test_bot'
+                    message['reply_to_message'] = parent
+                    if media == 'reply_photo':
+                        message['text'] = '@test_bot'
+                        parent['photo'] = [{'file_id': 'photo'}]
+                    elif media == 'photo':
+                        message['photo'] = [{'file_id': 'photo'}]
+                    else:
+                        message['document'] = {'file_id': 'doc', 'mime_type': 'image/png'}
+                    self.b.direct.side_effect = lambda s, p, action=action: {
+                        **self.decision(s, p), 'action': action, 'addressed': False, 'target': parent['message_id']}
+                    self.b.select_context.return_value = {'ids': [parent['message_id'], message['message_id']]}
+                    answer, trace = self.turn(message, can_interject=False)
+                    self.assertEqual(answer, 'Шо?')
+                    self.assertEqual(trace['action'], 'reply')
+                    self.assertEqual(trace['target'], message['message_id'])
+                    self.assertEqual(trace['jev_action'], action)
+                    self.assertEqual(trace['reply_policy'], 'addressed_image')
+                    self.assertEqual(self.b.select_context.call_args.args[1], message['message_id'])
+                    self.assertEqual(self.b.select_context.call_args.args[0]['_jev_image'], self.prepare_image.return_value)
+                    prompt = json.dumps(self.b.writer_step.call_args.args[0], ensure_ascii=False)
+                    self.assertIn('Предыстория картинки', prompt)
+                    self.assertIn(f"[{message['message_id']}]", prompt)
+                    self.assertIn('ORIGINAL', prompt)
+
+    def test_explicit_picture_keeps_full_context_when_selector_fails(self):
+        self.b.image = Mock(return_value='data:image/jpeg;base64,ORIGINAL')
+        parent = self.message('Важная предыстория')
+        self.b.history.add_message((-1, 0), parent)
+        message = self.message('@test_bot')
+        message['photo'] = [{'file_id': 'photo'}]
+        message['reply_to_message'] = parent
+        self.b.direct.side_effect = lambda s, p: {**self.decision(s, p), 'action': 'ignore'}
+        self.b.select_context.side_effect = RuntimeError('offline')
+        answer, trace = self.turn(message)
+        self.assertEqual(answer, 'Шо?')
+        self.assertTrue(trace['context_selection']['fallback'])
+        prompt = json.dumps(self.b.writer_step.call_args.args[0], ensure_ascii=False)
+        self.assertIn('Важная предыстория', prompt)
+        self.assertIn('ORIGINAL', prompt)
+
+    def test_picture_is_loaded_once_and_not_persisted_and_cooldown_still_applies(self):
+        self.b.image = Mock(return_value='data:image/png;base64,ORIGINAL')
+        message = self.message('')
+        message['photo'] = [{'file_id': 'photo'}]
+        self.b.direct.side_effect = lambda s, p: {**self.decision(s, p), 'addressed': False}
+        _, trace = self.turn(message, can_interject=False)
+        self.assertEqual(trace['action'], 'ignore')
+        self.b.image.assert_called_once()
+        self.b.image.reset_mock()
+        message = self.message('бот, посмотри')
+        message['photo'] = [{'file_id': 'photo'}]
+        self.turn(message)
+        self.b.image.assert_called_once()
+        self.assertEqual(self.b.select_context.call_args.args[0]['_jev_image'], self.prepare_image.return_value)
+        prompt = json.dumps(self.b.writer_step.call_args.args[0])
+        self.assertIn('ORIGINAL', prompt)
+        self.assertNotIn('PREPARED', prompt)
+        rows = self.b.history.db.execute('SELECT snapshot, decision FROM conversation_decisions').fetchall()
+        self.assertNotIn('base64', json.dumps(rows))
+        self.assertIn('image_context', json.dumps(rows))
+
+    def test_failed_image_preparation_keeps_original_for_writer(self):
+        self.b.image = Mock(return_value='data:image/png;base64,ORIGINAL')
+        self.prepare_image.side_effect = RuntimeError('unavailable')
+        message = self.message()
+        message['photo'] = [{'file_id': 'photo'}]
+        self.turn(message)
+        seen = self.b.direct.call_args.args[0]
+        self.assertIsNone(seen['_jev_image'])
+        self.assertEqual(seen['image_context'], {'message_id': message['message_id'], 'available': True, 'jev': False})
+        self.assertIn('ORIGINAL', json.dumps(self.b.writer_step.call_args.args[0]))
+
+    def test_jev_and_selector_receive_image_with_reply_parent_id(self):
+        message = self.message()
+        message['reply_to_message'] = {'message_id': 50, 'photo': [{'file_id': 'photo'}]}
+        self.b.image = Mock(return_value='data:image/jpeg;base64,ORIGINAL')
+        self.turn(message)
+        snapshot, previous = self.b.direct.call_args.args
+        body = conversation.payload(snapshot, previous)
+        attached = body['state']['image_context']
+        self.assertEqual(attached['message_id'], 50)
+        self.assertEqual(attached['image']['image_url']['url'], self.prepare_image.return_value)
+        post = Mock(return_value={'answers': {str(m['id']): {'noul': 0.1}
+                                             for m in snapshot['messages'] if m['id'] != snapshot['target']}})
+        # Include another candidate so the selector makes an actual request.
+        snapshot = copy.deepcopy(snapshot)
+        snapshot['messages'].insert(0, {'id': 50, 'reply_to': None, 'date': '2026-11-01',
+                                       'content': '[50] [фото]', 'role': 'user'})
+        post.return_value['answers']['50'] = {'noul': 0.1}
+        result = conversation.select_context(post, 'key', snapshot, snapshot['target'])
+        self.assertEqual(post.call_args.args[1]['state']['image_context'], attached)
+        self.assertIn(50, result['ids'])
+        self.assertTrue(result['jev']['image'])
+
+    def test_image_document_is_downloaded_with_its_mime_type(self):
+        message = self.message('')
+        message['document'] = {'file_id': 'doc', 'mime_type': 'image/png'}
+        self.b.telegram_url = 'https://api/bot/'
+        self.b.api.return_value = {'file_path': 'documents/file.bin'}
+        with patch('bot.fetch', return_value=b'PNG') as fetch:
+            self.assertEqual(self.b.image(message), 'data:image/png;base64,UE5H')
+        self.b.api.assert_called_once_with('getFile', file_id='doc')
+        fetch.assert_called_once_with('https://api/file/bot/documents/file.bin', timeout=30)
+
+    def test_typing_continues_during_writer_tools_and_formatter_in_topic(self):
+        from threading import Event
+        attempted = Event()
+        self.b.telegram_url = 'https://api/bot/'
+        self.b.send_typing = bot.Bot.send_typing.__get__(self.b)
+
+        def send(url, payload, **kwargs):
+            self.assertEqual(url, 'https://api/bot/sendChatAction')
+            self.assertEqual(payload, {'chat_id': -1, 'message_thread_id': 12, 'action': 'typing'})
+            self.assertEqual(kwargs['timeout'], 2)
+            attempted.set()
+            return {'ok': True}
+
+        def wait_for_typing():
+            attempted.clear()
+            self.assertTrue(attempted.wait(1), 'Typing stopped during generation')
+
+        steps = iter([
+            {'role': 'assistant', 'content': None, 'tool_calls': [
+                {'id': 'lookup', 'type': 'function', 'function': {'name': 'lookup_history', 'arguments': '{"query":"бот"}'}}]},
+            {'role': 'assistant', 'content': 'Ответ'},
+        ])
+        def writer(*args, **kwargs):
+            wait_for_typing()
+            return next(steps)
+        def tool(*args, **kwargs):
+            wait_for_typing()
+            return 'данные'
+        def formatter(text):
+            wait_for_typing()
+            return text, {}
+
+        self.b.writer_step.side_effect = writer
+        self.b.writer_tool = Mock(side_effect=tool)
+        self.b.format_answer.side_effect = formatter
+        real_typing = bot.typing
+        with patch('bot.post', side_effect=send), patch('bot.typing', side_effect=lambda send: real_typing(send, every=.01)):
+            answer, _ = self.turn(self.message(topic=12))
+        self.assertEqual(answer, 'Ответ')
+
+    def test_typing_context_closes_on_writer_failure(self):
+        self.b.writer_step.side_effect = RuntimeError('offline')
+        with patch('bot.typing') as indicator:
+            with self.assertRaisesRegex(RuntimeError, 'offline'):
+                self.turn()
+        indicator.return_value.__exit__.assert_called_once()
+
+    def test_replay_ignore_and_reaction_do_not_start_typing(self):
+        with patch('bot.typing') as indicator:
+            self.turn(live=False)
+            for action in ('ignore', 'react'):
+                self.b.direct.side_effect = lambda s, p, action=action: {**self.decision(s, p), 'action': action}
+                self.turn()
+        indicator.assert_not_called()
 
     def test_reaction_is_chosen_by_writer_and_targets_directors_message(self):
         first = self.message('привет')
@@ -384,51 +706,53 @@ class ConversationTests(unittest.TestCase):
                          '<b>Новости.</b> <a href="https://example.com/?a=1&amp;b=2">Источник</a> &lt;текст&gt;')
         self.assertEqual(self.b.history.answer(-1, 1000)[1], answer)
 
-    def test_balance_uses_lower_ceiling_and_caches_only_filtered_data(self):
-        responses = [{'data': {'limit_remaining': .75, 'hash': 'SECRET'}},
-                     {'data': {'total_credits': 173, 'total_usage': 171.57, 'secret': 'SECRET'}}]
+    def test_balance_exposes_only_key_allowance_and_caches_filtered_data(self):
+        responses = [{'data': {'limit_remaining': .75, 'hash': 'SECRET', 'total_credits': 173}}]
         with patch('bot.fetch', side_effect=[json.dumps(r).encode() for r in responses]) as fetch:
             result = self.b.balance()
             self.assertEqual(self.b.balance(), result)
-        self.assertEqual(fetch.call_count, 2)
+        self.assertEqual(fetch.call_count, 1)
         self.assertEqual(fetch.call_args_list[0].args[0].get_method(), 'GET')
+        self.assertEqual(fetch.call_args_list[0].args[0].full_url, 'https://openrouter.ai/api/v1/key')
         self.assertEqual(result['available_usd'], .75)
-        self.assertEqual(result['account_balance_usd'], 1.43)
+        self.assertEqual(set(result), {'currency', 'checked_at', 'available_usd', 'note'})
         self.assertNotIn('SECRET', json.dumps(result))
         self.assertNotIn('test-key', json.dumps(result))
         self.assertEqual(json.loads(self.b.writer_tool('balance', {}, self.message(), {}, True)), result)
 
-    def test_balance_account_can_be_lower_than_key_and_negative_is_unavailable(self):
-        for usage, expected in ((9.8, .2), (10.1, 0)):
-            with self.subTest(usage=usage):
-                self.b._balance_cache = None
-                responses = [{'data': {'limit_remaining': 2}}, {'data': {'total_credits': 10, 'total_usage': usage}}]
-                with patch('bot.fetch', side_effect=[json.dumps(r).encode() for r in responses]):
+    def test_balance_negative_key_allowance_is_zero(self):
+        for remaining, expected in ((.2, .2), (-.1, 0)):
+            with self.subTest(remaining=remaining):
+                self.b._key_balance_cache = None
+                with patch('bot.fetch', return_value=json.dumps({'data': {'limit_remaining': remaining}}).encode()):
                     self.assertEqual(self.b.balance()['available_usd'], expected)
 
-    def test_balance_does_not_invent_account_funds_when_credits_are_forbidden(self):
-        with patch('bot.fetch', side_effect=[b'{"data":{"limit_remaining":0.5}}', RuntimeError('HTTP 403')]):
+    def test_balance_ignores_legacy_cache_that_contains_account_funds(self):
+        self.b._balance_cache = {'checked_at': time.time(), 'available_usd': 100, 'account_balance_usd': 100}
+        with patch('bot.fetch', return_value=b'{"data":{"limit_remaining":0.5}}'):
             result = self.b.balance()
         self.assertEqual(result['available_usd'], .5)
-        self.assertFalse(result['account_balance_known'])
         self.assertNotIn('account_balance_usd', result)
 
     def test_unlimited_key_and_malformed_or_missing_balance(self):
-        with patch('bot.fetch', side_effect=[b'{"data":{"limit_remaining":null}}',
-                                           b'{"data":{"total_credits":10,"total_usage":8}}']):
-            self.assertEqual(self.b.balance()['available_usd'], 2)
+        with patch('bot.fetch', return_value=b'{"data":{"limit_remaining":null}}') as fetch:
+            self.assertIn('error', self.b.balance())
+            fetch.assert_called_once()
+            self.assertEqual(fetch.call_args.args[0].full_url, 'https://openrouter.ai/api/v1/key')
         for body in (b'not json', b'{"data":[]}', b'{"data":{"limit_remaining":true}}',
                      b'{"data":{"limit_remaining":NaN}}', b'{"data":{}}'):
             with self.subTest(body=body):
-                self.b._balance_cache = None
-                with patch('bot.fetch', return_value=body), self.assertRaises(RuntimeError):
-                    self.b.balance()
+                self.b._key_balance_cache = None
+                with patch('bot.fetch', return_value=body) as fetch:
+                    with self.assertRaises(RuntimeError):
+                        self.b.balance()
+                    fetch.assert_called_once()
 
     def test_balance_refreshes_expired_cache_and_replay_never_fetches(self):
-        self.b._balance_cache = {'available_usd': 99, 'checked_at': time.time() - 61}
+        self.b._key_balance_cache = {'available_usd': 99, 'checked_at': time.time() - 61}
         with patch('bot.fetch', side_effect=[b'{"data":{"limit_remaining":0.1}}', RuntimeError('offline')]) as fetch:
             self.assertEqual(self.b.balance()['available_usd'], .1)
-            self.assertEqual(fetch.call_count, 2)
+            self.assertEqual(fetch.call_count, 1)
             fetch.reset_mock()
             self.assertIn('error', self.b.balance(live=False))
             fetch.assert_not_called()

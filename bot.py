@@ -4,6 +4,7 @@
 import conversation
 import retrieval
 import formatting
+import vision
 
 from collections import Counter
 from contextlib import contextmanager, nullcontext
@@ -86,6 +87,12 @@ def fetch(request, timeout=60, direct=False):
 def with_image(text, image=None):
     """A message's content: the text, with the picture as a data URI after it when there is one."""
     return [{'type': 'text', 'text': text}, {'type': 'image_url', 'image_url': {'url': image}}] if image else text
+
+
+def has_picture(message):
+    """Photos and image documents."""
+    return bool(message.get('photo') or
+                (message.get('document') or {}).get('mime_type', '').startswith('image/'))
 
 
 def post(url, payload, timeout=60, direct=False, headers=None):
@@ -228,6 +235,11 @@ def message_participants(message):
             if entry not in people:
                 people.append(entry)
     return people
+
+
+def participant_id(message):
+    """Only the actual Telegram user sender, never a quote, mention or anonymous channel."""
+    return None if message.get('sender_chat') else (message.get('from') or {}).get('id')
 
 
 def participant_context(people, me_id):
@@ -843,18 +855,18 @@ class Bot:
                  'cost': usage.get('cost')}
         return (choice.get('message') or {}).get('content'), stats
 
+    def send_typing(self, chat_id, topic=0):
+        action = {'chat_id': chat_id, 'action': 'typing'}
+        if topic:
+            action['message_thread_id'] = topic
+        if not post(self.telegram_url + 'sendChatAction', action, timeout=2).get('ok'):
+            raise RuntimeError('Telegram отклонил typing')
+
     def generate(self, messages, chat_id=None, topic=0, system=SYSTEM, temperature=1.0, effort=None):
         messages = [{'role': 'system', 'content': system}] + messages
-        def send():
-            action = {'chat_id': chat_id, 'action': 'typing'}
-            if topic:
-                action['message_thread_id'] = topic
-            if not post(self.telegram_url + 'sendChatAction', action, timeout=2).get('ok'):
-                raise RuntimeError('Telegram отклонил typing')
-
         started = time.monotonic()
         try:
-            with typing(send) if chat_id is not None else nullcontext():
+            with typing(lambda: self.send_typing(chat_id, topic)) if chat_id is not None else nullcontext():
                 answer, stats = (self.ask_openrouter(messages, temperature, effort) if self.openrouter
                                  else self.ask_ollama(messages, temperature))
         except RuntimeError as exc:
@@ -939,19 +951,22 @@ class Bot:
             if photo:
                 # A Telegram photo comes in several sizes: a model needs no more than about 1280 pixels.
                 file = next((p for p in reversed(photo) if max(p['width'], p['height']) <= 1280), photo[0])
+            elif (source.get('document') or {}).get('mime_type', '').startswith('image/'):
+                file = source['document']
             elif sticker:
                 # An animated or video sticker is no picture, its thumbnail is.
                 file = sticker.get('thumbnail') if sticker.get('is_animated') or sticker.get('is_video') else sticker
             else:
                 continue
-            if file:
+            if file and file.get('file_id'):
                 try:
                     path = self.api('getFile', file_id=file['file_id'])['file_path']
                     data = fetch(self.telegram_url.replace('/bot', '/file/bot', 1) + path, timeout=30)
                 except RuntimeError as exc:
                     LOG.warning('telegram.image_failed %s', exc)
                     return None
-                return f'data:{mimetypes.guess_type(path)[0] or "image/jpeg"};base64,{b64encode(data).decode()}'
+                mime = (source.get('document') or {}).get('mime_type') or mimetypes.guess_type(path)[0] or 'image/jpeg'
+                return f'data:{mime};base64,{b64encode(data).decode()}'
         return None
 
     def snapshot(self, message, through, event=None, date=None, explicit=None, can_interject=None):
@@ -961,12 +976,20 @@ class Bot:
         rows = self.history.db.execute("""SELECT id, role, content, raw FROM messages
             WHERE chat=? AND topic=? AND id<=? AND date>=? AND date<=?
             ORDER BY date DESC, id DESC LIMIT 8""", (*key, through, now - self.window, now)).fetchall()
-        targets = [{'id': id_, 'label': clip(render(raw, self.me['id']) if role == 'user' and raw else text_of(content or ''), 180)}
+        targets = [{'id': id_, 'label': clip(render(raw, self.me['id']) if role == 'user' and raw else text_of(content or ''), 180),
+                    'user_id': participant_id(json.loads(raw)) if role == 'user' and raw else None}
                    for id_, role, content, raw in reversed(rows)]
         target = message['message_id']
         if target not in {m['id'] for m in targets}:
-            targets.append({'id': target, 'label': clip(message.get('text') or message.get('caption') or '[медиа]', 180)})
-        reactions = self.history.db.execute("""SELECT r.id, r.emoji FROM reactions r JOIN answers a
+            targets.append({'id': target, 'label': clip(message.get('text') or message.get('caption') or '[медиа]', 180),
+                            'user_id': participant_id(message)})
+        event_user_id = None if event and event.startswith('idle:') else participant_id(message)
+        if event_user_id == self.me['id']:
+            event_user_id = None
+        for candidate in targets:
+            if candidate['user_id'] == self.me['id']:
+                candidate['user_id'] = None
+        reactions = self.history.db.execute("""SELECT r.id, r.user, r.emoji FROM reactions r JOIN answers a
             ON a.chat=r.chat AND a.id=r.id WHERE a.chat=? AND a.topic=? AND r.date<=?
             AND r.date>? ORDER BY r.date DESC LIMIT 20""", (*key, now, now - self.window)).fetchall()
         context = CHAT + '\n\n'.join(turn['content'] for turn in turns)
@@ -979,16 +1002,33 @@ class Bot:
             context = aliases + '\n\n' + context
         reaction_context = ''
         if reactions:
-            reaction_context = 'Реакции на сообщения Рофла: ' + json.dumps(reactions, ensure_ascii=False)
+            reaction_context = 'Реакции на сообщения Рофла (message_id, user_id, emoji): ' + json.dumps(reactions, ensure_ascii=False)
             context += '\n\n' + reaction_context
         return {'context': context, 'messages': turns, 'reactions_context': reaction_context,
                 'participants': people, 'participants_context': aliases,
                 'event': (f'В чате пауза. Возможность вступить в разговор. {event}' if event and event.startswith('idle:') else
                           f"{identity_label(sender_of(message))} изменил реакцию на твоё сообщение: {event}" if event else
                           f"Сообщение {through}, пишет {identity_label(sender_of(message))}"),
-                'target': target, 'through': through, 'targets': targets, 'date': now,
+                'target': target, 'through': through, 'targets': targets, 'date': now, 'event_user_id': event_user_id,
                 'explicit': self.addressed(message, message.get('text') or message.get('caption', '')) if explicit is None else explicit,
                 'can_interject': self.can_interject(key, now) if can_interject is None else can_interject}
+
+    def visual_snapshot(self, message, snapshot):
+        """Fetch once for Jev and the writer. Image bytes remain transient."""
+        source = next((s for s in (message, message.get('reply_to_message') or {})
+                       if has_picture(s) or s.get('sticker')), None)
+        if source is None:
+            return snapshot
+        image = self.image(message)
+        prepared = None
+        if image:
+            try:
+                prepared = vision.prepare(image)
+            except RuntimeError as exc:
+                LOG.warning('jev.image_failed %s', exc)
+        return {**snapshot, '_image': image, '_jev_image': prepared,
+                'image_context': {'message_id': source.get('message_id', snapshot['target']),
+                                  'available': bool(image), 'jev': bool(prepared)}}
 
     def can_interject(self, key, now):
         if not HOURS[0] <= datetime.datetime.fromtimestamp(now).hour < 24:
@@ -1124,59 +1164,36 @@ class Bot:
         return 'Неизвестный инструмент.'
 
     def balance(self, live=True):
-        """Read-only credit lookup. Key allowance and account funds are separate ceilings."""
+        """Expose only this bot's key allowance; never request the account's credits."""
         if not live:
             return {'error': 'Текущий баланс недоступен в replay; исторический остаток неизвестен.'}
         now = time.time()
-        cached = getattr(self, '_balance_cache', None)
+        cached = getattr(self, '_key_balance_cache', None)
         if cached and 0 <= now - cached['checked_at'] < 60:
             return dict(cached)
         if not self.openrouter_key:
             raise RuntimeError('Нет ключа OpenRouter')
 
-        def get(path):
-            try:
-                body = json.loads(fetch(Request('https://openrouter.ai/api/v1/' + path,
-                                               headers={'Authorization': f'Bearer {self.openrouter_key}'}), 15))
-                data = body['data']
-                if not isinstance(data, dict):
-                    raise ValueError()
-                return data
-            except (ValueError, KeyError, TypeError):
-                raise RuntimeError('Некорректный ответ OpenRouter о балансе') from None
-
-        def number(data, name):
-            value = data[name]
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        try:
+            body = json.loads(fetch(Request('https://openrouter.ai/api/v1/key',
+                                           headers={'Authorization': f'Bearer {self.openrouter_key}'}), 15))
+            remaining = body['data']['limit_remaining']
+            if remaining is None:
+                return {'error': 'У ключа бота не задан отдельный лимит; остаток его бюджета неизвестен.'}
+            if isinstance(remaining, bool) or not isinstance(remaining, (int, float)) or not math.isfinite(remaining):
                 raise ValueError()
-            return value
-
-        result = {'currency': 'USD', 'checked_at': now}
-        try:
-            data = get('key')
-            if data.get('limit_remaining') is not None:
-                result['key_remaining_usd'] = round(number(data, 'limit_remaining'), 6)
-        except (RuntimeError, KeyError, ValueError):
-            pass
-        try:
-            data = get('credits')
-            result['account_balance_usd'] = round(number(data, 'total_credits') - number(data, 'total_usage'), 6)
-        except (RuntimeError, KeyError, ValueError):
-            pass  # Some keys can only read their own allowance, not account credits.
-        ceilings = [result[k] for k in ('key_remaining_usd', 'account_balance_usd') if k in result]
-        if not ceilings:
-            raise RuntimeError('OpenRouter не предоставил остаток денег')
-        result['available_usd'] = max(0, min(ceilings))
-        result['account_balance_known'] = 'account_balance_usd' in result
-        result['key_remaining_known'] = 'key_remaining_usd' in result
-        result['note'] = ('Доступно — минимум известных остатков; неизвестные ограничения не учтены. '
-                          'Снимок до оплаты текущего ответа, может измениться после других запросов.')
-        self._balance_cache = result
+        except (ValueError, KeyError, TypeError):
+            raise RuntimeError('Некорректный ответ OpenRouter о балансе') from None
+        result = {'currency': 'USD', 'checked_at': now, 'available_usd': max(0, round(remaining, 6)),
+                  'note': 'Остаток лимита ключа этого бота до оплаты текущего ответа; может измениться после других запросов.'}
+        self._key_balance_cache = result
         return dict(result)
 
     def write_turn(self, message, snapshot, decision, live):
         state = decision['state']
-        system = conversation.exposition(state['role'], state['attitude'])
+        subject = ('собеседнику' + (f" user_id={state['attitude_user_id']}" if state['attitude_user_id'] is not None else '')
+                   if 'attitude_user_id' in state else 'чату')
+        system = conversation.exposition(state['role'], state['attitude'], subject)
         instruction = (f"Сейчас {datetime.datetime.fromtimestamp(snapshot['date']):%d.%m.%Y %H:%M}.\n"
                        + snapshot['event'] + f"\nСообщение для ответа: {decision['target']}.\n")
         # Older persisted snapshots have no message IDs in their conversation text.
@@ -1186,7 +1203,10 @@ class Bot:
                 instruction += 'Текст выбранного сообщения: ' + target['label'] + '\n'
         if decision['action'] == 'react':
             instruction += '\nВыбранное действие: реакция на сообщение. Верни только одно эмодзи.'
-        image = self.image(message) if message.get('photo') or message.get('sticker') or (message.get('reply_to_message') or {}).get('photo') else None
+        if '_image' in snapshot:
+            image = snapshot['_image']
+        else:
+            image = self.image(message) if has_picture(message) or message.get('sticker') or has_picture(message.get('reply_to_message') or {}) else None
         messages = [{'role': 'system', 'content': system}]
         if 'messages' in snapshot:
             prelude = '\n\n'.join(filter(None, [snapshot.get('participants_context'), CHAT.rstrip()]))
@@ -1253,7 +1273,15 @@ class Bot:
                 snapshot, decision = cached
             else:
                 snapshot = self.snapshot(message, through, event=event, date=date, explicit=explicit, can_interject=can_interject)
+                if event is None:
+                    snapshot = self.visual_snapshot(message, snapshot)
                 previous = store.state(key, before=snapshot['date']) if not live else store.state(key)
+                before = snapshot['date'] if not live else None
+                user_id = snapshot['event_user_id']
+                previous['attitude'] = store.attitude(key[0], user_id, before=before)
+                users = {m['user_id'] for m in snapshot['targets']} | {user_id}
+                snapshot['attitudes'] = {str(user): store.attitude(key[0], user, before=before)
+                                         for user in users if user is not None}
                 try:
                     decision = self.direct(snapshot, previous)
                     if decision.get('jev'):
@@ -1262,7 +1290,11 @@ class Bot:
                     LOG.warning('jev.failed %s', exc)
                     decision = {'action': 'reply' if snapshot['explicit'] else 'ignore', 'target': snapshot['target'],
                                 'attitude': previous['attitude'], 'reconsider': False, 'fallback': True}
-                if not snapshot['explicit'] and not decision.get('addressed', False) and not snapshot['can_interject']:
+                if (event is None and snapshot['explicit']
+                        and (has_picture(message) or has_picture(message.get('reply_to_message') or {}))):
+                    decision.update(jev_action=decision['action'], action='reply', target=snapshot['target'],
+                                    reply_policy='addressed_image')
+                elif not snapshot['explicit'] and not decision.get('addressed', False) and not snapshot['can_interject']:
                     decision['action'] = 'ignore'
                 role = previous['role']
                 override = store.role_override(snapshot['date'])
@@ -1279,8 +1311,15 @@ class Bot:
                         LOG.warning('role.failed %s', exc)
                 changed = (override['starts'] if override else snapshot['date']
                            if role != previous['role'] or selected and expired else previous['changed_at'])
-                decision['state'] = {'role': role, 'attitude': decision['attitude'], 'changed_at': changed,
-                                     'updated_at': snapshot['date']}
+                decision['relationship'] = {'user_id': user_id, 'attitude': decision['attitude']}
+                # A spontaneous reply may address someone other than the event's author.
+                # A reaction to our own message belongs to the reacting user, not to us.
+                target_user = (user_id if decision['target'] == snapshot['target'] and not (event and event.startswith('idle:'))
+                               else next((m['user_id'] for m in snapshot['targets'] if m['id'] == decision['target']), None))
+                attitude = (decision['attitude'] if target_user is not None and target_user == user_id
+                            else snapshot['attitudes'].get(str(target_user), 5))
+                decision['state'] = {'role': role, 'attitude': attitude, 'attitude_user_id': target_user,
+                                     'changed_at': changed, 'updated_at': snapshot['date']}
                 if decision['action'] == 'reply' and not decision.get('fallback'):
                     try:
                         selection = self.select_context(snapshot, decision['target'])
@@ -1291,7 +1330,7 @@ class Bot:
                         decision['context_selection'] = {'fallback': True}
                         LOG.warning('context.selection_failed %s', exc)
                 if live:
-                    store.save(key, event_id, snapshot, decision)
+                    store.save(key, event_id, {k: v for k, v in snapshot.items() if not k.startswith('_')}, decision)
             # --morale is retained as a replay-only alias for the new 0–10 scale.
             if morale is not None and not live:
                 decision = {**decision, 'state': {**decision['state'], 'attitude': max(0, min(10, morale))}}
@@ -1299,6 +1338,9 @@ class Bot:
                      'role': decision['state']['role'], 'attitude': decision['state']['attitude'],
                      'role_changed_at': decision['state']['changed_at'], 'jev': decision.get('jev'),
                      'fallback': decision.get('fallback', False)}
+            if 'attitude_user_id' in decision['state']:
+                trace['attitude_user_id'] = decision['state']['attitude_user_id']
+                trace['relationship'] = decision['relationship']
             if decision.get('context_selection'):
                 # Scores stay in SQLite; logs contain counts and costs only.
                 selection = decision['context_selection']
@@ -1307,19 +1349,26 @@ class Bot:
                     trace['context_selection']['selected'] = len(selection['ids'])
             if decision.get('role_override_until'):
                 trace['role_override_until'] = decision['role_override_until']
+            if decision.get('reply_policy'):
+                trace['reply_policy'] = decision['reply_policy']
+                if 'jev_action' in decision:
+                    trace['jev_action'] = decision['jev_action']
+            if snapshot.get('image_context'):
+                trace['image_context'] = snapshot['image_context']
             LOG.info('conversation.decision %s', json.dumps({'chat': key[0], 'topic': key[1], **trace}, ensure_ascii=False))
             if decision['action'] == 'ignore':
                 return '', {**trace, **spent(usage)}
-            try:
-                answer, calls = self.write_turn(message, snapshot, decision, live)
-            except RuntimeError as exc:
-                LOG.error('writer.failed %s', exc)
-                raise
-            if decision['action'] == 'react':
-                answer = reaction_of(f'[реакция {answer}]') or '👍'
-                trace['reaction'] = True
-            else:
-                answer, trace['formatter'] = self.format_answer(answer)
+            with typing(lambda: self.send_typing(*key)) if live and decision['action'] == 'reply' else nullcontext():
+                try:
+                    answer, calls = self.write_turn(message, snapshot, decision, live)
+                except RuntimeError as exc:
+                    LOG.error('writer.failed %s', exc)
+                    raise
+                if decision['action'] == 'react':
+                    answer = reaction_of(f'[реакция {answer}]') or '👍'
+                    trace['reaction'] = True
+                else:
+                    answer, trace['formatter'] = self.format_answer(answer)
             return answer, {**trace, 'tools': calls, **spent(usage)}
 
     def roster(self, chat_id, live=True):
@@ -1603,8 +1652,9 @@ if __name__ == '__main__':
             sys.exit()
         if '--day' in sys.argv or '--state' in sys.argv:
             history = History(Path(__file__).with_name('history.sqlite3'))
-            rows = history.db.execute('SELECT chat, topic, role, attitude, changed_at FROM conversation_state ORDER BY chat, topic').fetchall()
-            print(json.dumps(rows, ensure_ascii=False, indent=2))
+            roles = history.db.execute('SELECT chat, topic, role, changed_at FROM conversation_state ORDER BY chat, topic').fetchall()
+            attitudes = history.db.execute('SELECT chat, user, attitude, updated_at FROM participant_attitudes ORDER BY chat, user').fetchall()
+            print(json.dumps({'roles': roles, 'attitudes': attitudes}, ensure_ascii=False, indent=2))
             sys.exit()
         read_only = '--read-only' in sys.argv or os.environ.get('READ_ONLY', '').lower() in ('1', 'true', 'yes')
         bot = Bot(read_only=read_only)

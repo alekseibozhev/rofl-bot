@@ -26,6 +26,7 @@ class ConversationTests(unittest.TestCase):
         self.b.setup = Mock(return_value='нет')
         self.counter = 0
         self.b.api = Mock(side_effect=self.send)
+        self.b.send_typing = Mock()
         self.b.read = Mock()  # no news from the network unless a test asks
         self.b.direct = Mock(side_effect=lambda snapshot, previous: {"action": "reply" if snapshot["explicit"] else "ignore", "target": snapshot["target"], "attitude": 5, "reconsider": False})
         self.b.select_context = Mock(return_value={'fallback': True})
@@ -273,6 +274,7 @@ class ConversationTests(unittest.TestCase):
                 post('http://localhost/api/chat', {}, direct=True)
 
     def test_typing_runs_while_the_model_is_busy_and_its_failures_are_harmless(self):
+        self.b.send_typing = Bot.send_typing.__get__(self.b)
         from threading import Event
         attempted = Event()
         def slow_post(url, payload, **kwargs):
