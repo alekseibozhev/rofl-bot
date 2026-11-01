@@ -207,6 +207,82 @@ class ConversationTests(unittest.TestCase):
         self.assertEqual(messages[-1]['role'], 'tool')
         self.assertIn('https://example.com', messages[-1]['content'])
 
+    def test_writer_gets_message_ids_without_repeated_target_excerpts(self):
+        for text in ('ПЕРВАЯ УНИКАЛЬНАЯ РЕПЛИКА', 'ВТОРАЯ УНИКАЛЬНАЯ РЕПЛИКА'):
+            self.b.history.add_message((-1, 0), self.message(text))
+        self.turn(self.message('бот, ответь на последнее'))
+        snapshot = self.b.direct.call_args.args[0]
+        prompt = self.b.writer_step.call_args.args[0][1]['content']
+        self.assertIn('[1] Алексей: ПЕРВАЯ УНИКАЛЬНАЯ РЕПЛИКА', snapshot['context'])
+        self.assertEqual(prompt.count('ПЕРВАЯ УНИКАЛЬНАЯ РЕПЛИКА'), 1)
+        self.assertEqual(prompt.count('ВТОРАЯ УНИКАЛЬНАЯ РЕПЛИКА'), 1)
+
+    def test_old_snapshot_still_identifies_selected_target(self):
+        snapshot = {'context': 'старый контекст', 'event': 'событие', 'date': time.time(),
+                    'targets': [{'id': 1, 'label': 'выбранный текст'}, {'id': 2, 'label': 'чужая реплика'}]}
+        decision = {'state': conversation.Store.initial(), 'action': 'reply', 'target': 1}
+        self.b.write_turn(self.message(), snapshot, decision, live=False)
+        prompt = self.b.writer_step.call_args.args[0][1]['content']
+        self.assertIn('выбранный текст', prompt)
+        self.assertNotIn('чужая реплика', prompt)
+
+    def test_news_markup_is_sent_as_html_but_history_keeps_original(self):
+        answer = '**Новости.** [Источник](https://example.com/?a=1&b=2) <текст>'
+        self.b.deliver(self.message(), answer, {'target': 1}, request=1)
+        self.assertEqual(self.b.api.call_args.kwargs['parse_mode'], 'HTML')
+        self.assertEqual(self.b.api.call_args.kwargs['text'],
+                         '<b>Новости.</b> <a href="https://example.com/?a=1&amp;b=2">Источник</a> &lt;текст&gt;')
+        self.assertEqual(self.b.history.answer(-1, 1000)[1], answer)
+
+    def test_balance_uses_lower_ceiling_and_caches_only_filtered_data(self):
+        responses = [{'data': {'limit_remaining': .75, 'hash': 'SECRET'}},
+                     {'data': {'total_credits': 173, 'total_usage': 171.57, 'secret': 'SECRET'}}]
+        with patch('bot.fetch', side_effect=[json.dumps(r).encode() for r in responses]) as fetch:
+            result = self.b.balance()
+            self.assertEqual(self.b.balance(), result)
+        self.assertEqual(fetch.call_count, 2)
+        self.assertEqual(fetch.call_args_list[0].args[0].get_method(), 'GET')
+        self.assertEqual(result['available_usd'], .75)
+        self.assertEqual(result['account_balance_usd'], 1.43)
+        self.assertNotIn('SECRET', json.dumps(result))
+        self.assertNotIn('test-key', json.dumps(result))
+        self.assertEqual(json.loads(self.b.writer_tool('balance', {}, self.message(), {}, True)), result)
+
+    def test_balance_account_can_be_lower_than_key_and_negative_is_unavailable(self):
+        for usage, expected in ((9.8, .2), (10.1, 0)):
+            with self.subTest(usage=usage):
+                self.b._balance_cache = None
+                responses = [{'data': {'limit_remaining': 2}}, {'data': {'total_credits': 10, 'total_usage': usage}}]
+                with patch('bot.fetch', side_effect=[json.dumps(r).encode() for r in responses]):
+                    self.assertEqual(self.b.balance()['available_usd'], expected)
+
+    def test_balance_does_not_invent_account_funds_when_credits_are_forbidden(self):
+        with patch('bot.fetch', side_effect=[b'{"data":{"limit_remaining":0.5}}', RuntimeError('HTTP 403')]):
+            result = self.b.balance()
+        self.assertEqual(result['available_usd'], .5)
+        self.assertFalse(result['account_balance_known'])
+        self.assertNotIn('account_balance_usd', result)
+
+    def test_unlimited_key_and_malformed_or_missing_balance(self):
+        with patch('bot.fetch', side_effect=[b'{"data":{"limit_remaining":null}}',
+                                           b'{"data":{"total_credits":10,"total_usage":8}}']):
+            self.assertEqual(self.b.balance()['available_usd'], 2)
+        for body in (b'not json', b'{"data":[]}', b'{"data":{"limit_remaining":true}}',
+                     b'{"data":{"limit_remaining":NaN}}', b'{"data":{}}'):
+            with self.subTest(body=body):
+                self.b._balance_cache = None
+                with patch('bot.fetch', return_value=body), self.assertRaises(RuntimeError):
+                    self.b.balance()
+
+    def test_balance_refreshes_expired_cache_and_replay_never_fetches(self):
+        self.b._balance_cache = {'available_usd': 99, 'checked_at': time.time() - 61}
+        with patch('bot.fetch', side_effect=[b'{"data":{"limit_remaining":0.1}}', RuntimeError('offline')]) as fetch:
+            self.assertEqual(self.b.balance()['available_usd'], .1)
+            self.assertEqual(fetch.call_count, 2)
+            fetch.reset_mock()
+            self.assertIn('error', self.b.balance(live=False))
+            fetch.assert_not_called()
+
     def test_invalid_tool_arguments_reach_writer_as_error(self):
         self.b.writer_step.side_effect = [
             {'role': 'assistant', 'tool_calls': [{'id': 't', 'function': {'name': 'news', 'arguments': 'invalid'}}]},

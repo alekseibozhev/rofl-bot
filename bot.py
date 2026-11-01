@@ -240,18 +240,30 @@ def casual(text):
 
 
 def telegram_html(text):
-    """An answer with code as Telegram HTML: ```blocks``` and `inline` code; None for one without, it goes as is."""
-    if not re.search(r'```[^\n]*\n.*?```|`[^`\n]+`', text, re.S):
-        return None
-    parts = re.split(r'(```[^\n]*\n.*?```)', text, flags=re.S)
-    for n, part in enumerate(parts):
-        if n % 2:
-            language, _, code = part[3:-3].partition('\n')
-            lang = f' class="language-{html.escape(language.strip())}"' if language.strip() else ''
-            parts[n] = f'<pre><code{lang}>{html.escape(code.rstrip(), quote=False)}</code></pre>'
-        else:
-            parts[n] = re.sub(r'`([^`\n]+)`', r'<code>\1</code>', html.escape(part, quote=False))
-    return ''.join(parts)
+    """Render Markdown code, bold and HTTP(S) links as escaped Telegram HTML."""
+    tokens = re.compile(r'```([^\n]*)\n(.*?)```|`([^`\n]+)`|'
+                        r'\[([^\]\n]+)\]\((https?://(?:[^\s<>()]|\([^\s<>()]*\))+)\)|'
+                        r'\*\*(?=\S)(.+?)(?<=\S)\*\*|__(?=\S)(.+?)(?<=\S)__', re.S)
+
+    def render_text(value):
+        parts, end = [], 0
+        for match in tokens.finditer(value):
+            parts.append(html.escape(value[end:match.start()], quote=False))
+            language, block, inline, label, url, bold, underbold = match.groups()
+            if block is not None:
+                lang = f' class="language-{html.escape(language.strip())}"' if language.strip() else ''
+                parts.append(f'<pre><code{lang}>{html.escape(block.rstrip(), quote=False)}</code></pre>')
+            elif inline is not None:
+                parts.append(f'<code>{html.escape(inline, quote=False)}</code>')
+            elif url is not None:
+                parts.append(f'<a href="{html.escape(url)}">{render_text(label)}</a>')
+            else:
+                parts.append(f'<b>{render_text(bold or underbold)}</b>')
+            end = match.end()
+        parts.append(html.escape(value[end:], quote=False))
+        return ''.join(parts)
+
+    return render_text(text) if tokens.search(text) else None
 
 
 MEDIA = (('photo', 'фото'), ('video', 'видео'), ('animation', 'гифка'), ('video_note', 'кружок'),
@@ -427,7 +439,7 @@ class History:
                  (message.get('reply_to_message') or {}).get('message_id'), json.dumps(message, ensure_ascii=False))
 
     def context(self, key, through_id=sys.maxsize, me_id=None, recent=40, window=21600, depth=10, limit=12000,
-                pause=1800):
+                pause=1800, include_ids=False):
         """The chat up to the newest message as lines, oldest first: the last `recent` messages of people
         from `window` seconds before it, plus its reply chain (rebuilt from earlier updates) however old.
 
@@ -494,6 +506,8 @@ class History:
                 lines.append(chat_line(f'Рофл → {target}' if target else 'Рофл', content))
             else:
                 lines.append(render(raw, me_id, rows, previous))
+            if include_ids:
+                lines[-1] = f'[{message_id}] ' + lines[-1]
             previous = message_id
         return lines
 
@@ -841,7 +855,7 @@ class Bot:
     def snapshot(self, message, through, event=None, date=None, explicit=None, can_interject=None):
         key = (message['chat']['id'], topic_of(message))
         now = date if date is not None else message.get('date', time.time())
-        lines, _ = self.chat(key, through)
+        lines, _ = self.chat(key, through, include_ids=True)
         rows = self.history.db.execute("""SELECT id, role, content, raw FROM messages
             WHERE chat=? AND topic=? AND id<=? AND date>=? AND date<=?
             ORDER BY date DESC, id DESC LIMIT 8""", (*key, through, now - self.window, now)).fetchall()
@@ -925,14 +939,71 @@ class Bot:
             chat = message['chat']['id']
             count = self.roster(chat, live=live) if args.get('all') and live else None
             return json.dumps({'known': self.history.names(chat), 'total': count}, ensure_ascii=False)
+        if name == 'balance':
+            return json.dumps(self.balance(live=live), ensure_ascii=False)
         return 'Неизвестный инструмент.'
+
+    def balance(self, live=True):
+        """Read-only credit lookup. Key allowance and account funds are separate ceilings."""
+        if not live:
+            return {'error': 'Текущий баланс недоступен в replay; исторический остаток неизвестен.'}
+        now = time.time()
+        cached = getattr(self, '_balance_cache', None)
+        if cached and 0 <= now - cached['checked_at'] < 60:
+            return dict(cached)
+        if not self.openrouter_key:
+            raise RuntimeError('Нет ключа OpenRouter')
+
+        def get(path):
+            try:
+                body = json.loads(fetch(Request('https://openrouter.ai/api/v1/' + path,
+                                               headers={'Authorization': f'Bearer {self.openrouter_key}'}), 15))
+                data = body['data']
+                if not isinstance(data, dict):
+                    raise ValueError()
+                return data
+            except (ValueError, KeyError, TypeError):
+                raise RuntimeError('Некорректный ответ OpenRouter о балансе') from None
+
+        def number(data, name):
+            value = data[name]
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError()
+            return value
+
+        result = {'currency': 'USD', 'checked_at': now}
+        try:
+            data = get('key')
+            if data.get('limit_remaining') is not None:
+                result['key_remaining_usd'] = round(number(data, 'limit_remaining'), 6)
+        except (RuntimeError, KeyError, ValueError):
+            pass
+        try:
+            data = get('credits')
+            result['account_balance_usd'] = round(number(data, 'total_credits') - number(data, 'total_usage'), 6)
+        except (RuntimeError, KeyError, ValueError):
+            pass  # Some keys can only read their own allowance, not account credits.
+        ceilings = [result[k] for k in ('key_remaining_usd', 'account_balance_usd') if k in result]
+        if not ceilings:
+            raise RuntimeError('OpenRouter не предоставил остаток денег')
+        result['available_usd'] = max(0, min(ceilings))
+        result['account_balance_known'] = 'account_balance_usd' in result
+        result['key_remaining_known'] = 'key_remaining_usd' in result
+        result['note'] = ('Доступно — минимум известных остатков; неизвестные ограничения не учтены. '
+                          'Снимок до оплаты текущего ответа, может измениться после других запросов.')
+        self._balance_cache = result
+        return dict(result)
 
     def write_turn(self, message, snapshot, decision, live):
         state = decision['state']
         system = conversation.exposition(state['role'], state['attitude'])
         instruction = (f"Сейчас {datetime.datetime.fromtimestamp(snapshot['date']):%d.%m.%Y %H:%M}.\n"
-                       + snapshot['event'] + f"\nСообщение для ответа: {decision['target']}.\n"
-                       + json.dumps(snapshot['targets'], ensure_ascii=False))
+                       + snapshot['event'] + f"\nСообщение для ответа: {decision['target']}.\n")
+        # Older persisted snapshots have no message IDs in their conversation text.
+        if not re.search(rf"(?m)^\[{decision['target']}\] ", snapshot['context']):
+            target = next((m for m in snapshot['targets'] if m['id'] == decision['target']), None)
+            if target:
+                instruction += 'Текст выбранного сообщения: ' + target['label'] + '\n'
         if decision['action'] == 'react':
             instruction += '\nВыбранное действие: реакция на сообщение. Верни только одно эмодзи.'
         prompt = snapshot['context'] + '\n\n' + instruction
@@ -1043,11 +1114,11 @@ class Bot:
             return 0
         return count
 
-    def chat(self, key, through=sys.maxsize):
+    def chat(self, key, through=sys.maxsize, include_ids=False):
         """The chat up to message `through` as lines for the model, one name per person, and the names by username."""
         names = {**self.history.names(key[0]), self.me['username'].lower(): 'Рофл'}
         return rename(self.history.context(key, through, self.me['id'], self.recent, self.window,
-                                           limit=self.limit, pause=self.pause), names), names
+                                           limit=self.limit, pause=self.pause, include_ids=include_ids), names), names
 
     @contextmanager
     def counting(self):

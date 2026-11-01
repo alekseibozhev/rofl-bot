@@ -257,9 +257,9 @@ class ConversationTests(unittest.TestCase):
         self.counter = 10
         self.b.handle(self.message('бот, что скажешь в своё оправдание?', date=self.at(20),
                                    reply_to_message={'message_id': 2, 'from': {'id': 42}, 'text': 'Инженерка для крыс 🐀'}))
-        self.assertIn('сверху:\n\n— вчера, 14:00 —\n\nАлексей: качаю инженерку в вове\n\nРофл → Алексей: Инженерка для '
-                      'крыс 🐀\n\n— сегодня, 19:00 —\n\nKirill: Нормально кринжа насрал\n\n— сегодня, 20:00 —\n\n'
-                      'User 7 → Рофл «Инженерка для крыс 🐀»: бот, что скажешь', self.prompt())
+        self.assertIn('сверху:\n\n— вчера, 14:00 —\n\n[1] Алексей: качаю инженерку в вове\n\n[2] Рофл → Алексей: Инженерка для '
+                      'крыс 🐀\n\n— сегодня, 19:00 —\n\n[4] Kirill: Нормально кринжа насрал\n\n— сегодня, 20:00 —\n\n'
+                      '[11] User 7 → Рофл «Инженерка для крыс 🐀»: бот, что скажешь', self.prompt())
         self.assertNotIn('вчерашняя задача', self.prompt())  # older than a day and not in the chain
         self.b.handle(self.message('бот, а ты?', date=self.at(20, 1)))
         self.assertNotIn('качаю инженерку', self.prompt())  # the old chain stays with the request it belonged to
@@ -284,6 +284,30 @@ class ConversationTests(unittest.TestCase):
         self.b.ollama_url, self.b.model, self.b.telegram_url = 'http://localhost:11434', 'test', 'https://api/bot/'
         with patch('bot.post', side_effect=slow_post), self.assertLogs('bot', level='WARNING'):
             self.assertEqual(Bot.generate(self.b, [], chat_id=-100123), 'ok')
+
+
+class TelegramFormattingTests(unittest.TestCase):
+    def test_plain_chat_is_unchanged(self):
+        self.assertIsNone(bot.telegram_html('ну ты <гений> & математик 2 * 2'))
+
+    def test_news_bold_and_two_links_with_balanced_url_parentheses(self):
+        text = '**Новости**\n[Первый](https://example.com/a_(b)) [Второй](https://example.org)'
+        self.assertEqual(bot.telegram_html(text),
+                         '<b>Новости</b>\n<a href="https://example.com/a_(b)">Первый</a> '
+                         '<a href="https://example.org">Второй</a>')
+
+    def test_code_keeps_markdown_literal_and_escapes_html(self):
+        text = '**Код**\n```python\nprint("**x** < y & z")\n```\n`__inline__ <b>`'
+        self.assertEqual(bot.telegram_html(text),
+                         '<b>Код</b>\n<pre><code class="language-python">print("**x** &lt; y &amp; z")</code></pre>'
+                         '\n<code>__inline__ &lt;b&gt;</code>')
+
+    def test_html_cannot_be_injected_through_text_label_or_url(self):
+        text = '__Тема__ <b>x</b> [<i>источник</i>](https://example.com/"x?y=1&z=2)'
+        self.assertEqual(bot.telegram_html(text),
+                         '<b>Тема</b> &lt;b&gt;x&lt;/b&gt; '
+                         '<a href="https://example.com/&quot;x?y=1&amp;z=2">&lt;i&gt;источник&lt;/i&gt;</a>')
+        self.assertIsNone(bot.telegram_html('[опасно](javascript:alert(1))'))
 
 
 if __name__ == '__main__':
