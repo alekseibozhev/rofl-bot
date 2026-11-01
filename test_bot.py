@@ -258,8 +258,11 @@ class ConversationTests(unittest.TestCase):
         self.counter = 10
         self.b.handle(self.message('бот, что скажешь в своё оправдание?', date=self.at(20),
                                    reply_to_message={'message_id': 2, 'from': {'id': 42}, 'text': 'Инженерка для крыс 🐀'}))
-        self.assertIn('сверху:\n\n— вчера, 14:00 —\n\n[1] Алексей: качаю инженерку в вове\n\n[2] Рофл → Алексей: Инженерка для '
-                      'крыс 🐀\n\n— сегодня, 19:00 —\n\n[4] Kirill: Нормально кринжа насрал\n\n— сегодня, 20:00 —\n\n'
+        self.assertIn('сверху:\n\n— вчера, 14:00 —\n\n[1] Алексей: качаю инженерку в вове', self.prompt())
+        self.assertIn('"reply_to": 1', self.prompt())
+        self.assertEqual([m['content'] for m in self.b.generate.call_args.args[0] if m['role'] == 'assistant'],
+                         ['Инженерка для крыс 🐀'])
+        self.assertIn('— сегодня, 19:00 —\n\n[4] Kirill: Нормально кринжа насрал\n\n— сегодня, 20:00 —\n\n'
                       '[11] User 7 → Рофл «Инженерка для крыс 🐀»: бот, что скажешь', self.prompt())
         self.assertNotIn('вчерашняя задача', self.prompt())  # older than a day and not in the chain
         self.b.handle(self.message('бот, а ты?', date=self.at(20, 1)))

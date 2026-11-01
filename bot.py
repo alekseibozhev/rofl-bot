@@ -5,6 +5,7 @@ import conversation
 import retrieval
 import formatting
 import vision
+import delivery
 
 from collections import Counter
 from contextlib import contextmanager, nullcontext
@@ -21,6 +22,7 @@ import os
 from pathlib import Path
 import random
 import re
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -433,6 +435,7 @@ class History:
             day TEXT, interest TEXT, title TEXT, link TEXT, mood INTEGER, thought TEXT, PRIMARY KEY (day, interest))''')
         self.untag()
         conversation.Store(self.db)
+        self.delivery = delivery.Store(self.db)
 
     def untag(self):
         """Take the line of @ off the answers kept before it went only to Telegram: `tagged` in the trace says which
@@ -570,6 +573,8 @@ class History:
                           'content': '\n\n'.join(lines[first_line:]), 'id': message_id,
                           'reply_to': reply_to, 'date': datetime.datetime.fromtimestamp(date).isoformat(),
                           'participants': message_participants(json.loads(raw)) if raw else []})
+            if turns[-1]['role'] == 'assistant':
+                turns[-1]['assistant_text'] = content
             previous = message_id
         return turns if structured else lines
 
@@ -894,7 +899,7 @@ class Bot:
         other_bot = bool(re.search(r'@[a-zA-Z0-9_]{1,29}bot\b', text, re.I)) and not mentioned
         return bool(mentioned or called or (reply_to_me and not other_bot))
 
-    def receive(self, message):
+    def receive(self, message, received_at=None):
         """Store a group message as context. Returns what it asks for: a command, 'rofl' for the model, or None."""
         chat = message['chat']
         if chat['type'] not in ('group', 'supergroup') or chat['id'] not in self.allowed_groups:
@@ -912,7 +917,7 @@ class Bot:
             return None
         date = message.get('date', time.time())
         # Keep received background messages, answer direct turns, also those sent while the bot was off.
-        fresh = not self.read_only and time.time() - date <= self.max_age
+        fresh = not self.read_only and (received_at if received_at is not None else time.time()) - date <= self.max_age
         command = re.match(r'^/(\w+)(?:@([\w]+))?(?:\s|$)', text)
         if command and command[2] and command[2].lower() != self.me['username'].lower():
             return None
@@ -1217,6 +1222,20 @@ class Bot:
                 if kept is not None and turn['id'] not in kept:
                     continue
                 content = turn['content']
+                if turn['role'] == 'assistant':
+                    body = turn.get('assistant_text')
+                    if body is None:
+                        # Legacy structured snapshots rendered their own speaker header into the text.
+                        header = re.search(rf"(?m)^\[{turn['id']}\] Рофл(?: → [^:\n]*)?:(?:\n| )?", content)
+                        body = content[header.end():] if header else content
+                    metadata = 'Сведения о следующем сохранённом ответе Рофла: ' + json.dumps(
+                        {k: turn.get(k) for k in ('id', 'date', 'reply_to')}, ensure_ascii=False)
+                    if messages[-1]['role'] == 'user':
+                        messages[-1]['content'] += '\n\n' + metadata
+                    else:
+                        messages.append({'role': 'user', 'content': metadata})
+                    messages.append({'role': 'assistant', 'content': body})
+                    continue
                 if kept is not None:
                     # A removed message may have carried the day's time heading.
                     content = f"Время сообщения: {turn['date']}\n" + content
@@ -1421,6 +1440,10 @@ class Bot:
     def respond(self, message, kind, extra=()):
         chat = message['chat']
         key = (chat['id'], topic_of(message))
+        ready = self.history.delivery.outgoing(key, f'request:{message["message_id"]}')
+        if ready:
+            self.dispatch(ready)
+            return
         trace = None
         if kind in ('start', 'help'):
             answer = 'Зови «рофл, …», «бот, …» или отвечай на мои сообщения. /reset — забыть разговор.'
@@ -1432,37 +1455,69 @@ class Bot:
             LOG.info('telegram.addressed chat=%s message=%s message_age_s=%.1f followups=%s',
                      chat['id'], message['message_id'], time.time() - message.get('date', time.time()), len(extra))
             answer, trace = self.joke(message, extra[-1]['message_id'] if extra else message['message_id'])
-        for followup in extra:
-            self.history.claim_reply(key, followup['message_id'])
-        self.deliver(message, answer, trace, request=message['message_id'], kind=kind)
+        self.deliver(message, answer, trace, request=message['message_id'], kind=kind,
+                     followup_ids=[m['message_id'] for m in extra])
 
-    def deliver(self, message, answer, trace, request=None, kind='rofl'):
+    def deliver(self, message, answer, trace, request=None, kind='rofl', followup_ids=()):
         key = (message['chat']['id'], topic_of(message))
-        target = trace.get('target', message['message_id']) if trace else message['message_id']
-        if request is not None:
-            if not self.history.claim_reply(key, request):
-                return
-        elif trace:
-            stamp = f"delivered {key} {trace['event']}"
-            if self.history.stamp(stamp):
-                return
-            self.history.stamp(stamp, time.time())
-        if trace and trace.get('action') == 'ignore':
+        event = f'request:{request}' if request is not None else trace['event']
+        ready = self.history.delivery.outgoing(key, event)
+        if ready:
+            self.dispatch(ready)
             return
-        if trace and trace.get('reaction'):
-            self.api('setMessageReaction', chat_id=key[0], message_id=target,
-                     reaction=[{'type': 'emoji', 'emoji': answer}])
-            self.history.record(key, None, request, time.time(), answer, self.params(), trace)
+        # Respect claims made by versions without an outbox.
+        if (request is not None and self.history.replied(key, request)
+                or request is None and self.history.stamp(f'delivered {key} {event}')):
             return
-        if not answer:
+        payload = {'target': trace.get('target', message['message_id']) if trace else message['message_id'],
+                   'answer': answer, 'trace': trace, 'request': request, 'kind': kind,
+                   'followup_ids': list(followup_ids), 'params': self.params()}
+        self.dispatch(self.history.delivery.stage(key, event, payload))
+
+    def dispatch(self, item):
+        if self.read_only or item['status'] in ('done', 'unknown', 'sending'):
             return
-        text = envelope(answer, trace)
-        markup = telegram_html(text)
-        sent = self.send(key, target, markup or text, parse_mode='HTML' if markup else None)
-        if kind != 'reset':
-            self.history.add(key, sent['message_id'], 'assistant', answer, sent.get('date', time.time()), target)
-        if kind == 'rofl':
-            self.history.record(key, sent['message_id'], request, sent.get('date', time.time()), answer, self.params(), trace)
+        key, event, p = item['key'], item['event'], item['payload']
+        answer, trace, target = p['answer'], p['trace'], p['target']
+        silent = not answer or trace and trace.get('action') == 'ignore'
+        reaction = trace and trace.get('reaction')
+        receipt = item['receipt']
+        if item['status'] == 'pending':
+            if silent:
+                receipt = {'date': time.time()}
+            else:
+                # From this point a crash/network failure leaves an uncertain send, never an automatic duplicate.
+                self.history.delivery.status(key, event, 'sending')
+                try:
+                    if reaction:
+                        self.api('setMessageReaction', chat_id=key[0], message_id=target,
+                                 reaction=[{'type': 'emoji', 'emoji': answer}])
+                        receipt = {'date': time.time()}
+                    else:
+                        text = envelope(answer, trace)
+                        markup = telegram_html(text)
+                        sent = self.send(key, target, markup or text, parse_mode='HTML' if markup else None)
+                        receipt = {'message_id': sent['message_id'], 'date': sent.get('date', time.time())}
+                except BaseException:
+                    self.history.delivery.status(key, event, 'unknown')
+                    LOG.error('delivery.unknown chat=%s event=%s; saved answer needs delivery review', key[0], event)
+                    raise
+            self.history.delivery.status(key, event, 'delivered', receipt)
+        # A receipt is durable before local bookkeeping, which can be safely retried after a crash.
+        if not silent:
+            if not reaction and p['kind'] != 'reset':
+                self.history.add(key, receipt['message_id'], 'assistant', answer, receipt['date'], target)
+            recorded_reaction = reaction and self.history.db.execute(
+                'SELECT 1 FROM answers WHERE chat=? AND topic=? AND request IS ? AND date=?',
+                (*key, p['request'], receipt['date'])).fetchone()
+            if p['kind'] == 'rofl' and not recorded_reaction:
+                self.history.record(key, receipt.get('message_id'), p['request'], receipt['date'], answer, p['params'], trace)
+        for request in [p['request'], *p['followup_ids']]:
+            if request is not None:
+                self.history.claim_reply(key, request)
+        if p['request'] is None:
+            self.history.stamp(f'delivered {key} {event}', receipt['date'])
+        self.history.delivery.status(key, event, 'done', receipt)
 
     def params(self):
         return {'model': self.model, 'recent': self.recent, 'window_h': self.window / 3600, 'limit': self.limit,
@@ -1540,7 +1595,7 @@ class Bot:
         LOG.info('telegram.sent chat=%s source=%s reply=%s', key[0], reply_to, sent['message_id'])
         return sent
 
-    def react(self, reaction):
+    def react(self, reaction, received_at=None):
         chat, message_id = reaction['chat']['id'], reaction['message_id']
         person = reaction.get('user')
         if chat not in self.allowed_groups or not person or person.get('is_bot'):
@@ -1549,7 +1604,7 @@ class Bot:
         if not self.history.reacted(chat, message_id, person['id'], emojis, reaction.get('date', time.time())):
             return
         now = reaction.get('date', time.time())
-        if self.read_only or time.time() - now > self.max_age:
+        if self.read_only or (received_at if received_at is not None else time.time()) - now > self.max_age:
             return
         answer = self.history.answer(chat, message_id)
         if not answer:
@@ -1559,39 +1614,76 @@ class Bot:
                    'message_thread_id': topic, 'from': person, 'text': content}
         event = f'reaction:{message_id}:{person["id"]}:{now}:{"".join(emojis)}'
         try:
+            ready = self.history.delivery.outgoing((chat, topic), event)
+            if ready:
+                self.dispatch(ready)
+                return
             text, trace = self.joke(message, sys.maxsize, event=event, date=now, explicit=False)
             self.deliver(message, text, trace, request=None)
         except RuntimeError as exc:
             LOG.warning('reaction.failed %s', exc)
+            return False
 
-    def handle(self, *batch):
+    def handle(self, *batch, received_at=None):
         """Messages that arrived together: store all, then answer each request with what its author sent right after."""
-        requests = [(message, kind) for message in batch if (kind := self.receive(message))]
-        absorbed = set()
+        identity = lambda m: (m['chat']['id'], m['message_id'])
+        requests = [(message, kind) for message in batch
+                    if (kind := self.receive(message, (received_at or {}).get(identity(message))))]
+        absorbed, failed = set(), set()
         for message, kind in requests:
-            if message['message_id'] in absorbed:  # «@бот» and «@бот глянь» in a row get one answer
+            if identity(message) in absorbed:  # «@бот» and «@бот глянь» in a row get one answer
                 continue
             extra = followups(message, batch) if kind == 'rofl' else []
-            absorbed.update(m['message_id'] for m in extra)
+            absorbed.update(identity(m) for m in extra)
             try:
                 self.respond(message, kind, extra)
             except RuntimeError as exc:
-                LOG.error('Сообщение пропущено: %s', exc)
+                failed.update(identity(m) for m in [message, *extra])
+                LOG.error('Обработка не завершена, сообщение остаётся в очереди: %s', exc)
+        return failed
+
+    def process_updates(self, updates):
+        received = {(u['message']['chat']['id'], u['message']['message_id']): u.get('_received_at')
+                    for u in updates if 'message' in u}
+        failed_messages = self.handle(*[u['message'] for u in updates if 'message' in u], received_at=received)
+        failed = set()
+        for update in updates:
+            if 'message' in update:
+                m = update['message']
+                if (m['chat']['id'], m['message_id']) in failed_messages:
+                    failed.add(update['update_id'])
+            if 'message_reaction' in update:
+                try:
+                    if self.react(update['message_reaction'], received_at=update.get('_received_at')) is False:
+                        failed.add(update['update_id'])
+                except RuntimeError as exc:
+                    failed.add(update['update_id'])
+                    LOG.error('Реакция остаётся в очереди: %s', exc)
+        self.history.delivery.finish(updates, failed)
 
     def poll(self, offset, timeout):
         # Reactions come only to a bot that is an admin of the group.
-        return self.api('getUpdates', offset=offset, timeout=timeout, allowed_updates=['message', 'message_reaction'])
+        updates = self.api('getUpdates', offset=offset, timeout=timeout, allowed_updates=['message', 'message_reaction'])
+        self.history.delivery.enqueue(updates)
+        return updates
 
     def collect(self, updates, limit=10):
         """Poll on until `wait` seconds of quiet (at most `limit`): a request's material arrives right after it."""
         deadline = time.monotonic() + limit
         try:
-            while time.monotonic() < deadline and (more := self.poll(updates[-1]['update_id'] + 1, self.wait)):
+            while (not getattr(self, 'stopping', False) and time.monotonic() < deadline
+                   and (more := self.poll(updates[-1]['update_id'] + 1, self.wait))):
                 updates += more
         except RuntimeError as exc:
             # Earlier updates are already confirmed to Telegram by the offset: answer what arrived.
             LOG.error('Polling: %s; отвечаю на то, что уже пришло', exc)
         return updates
+
+    def request_stop(self, signum, frame):
+        if getattr(self, 'stopping', False):
+            raise KeyboardInterrupt  # A second signal forces exit; the inbox/outbox survives.
+        self.stopping = True
+        LOG.info('shutdown.requested: finish current work before exit; second signal forces exit')
 
     def run(self):
         self.process_lock = Path(__file__).with_name('.bot.lock').open('a')
@@ -1614,8 +1706,24 @@ class Bot:
             LOG.warning('Режим read-only: сообщения сохраняются в контекст, бот ничего не отправляет.')
         if not self.me.get('can_read_all_group_messages'):
             LOG.warning('Privacy Mode включён: фон чата и обращения по имени Telegram не доставляет.')
-        offset = self.history.stamp('offset')
-        while True:
+        self.stopping = False
+        signal.signal(signal.SIGINT, self.request_stop)
+        signal.signal(signal.SIGTERM, self.request_stop)
+        unknown = self.history.delivery.recover()
+        if unknown:
+            LOG.error('delivery.recovered_unknown count=%s; automatic resend disabled', unknown)
+        while not self.stopping:
+            try:
+                if not self.read_only:
+                    for item in self.history.delivery.ready():
+                        self.dispatch(item)
+                pending = self.history.delivery.pending()
+                if pending:
+                    self.process_updates(pending)
+            except RuntimeError as exc:
+                LOG.error('queue.failed %s', exc)
+            if self.stopping:
+                break
             try:
                 self.idle()
             except RuntimeError as exc:
@@ -1623,22 +1731,18 @@ class Bot:
             except Exception:  # a bug in a blurt or the news must not stop the answers
                 LOG.exception('idle.failed')
             try:
-                updates = self.poll(offset, 30)
+                if self.stopping:
+                    break
+                updates = self.poll(self.history.stamp('offset'), 30)
                 if not updates:
                     continue
-                updates = self.collect(updates)
-                self.handle(*[update['message'] for update in updates if 'message' in update])
-                for update in updates:
-                    if 'message_reaction' in update:
-                        try:
-                            self.react(update['message_reaction'])
-                        except RuntimeError as exc:
-                            LOG.error('Реакция пропущена: %s', exc)
-                offset = updates[-1]['update_id'] + 1
-                self.history.stamp('offset', offset)
+                self.collect(updates)
+                if not self.stopping:
+                    self.process_updates(self.history.delivery.pending())
             except RuntimeError as exc:
                 LOG.error('Polling: %s; повтор через 5 секунд', exc)
                 time.sleep(5)
+        LOG.info('shutdown.complete: pending work saved')
 
 
 if __name__ == '__main__':
@@ -1654,7 +1758,9 @@ if __name__ == '__main__':
             history = History(Path(__file__).with_name('history.sqlite3'))
             roles = history.db.execute('SELECT chat, topic, role, changed_at FROM conversation_state ORDER BY chat, topic').fetchall()
             attitudes = history.db.execute('SELECT chat, user, attitude, updated_at FROM participant_attitudes ORDER BY chat, user').fetchall()
-            print(json.dumps({'roles': roles, 'attitudes': attitudes}, ensure_ascii=False, indent=2))
+            queues = {'inbox_pending': history.db.execute('SELECT count(*) FROM telegram_inbox WHERE done=0').fetchone()[0],
+                      'outbox': dict(history.db.execute('SELECT status,count(*) FROM telegram_outbox GROUP BY status').fetchall())}
+            print(json.dumps({'roles': roles, 'attitudes': attitudes, 'delivery': queues}, ensure_ascii=False, indent=2))
             sys.exit()
         read_only = '--read-only' in sys.argv or os.environ.get('READ_ONLY', '').lower() in ('1', 'true', 'yes')
         bot = Bot(read_only=read_only)

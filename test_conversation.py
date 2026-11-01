@@ -569,7 +569,9 @@ class ConversationTests(unittest.TestCase):
         self.turn(self.dialogue())
         messages = self.b.writer_step.call_args.args[0]
         self.assertEqual([m['role'] for m in messages], ['system', 'user', 'assistant', 'user'])
-        self.assertIn('[2] Рофл → Алексей: МОЙ ПРЕЖНИЙ ОТВЕТ', messages[2]['content'])
+        self.assertEqual(messages[2]['content'], 'МОЙ ПРЕЖНИЙ ОТВЕТ')
+        self.assertIn('"id": 2', messages[1]['content'])
+        self.assertIn('"reply_to": 1', messages[1]['content'])
         self.assertIn('— сегодня,', messages[1]['content'])
         self.assertIn('ЧУЖОЙ ОТВЕТ', messages[3]['content'])
         self.assertIn('[4] Алексей → Рофл', messages[3]['content'])
@@ -662,7 +664,8 @@ class ConversationTests(unittest.TestCase):
         self.assertEqual([m['role'] for m in messages], ['system', 'user', 'assistant', 'user'])
         self.assertNotIn('ЧУЖОЙ ОТВЕТ', json.dumps(messages, ensure_ascii=False))
         self.assertIn('МОЙ ПРЕЖНИЙ ОТВЕТ', messages[2]['content'])
-        self.assertIn('Время сообщения:', messages[2]['content'])
+        self.assertEqual(messages[2]['content'], 'МОЙ ПРЕЖНИЙ ОТВЕТ')
+        self.assertIn('"date":', messages[1]['content'])
         self.assertTrue(all(set(m) == {'role', 'content'} for m in messages))
         self.assertEqual(trace['context_selection']['selected'], 3)
         self.assertNotIn('scores', trace['context_selection'])
@@ -670,6 +673,26 @@ class ConversationTests(unittest.TestCase):
         self.b.joke(current, current['message_id'])
         self.b.select_context.assert_not_called()
         self.assertEqual(self.b.writer_step.call_args.args[0], messages)
+
+    def test_legacy_structured_snapshot_separates_assistant_header_without_changing_snapshot(self):
+        current = self.dialogue()
+        self.turn(current)
+        snapshot, decision = conversation.Store(self.b.history.db).get((-1, 0), 'message:4:4')
+        for turn in snapshot['messages']:
+            turn.pop('assistant_text', None)
+        original = copy.deepcopy(snapshot)
+        self.b.write_turn(current, snapshot, decision, live=False)
+        messages = self.b.writer_step.call_args.args[0]
+        self.assertEqual([m['content'] for m in messages if m['role'] == 'assistant'], ['МОЙ ПРЕЖНИЙ ОТВЕТ'])
+        self.assertEqual(snapshot, original)
+
+    def test_assistant_body_preserves_multiline_code_and_literal_prefixes(self):
+        current = self.dialogue()
+        body = '```py\n  x = 1\n```\nРофл: это буквальный текст ответа.'
+        self.b.history.db.execute("UPDATE messages SET content=? WHERE role='assistant'", (body,))
+        self.turn(current)
+        messages = self.b.writer_step.call_args.args[0]
+        self.assertEqual([m['content'] for m in messages if m['role'] == 'assistant'], [body])
 
     def test_selection_failure_keeps_full_context_and_is_not_retried_on_replay(self):
         current = self.dialogue()
