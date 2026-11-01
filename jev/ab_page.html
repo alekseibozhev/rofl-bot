@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Рофл вслепую</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --card: #ffffff; --ink: #1d1d1b; --muted: #77756f; --line: #e2e0da;
+    --accent: #2f6fdb; --accent-ink: #ffffff; --picked: #e8f0fd; --mono: ui-monospace, Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #161615; --card: #20201e; --ink: #ecebe6; --muted: #9a988f; --line: #34332f;
+            --accent: #6c9cf0; --accent-ink: #0d0d0c; --picked: #24324b; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 980px; margin: 0 auto; padding: 20px 16px 40px; }
+  header { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: baseline; justify-content: space-between; }
+  h1 { font-size: 20px; margin: 0; }
+  .count { color: var(--muted); }
+  .dots { display: flex; flex-wrap: wrap; gap: 4px; margin: 14px 0 18px; }
+  .dot { width: 26px; height: 26px; border: 1px solid var(--line); border-radius: 6px; background: var(--card);
+         color: var(--muted); font-size: 11px; cursor: pointer; padding: 0; }
+  .dot.done { background: var(--picked); color: var(--ink); }
+  .dot.here { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .chat { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+  .before { color: var(--muted); font-size: 14px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .before div + div { margin-top: 3px; }
+  .request { margin-top: 8px; font-weight: 600; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
+  @media (max-width: 700px) { .pair { grid-template-columns: 1fr; } }
+  .answer { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px;
+            min-width: 0; }
+  .answer.chosen { border-color: var(--accent); background: var(--picked); }
+  .label { font-weight: 700; color: var(--accent); margin-bottom: 6px; }
+  .text { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .text.mono { font-family: var(--mono); font-size: 13px; overflow-x: auto; overflow-wrap: normal; }
+  .buttons { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+  button.pick { flex: 1 1 140px; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line);
+                background: var(--card); color: var(--ink); font: inherit; cursor: pointer; }
+  button.pick.on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  button.pick kbd { color: inherit; opacity: .6; font-family: var(--mono); font-size: 12px; margin-left: 6px; }
+  nav { display: flex; gap: 8px; margin-top: 10px; }
+  nav button { padding: 6px 12px; border-radius: 8px; border: 1px solid var(--line); background: transparent;
+               color: var(--muted); font: inherit; cursor: pointer; }
+  .result { margin-top: 26px; padding-top: 14px; border-top: 1px solid var(--line); color: var(--muted);
+            font-size: 14px; }
+  .result .row { display: flex; gap: 8px; margin-top: 6px; }
+  .result input { flex: 1; min-width: 0; font-family: var(--mono); font-size: 13px; padding: 8px;
+                  border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--ink); }
+  .result button { padding: 8px 12px; border-radius: 8px; border: 1px solid var(--accent); background: var(--accent);
+                   color: var(--accent-ink); font: inherit; cursor: pointer; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Какой ответ Рофла лучше?</h1>
+    <span class="count" id="count"></span>
+  </header>
+  <div class="dots" id="dots"></div>
+  <div class="chat">
+    <div class="before" id="before"></div>
+    <div class="request" id="request"></div>
+  </div>
+  <div class="pair">
+    <div class="answer" id="A"><div class="label">A</div><div class="text"></div></div>
+    <div class="answer" id="B"><div class="label">B</div><div class="text"></div></div>
+  </div>
+  <div class="buttons" id="buttons"></div>
+  <nav><button id="prev">← назад</button><button id="next">вперёд →</button></nav>
+  <div class="result">
+    Когда закончишь (или в любой момент), пришли эту строку в чат: «?» — пары без отметки.
+    <div class="row"><input id="code" readonly><button id="copy">Скопировать</button></div>
+  </div>
+</main>
+<script type="application/json" id="items">{{items}}</script>
+<script>
+const items = JSON.parse(document.getElementById('items').textContent);
+const PICKS = [['A', 'A лучше', '1'], ['B', 'B лучше', '2'], ['=', 'одинаково', '3'], ['x', 'оба плохо', '4']];
+const STORE = 'rofl-{{set}}';
+let picks = items.map(() => '');
+try {
+  const saved = JSON.parse(localStorage.getItem(STORE));
+  if (Array.isArray(saved) && saved.length === items.length) picks = saved;
+} catch (e) {}
+let at = Math.max(0, picks.indexOf(''));
+if (picks.indexOf('') < 0) at = 0;
+
+const buttons = document.getElementById('buttons');
+for (const [value, label, key] of PICKS) {
+  const b = document.createElement('button');
+  b.className = 'pick'; b.dataset.value = value;
+  b.innerHTML = `${label}<kbd>${key}</kbd>`;
+  b.onclick = () => pick(value);
+  buttons.appendChild(b);
+}
+const dots = document.getElementById('dots');
+items.forEach((_, n) => {
+  const d = document.createElement('button');
+  d.className = 'dot'; d.textContent = n + 1; d.onclick = () => { at = n; render(); };
+  dots.appendChild(d);
+});
+
+function show(box, text) {
+  const el = box.querySelector('.text');
+  el.textContent = text;
+  el.classList.toggle('mono', text.includes('```'));
+}
+function render() {
+  const item = items[at];
+  document.getElementById('count').textContent =
+    `пара ${at + 1} из ${items.length} · отмечено ${picks.filter(Boolean).length}`;
+  const before = document.getElementById('before');
+  before.replaceChildren(...item.before.map(line => { const d = document.createElement('div'); d.textContent = line; return d; }));
+  document.getElementById('request').textContent = item.request;
+  show(document.getElementById('A'), item.A);
+  show(document.getElementById('B'), item.B);
+  document.getElementById('A').classList.toggle('chosen', picks[at] === 'A');
+  document.getElementById('B').classList.toggle('chosen', picks[at] === 'B');
+  for (const b of buttons.children) b.classList.toggle('on', b.dataset.value === picks[at]);
+  [...dots.children].forEach((d, n) => { d.classList.toggle('done', !!picks[n]); d.classList.toggle('here', n === at); });
+  document.getElementById('code').value = picks.map(p => p || '?').join('');
+}
+function pick(value) {
+  picks[at] = value;
+  try { localStorage.setItem(STORE, JSON.stringify(picks)); } catch (e) {}
+  const next = picks.findIndex((p, n) => !p && n > at);
+  const any = picks.indexOf('');
+  at = next >= 0 ? next : any >= 0 ? any : at;
+  render();
+  window.scrollTo({ top: 0 });
+}
+document.getElementById('prev').onclick = () => { at = Math.max(0, at - 1); render(); };
+document.getElementById('next').onclick = () => { at = Math.min(items.length - 1, at + 1); render(); };
+document.getElementById('copy').onclick = () => {
+  const code = document.getElementById('code');
+  navigator.clipboard?.writeText(code.value).catch(() => {});
+  code.select();
+};
+document.addEventListener('keydown', e => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  const hit = PICKS.find(([, , key]) => key === e.key);
+  if (hit) pick(hit[0]);
+  else if (e.key === 'ArrowLeft') document.getElementById('prev').click();
+  else if (e.key === 'ArrowRight') document.getElementById('next').click();
+});
+render();
+</script>
+</body>
+</html>

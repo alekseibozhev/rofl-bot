@@ -21,12 +21,14 @@ class ConversationTests(unittest.TestCase):
         self.b.me = {'id': 42, 'username': 'test_bot'}
         self.b.history = History(self.path)
         self.b.generate = Mock(return_value='Согласен')
+        self.b.format_answer = Mock(side_effect=lambda text: (text, {'mock': True}))
         self.b.rude = 0
         self.b.setup = Mock(return_value='нет')
         self.counter = 0
         self.b.api = Mock(side_effect=self.send)
         self.b.read = Mock()  # no news from the network unless a test asks
         self.b.direct = Mock(side_effect=lambda snapshot, previous: {"action": "reply" if snapshot["explicit"] else "ignore", "target": snapshot["target"], "attitude": 5, "reconsider": False})
+        self.b.select_context = Mock(return_value={'fallback': True})
         self.b.model = 'deepseek/deepseek-v4.1-flash'
 
     def tearDown(self):
@@ -43,9 +45,7 @@ class ConversationTests(unittest.TestCase):
         return {'message_id': self.counter, 'date': int(time.time())}
 
     def prompt(self):
-        [message] = self.b.generate.call_args.args[0]
-        content = message['content']
-        return content if isinstance(content, str) else content[0]['text']  # a picture goes after the text
+        return '\n\n'.join(bot.text_of(message['content']) for message in self.b.generate.call_args.args[0])
 
     def store(self, message_id, text, topic=0, date=None, name='User 9'):
         self.b.history.add_message((-100123, topic), {'message_id': message_id, 'date': date or time.time(),

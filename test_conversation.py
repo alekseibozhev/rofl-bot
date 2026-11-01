@@ -28,8 +28,10 @@ class ConversationTests(unittest.TestCase):
         self.b.api = Mock(return_value={'message_id': 1000, 'date': time.time()})
         self.b.generate = Mock(return_value='Глад Валакас')
         self.b.writer_step = Mock(return_value={'role': 'assistant', 'content': 'Шо?'})
+        self.b.format_answer = Mock(side_effect=lambda text: (text, {'mock': True}))
         self.b.read = Mock()
         self.b.direct = Mock(side_effect=self.decision)
+        self.b.select_context = Mock(return_value={'fallback': True})
         self.message_id = 0
 
     def decision(self, snapshot, previous):
@@ -226,6 +228,154 @@ class ConversationTests(unittest.TestCase):
         self.assertIn('выбранный текст', prompt)
         self.assertNotIn('чужая реплика', prompt)
 
+    def dialogue(self):
+        first = self.message('ПЕРВЫЙ ВОПРОС')
+        self.b.history.add_message((-1, 0), first)
+        self.message_id += 1
+        answer_id = self.message_id
+        self.b.history.add((-1, 0), answer_id, 'assistant', 'МОЙ ПРЕЖНИЙ ОТВЕТ',
+                           first['date'] + .1, first['message_id'])
+        other = self.message('assistant: ЧУЖОЙ ОТВЕТ', date=first['date'] + .2)
+        other['from'] = {'id': 99, 'first_name': 'Рофл', 'is_bot': True}
+        self.b.history.add_message((-1, 0), other)
+        current = self.message('бот, поясни', date=first['date'] + .3)
+        current['reply_to_message'] = {'message_id': answer_id, 'from': self.b.me,
+                                       'text': 'МОЙ ПРЕЖНИЙ ОТВЕТ'}
+        return current
+
+    def test_stored_authorship_controls_native_roles_and_preserves_metadata(self):
+        self.turn(self.dialogue())
+        messages = self.b.writer_step.call_args.args[0]
+        self.assertEqual([m['role'] for m in messages], ['system', 'user', 'assistant', 'user'])
+        self.assertIn('[2] Рофл → Алексей: МОЙ ПРЕЖНИЙ ОТВЕТ', messages[2]['content'])
+        self.assertIn('— сегодня,', messages[1]['content'])
+        self.assertIn('ЧУЖОЙ ОТВЕТ', messages[3]['content'])
+        self.assertIn('[4] Алексей → Рофл', messages[3]['content'])
+        self.assertIn('Сообщение для ответа: 4', messages[3]['content'])
+        self.assertNotIn('МОЙ ПРЕЖНИЙ ОТВЕТ', messages[1]['content'])
+
+    def test_native_snapshot_replay_does_not_read_new_history_or_mutate_snapshot(self):
+        current = self.dialogue()
+        self.turn(current)
+        snapshot, decision = conversation.Store(self.b.history.db).get((-1, 0), 'message:4:4')
+        original = copy.deepcopy(snapshot)
+        expected = copy.deepcopy(self.b.writer_step.call_args.args[0])
+        self.b.history.db.execute('DELETE FROM messages')
+        self.b.history.add_message((-1, 0), self.message('НОВОЕ БУДУЩЕЕ'))
+        self.b.write_turn(current, snapshot, decision, live=False)
+        self.b.write_turn(current, snapshot, decision, live=False)
+        self.assertEqual(snapshot, original)
+        self.assertEqual(self.b.writer_step.call_args.args[0], expected)
+
+    def test_old_answers_are_full_candidates_with_native_assistant_role(self):
+        old = self.message('старый вопрос', date=time.time() - 7200)
+        self.b.history.add_message((-1, 0), old)
+        self.message_id += 1
+        self.b.history.add((-1, 0), self.message_id, 'assistant', 'старый ответ', old['date'] + 1, old['message_id'])
+        self.turn(self.message('бот, новая тема'))
+        messages = self.b.writer_step.call_args.args[0]
+        self.assertEqual([m['role'] for m in messages], ['system', 'user', 'assistant', 'user'])
+        self.assertIn('старый ответ', messages[2]['content'])
+        self.assertNotIn('[ответил]', json.dumps(self.b.direct.call_args.args[0], ensure_ascii=False))
+
+    def test_image_and_tool_cycle_follow_native_history(self):
+        current = self.dialogue()
+        current['photo'] = [{'file_id': 'x'}]
+        self.b.image = Mock(return_value='data:image/jpeg;base64,AA==')
+        self.b.writer_tool = Mock(return_value='данные инструмента')
+        self.b.writer_step.side_effect = [
+            {'role': 'assistant', 'content': None, 'tool_calls': [
+                {'id': 't1', 'type': 'function', 'function': {'name': 'news', 'arguments': '{}'}}]},
+            {'role': 'assistant', 'content': 'ответ с картинкой'}]
+        self.turn(current)
+        messages = self.b.writer_step.call_args.args[0]
+        self.assertEqual([m['role'] for m in messages], ['system', 'user', 'assistant', 'user', 'assistant', 'tool'])
+        self.assertEqual(messages[3]['content'][1]['type'], 'image_url')
+        self.assertIn('МОЙ ПРЕЖНИЙ ОТВЕТ', messages[2]['content'])
+        self.assertEqual(messages[-1]['tool_call_id'], 't1')
+
+    def test_ollama_also_receives_native_history(self):
+        self.b.openrouter = False
+        self.turn(self.dialogue())
+        messages = self.b.generate.call_args.args[0]
+        self.assertEqual([m['role'] for m in messages], ['user', 'assistant', 'user'])
+        self.assertIn('МОЙ ПРЕЖНИЙ ОТВЕТ', messages[1]['content'])
+
+    def test_context_selection_preserves_background_and_mandatory_followups(self):
+        turns = [dict(id=i, reply_to=parent, role=role, date='2026-11-01T12:00:00', content=text)
+                 for i, parent, role, text in [
+                     (1, None, 'user', 'NAS отвалился'),
+                     (2, 1, 'assistant', 'ПОЛНЫЙ ОТВЕТ ' * 80),
+                     (3, None, 'user', 'посторонняя игра'),
+                     (4, 2, 'user', 'бот, что с коробкой?'),
+                     (5, None, 'user', 'и почему второй раз за неделю?')]]
+        snapshot = dict(messages=turns, target=4, through=5)
+        original = copy.deepcopy(snapshot)
+        post = Mock(return_value={'answers': {str(i): {'noul': .5 if i == 1 else .1} for i in (1, 2, 3, 5)},
+                                  'usage': {'cost': .001}})
+        result = conversation.select_context(post, 'key', snapshot, 4)
+        self.assertEqual(result['ids'], [1, 2, 4, 5])
+        state = post.call_args.args[1]['state']
+        self.assertLess(len(state['messages'][1]['text']), 260)
+        self.assertEqual(state['immediate_reply_parent']['text'], turns[1]['content'])
+        self.assertEqual(state['current_message']['text'], turns[3]['content'])
+        self.assertEqual(snapshot, original)
+        self.assertEqual(result['jev']['cost'], .001)
+
+    def test_invalid_selection_is_rejected_instead_of_silently_dropping_context(self):
+        snapshot = {'target': 2, 'messages': [
+            {'id': 1, 'reply_to': None, 'role': 'user', 'date': 'now', 'content': 'фон'},
+            {'id': 2, 'reply_to': None, 'role': 'user', 'date': 'now', 'content': 'бот'}]}
+        for answers in ({}, ['1'], {'999': {'noul': 1}}, {'1': {'noul': True}}, {'1': {'noul': float('nan')}},
+                        {'1': {'noul': 1.1}}, {'1': {'noul': '0.5'}}, {'1': {'choice': 'keep'}}):
+            with self.subTest(answers=answers), self.assertRaises(RuntimeError):
+                conversation.select_context(Mock(return_value={'answers': answers}), 'key', snapshot, 2)
+
+    def test_selected_originals_reach_author_and_saved_ids_are_reused(self):
+        current = self.dialogue()
+        self.b.select_context.return_value = {'ids': [1, 2, 4], 'scores': {'3': .1}, 'candidates': 4,
+                                              'threshold': .5, 'jev': {'cost': .002}}
+        _, trace = self.turn(current)
+        messages = copy.deepcopy(self.b.writer_step.call_args.args[0])
+        self.assertEqual([m['role'] for m in messages], ['system', 'user', 'assistant', 'user'])
+        self.assertNotIn('ЧУЖОЙ ОТВЕТ', json.dumps(messages, ensure_ascii=False))
+        self.assertIn('МОЙ ПРЕЖНИЙ ОТВЕТ', messages[2]['content'])
+        self.assertIn('Время сообщения:', messages[2]['content'])
+        self.assertTrue(all(set(m) == {'role', 'content'} for m in messages))
+        self.assertEqual(trace['context_selection']['selected'], 3)
+        self.assertNotIn('scores', trace['context_selection'])
+        self.b.select_context.reset_mock()
+        self.b.joke(current, current['message_id'])
+        self.b.select_context.assert_not_called()
+        self.assertEqual(self.b.writer_step.call_args.args[0], messages)
+
+    def test_selection_failure_keeps_full_context_and_is_not_retried_on_replay(self):
+        current = self.dialogue()
+        self.b.select_context.side_effect = RuntimeError('offline')
+        _, trace = self.turn(current)
+        self.assertTrue(trace['context_selection']['fallback'])
+        self.assertIn('ЧУЖОЙ ОТВЕТ', json.dumps(self.b.writer_step.call_args.args[0], ensure_ascii=False))
+        self.b.select_context.reset_mock()
+        self.b.joke(current, current['message_id'])
+        self.b.select_context.assert_not_called()
+
+    def test_silence_reactions_and_director_failures_do_not_call_selector(self):
+        for action in ('ignore', 'react'):
+            self.b.direct.side_effect = lambda s, p: {**self.decision(s, p), 'action': action}
+            self.turn()
+        self.b.direct.side_effect = RuntimeError('offline')
+        self.turn()
+        self.b.select_context.assert_not_called()
+
+    def test_selector_cost_is_counted_only_on_new_selection(self):
+        current = self.message()
+        self.b.select_context.return_value = {'ids': [current['message_id']], 'candidates': 1,
+                                              'jev': {'cost': .002}}
+        _, first = self.turn(current)
+        _, repeated = self.b.joke(current, current['message_id'])
+        self.assertAlmostEqual(first['cost'], .003)
+        self.assertEqual(repeated['cost'], 0)
+
     def test_news_markup_is_sent_as_html_but_history_keeps_original(self):
         answer = '**Новости.** [Источник](https://example.com/?a=1&b=2) <текст>'
         self.b.deliver(self.message(), answer, {'target': 1}, request=1)
@@ -294,6 +444,79 @@ class ConversationTests(unittest.TestCase):
         m = self.message()
         snapshot = {'context': ''}
         self.b.writer_tool('participants', {'all': True}, m, snapshot, live=False)
+        self.b.api.assert_not_called()
+
+    def test_history_lookup_is_scoped_and_excludes_future_in_replay(self):
+        now = time.time()
+        parent = self.message('старый вопрос', date=now - 100)
+        self.b.history.add_message((-1, 0), parent)
+        self.message_id += 1
+        self.b.history.add((-1, 0), 2, 'assistant', 'Придумал ник: Ёлкин', now - 90, 1)
+        self.b.history.add_message((-1, 0), self.message('соседняя реплика', date=now - 80))
+        self.b.history.add_message((-1, 0), self.message('ник БУДУЩЕЕ ПО ВРЕМЕНИ', date=now + 50))
+        current = self.message('бот, какой ник?', date=now)
+        self.b.history.add_message((-1, 0), current)
+        self.b.history.add_message((-1, 0), self.message('ник БУДУЩЕЕ ПО ID', date=now - 10))
+        self.b.history.add_message((-2, 0), self.message('ник ДРУГОЙ ЧАТ', chat=-2, date=now - 10))
+        self.b.history.add_message((-1, 5), self.message('ник ДРУГАЯ ТЕМА', topic=5, date=now - 10))
+        before = self.b.history.db.total_changes
+        result = json.loads(self.b.writer_tool('lookup_history', {'query': 'НИК', 'limit': 1, 'chat': -2},
+                                             current, {'target': current['message_id'], 'date': now}, live=False))
+        self.assertEqual(result['matched_ids'], [2])
+        self.assertEqual([m['id'] for m in result['messages']], [1, 2, 3])
+        self.assertEqual(result['messages'][1]['role'], 'assistant')
+        self.assertEqual(result['messages'][1]['author'], 'Рофл')
+        self.assertEqual(self.b.history.db.total_changes, before)
+        self.b.api.assert_not_called()
+        self.assertEqual(self.b.history.lookup((-1, 0), 'елк', 5, now)['matched_ids'], [2])
+
+    def test_history_lookup_keeps_other_bots_external_and_returns_matching_excerpt(self):
+        now = time.time()
+        external = self.message('длинно ' * 200 + 'уникальныймаркер найден', date=now - 20)
+        external['from'] = {'id': 99, 'first_name': 'oracle', 'is_bot': True}
+        self.b.history.add_message((-1, 0), external)
+        result = self.b.history.lookup((-1, 0), 'уникальныймаркер', 2, now)
+        match = result['messages'][0]
+        self.assertEqual(match['role'], 'user')
+        self.assertEqual(match['author'], 'oracle (бот)')
+        self.assertIn('уникальныймаркер', match['text'])
+        self.assertTrue(match['truncated'])
+        self.assertGreater(match['excerpt_start'], 0)
+        self.assertLessEqual(len(match['text']), 500)
+
+    def test_history_lookup_bounds_results_and_validates_inputs(self):
+        now = time.time()
+        for i in range(35):
+            self.b.history.add_message((-1, 0), self.message('ников много ' + 'x' * 600, date=now - 100 + i))
+        result = self.b.history.lookup((-1, 0), 'ник', 36, now, limit=8)
+        self.assertEqual(result['total_matches'], 35)
+        self.assertEqual(len(result['matched_ids']), 8)
+        self.assertLessEqual(len(result['messages']), 20)
+        self.assertTrue(all(len(m['text']) <= 500 for m in result['messages']))
+        current = self.message()
+        for args in ({}, {'query': []}, {'query': 'x' * 201}, {'query': '%_'},
+                     {'query': 'ник', 'limit': True}, {'query': 'ник', 'limit': 9}):
+            with self.subTest(args=args):
+                self.assertIn('error', json.loads(self.b.writer_tool('lookup_history', args, current,
+                                                                  {'date': now}, live=False)))
+        empty = self.b.history.lookup((-1, 0), 'ничегонепохожего', 36, now)
+        self.assertEqual(empty['messages'], [])
+        self.assertIn('Удалённая история недоступна', empty['note'])
+
+    def test_author_can_lookup_history_then_continue_without_external_calls(self):
+        old = self.message('Мне понравился ник Паяснитель', date=time.time() - 60)
+        self.b.history.add_message((-1, 0), old)
+        self.b.writer_step.side_effect = [
+            {'role': 'assistant', 'content': None, 'tool_calls': [{'id': 'h1', 'type': 'function',
+                'function': {'name': 'lookup_history', 'arguments': '{"query":"ник"}'}}]},
+            {'role': 'assistant', 'content': 'Ты выбрал Паяснителя.'}]
+        answer, trace = self.turn(self.message('бот, что мы выбрали?'), live=False)
+        self.assertEqual(answer, 'Ты выбрал Паяснителя.')
+        self.assertEqual(trace['tools'][0]['tool'], 'lookup_history')
+        result = self.b.writer_step.call_args.args[0][-1]
+        self.assertEqual(result['role'], 'tool')
+        self.assertEqual(result['tool_call_id'], 'h1')
+        self.assertIn('Паяснитель', result['content'])
         self.b.api.assert_not_called()
 
     def test_image_reaches_writer_with_short_exposition(self):
@@ -367,14 +590,14 @@ class ConversationTests(unittest.TestCase):
         self.b.api.assert_called_once()
         self.b.direct.assert_called_once()
 
-    def test_writer_requests_functions_with_medium_reasoning_and_records_usage(self):
+    def test_writer_requests_functions_with_high_reasoning_and_records_usage(self):
         response = {'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}],
                     'usage': {'prompt_tokens': 12, 'completion_tokens': 4, 'cost': .02}}
         with self.b.counting() as usage, patch('bot.post', return_value=response) as post:
             answer = bot.Bot.writer_step(self.b, [{'role': 'user', 'content': 'hello'}])
         self.assertEqual(answer['content'], 'ok')
         payload = post.call_args.args[1]
-        self.assertEqual(payload['reasoning'], {'effort': 'medium'})
+        self.assertEqual(payload['reasoning'], {'effort': 'high'})
         self.assertEqual(payload['tools'], conversation.TOOLS)
         self.assertEqual(usage[0]['output_tokens'], 4)
         self.assertEqual(usage[0]['cost'], .02)
@@ -428,6 +651,92 @@ class ConversationTests(unittest.TestCase):
         _, first = self.turn()
         self.assertEqual(first['cost'], .001)
         self.assertIsNone(self.b.usage)
+
+    def test_formatter_runs_after_author_and_skips_silence_and_reactions(self):
+        self.b.writer_step.return_value = {'role': 'assistant', 'content': 'Исходный ответ'}
+        def format_answer(text):
+            self.b.usage.append({'cost': .0001, 'stage': 'formatter'})
+            return '**Исходный ответ**', {'cost': .0001}
+        self.b.format_answer.side_effect = format_answer
+        answer, trace = self.turn()
+        self.assertEqual(answer, '**Исходный ответ**')
+        self.assertEqual(trace['formatter']['cost'], .0001)
+        self.assertAlmostEqual(trace['cost'], .0011)
+        self.assertNotIn('reaction', trace)
+        self.b.format_answer.assert_called_once_with('Исходный ответ')
+        self.b.format_answer.reset_mock()
+        for action in ('react', 'ignore'):
+            self.b.direct.side_effect = lambda snapshot, previous, action=action: {
+                **self.decision(snapshot, previous), 'action': action}
+            self.turn()
+        self.b.format_answer.assert_not_called()
+
+    def test_aliases_link_name_handle_and_id_without_rewriting_message_text(self):
+        author = self.message('Это мой бот.')
+        author['from'].update(first_name='Andrew', username='oxgrb')
+        self.b.history.add_message((-1, 0), author)
+        current = self.message('бот, пусть @oxgrb поправит промпт')
+        current['from'] = {'id': 99, 'first_name': 'Andrew', 'username': 'another_andrew'}
+        # The current participant cache must not alter historical authors or literal mentions.
+        self.b.history.remember(-1, {'id': 7, 'first_name': 'Будущее имя', 'username': 'oxgrb'})
+        self.turn(current)
+        snapshot = self.b.direct.call_args.args[0]
+        self.assertIn('user_id=7: Andrew (@oxgrb)', snapshot['participants_context'])
+        self.assertIn('user_id=99: Andrew (@another_andrew)', snapshot['participants_context'])
+        self.assertIn('Andrew (@oxgrb): Это мой бот.', snapshot['context'])
+        self.assertIn('пусть @oxgrb поправит промпт', snapshot['context'])
+        self.assertNotIn('Будущее имя', snapshot['context'])
+        self.assertIn('Andrew (@another_andrew)', snapshot['event'])
+
+    def test_alias_index_survives_selection_and_is_frozen_on_replay(self):
+        author = self.message('Предыдущая реплика')
+        author['from'].update(first_name='Andrew', username='oxgrb')
+        self.b.history.add_message((-1, 0), author)
+        current = self.message('бот, @oxgrb это кто?')
+        self.b.select_context.return_value = {'ids': [current['message_id']]}
+        self.turn(current)
+        snapshot, decision = conversation.Store(self.b.history.db).get((-1, 0), 'message:2:2')
+        prompt = self.b.writer_step.call_args.args[0][1]['content']
+        self.assertIn('user_id=7: Andrew (@oxgrb)', prompt)
+        self.assertNotIn('Предыдущая реплика', prompt)
+        expected = copy.deepcopy(self.b.writer_step.call_args.args[0])
+        self.b.history.db.execute('DELETE FROM messages')
+        self.b.history.remember(-1, {'id': 7, 'first_name': 'Другое имя', 'username': 'oxgrb'})
+        self.b.write_turn(current, snapshot, decision, live=False)
+        self.assertEqual(self.b.writer_step.call_args.args[0], expected)
+        participants = json.loads(self.b.writer_tool('participants', {}, current, snapshot, live=False))
+        self.assertEqual(participants['known']['oxgrb'], 'Andrew')
+        post = Mock(return_value={'answers': {'1': {'noul': .1}}})
+        conversation.select_context(post, 'test-key', snapshot, 2)
+        self.assertEqual(post.call_args.args[1]['state']['participants_context'], snapshot['participants_context'])
+        self.assertIn('user_id=7: Andrew (@oxgrb)', conversation.payload(snapshot, conversation.Store.initial())['state']['context'])
+
+    def test_alias_history_keeps_same_id_changes_and_separates_chat_from_user(self):
+        old = self.message('раньше')
+        old['from'].update(first_name='Andrew', username='oxgrb')
+        new = self.message('теперь')
+        new['from'].update(first_name='Андрей', username='renamed')
+        channel = {'id': 7, 'title': 'Новости', 'username': 'news_channel'}
+        participants = bot.message_participants(old) + bot.message_participants(new)
+        participants += bot.message_participants({'sender_chat': channel})
+        text = bot.participant_context(participants, 42)
+        self.assertIn('user_id=7: Andrew (@oxgrb) = Андрей (@renamed)', text)
+        self.assertIn('chat_id=7: Новости (@news_channel)', text)
+
+    def test_reply_and_lookup_retain_alias_evidence_and_lookup_can_find_handle(self):
+        now = time.time()
+        author = self.message('Это мой проект', date=now - 2)
+        author['from'].update(first_name='Andrew', username='oxgrb')
+        self.b.history.add_message((-1, 0), author)
+        reply = self.message('бот, поясни', date=now)
+        reply['reply_to_message'] = author
+        self.assertIn('→ Andrew (@oxgrb)', bot.message_content(reply))
+        lookup = self.b.history.lookup((-1, 0), 'oxgrb', reply['message_id'], now)
+        self.assertEqual(lookup['matched_ids'], [author['message_id']])
+        self.assertEqual(lookup['messages'][0]['author'], 'Andrew (@oxgrb)')
+        self.assertEqual(lookup['messages'][0]['participants'][0]['id'], 7)
+        mention = {'entities': [{'type': 'text_mention', 'user': author['from']}]}
+        self.assertEqual(bot.message_participants(mention)[0]['username'], 'oxgrb')
 
 
 if __name__ == '__main__':

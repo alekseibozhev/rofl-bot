@@ -10,3 +10,9 @@ history.sqlite3*
 searxng/.env
 searxng/config/*.toml
 searxng/config/*.bak
+
+# Experiment code is public; frozen Telegram histories, API dumps and answers stay local.
+jev/*
+!jev/*.py
+!jev/README.md
+!jev/ab_page.html

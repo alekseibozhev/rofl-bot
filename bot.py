@@ -3,6 +3,7 @@
 
 import conversation
 import retrieval
+import formatting
 
 from collections import Counter
 from contextlib import contextmanager, nullcontext
@@ -202,11 +203,59 @@ def person_label(person):
     return name or (f'@{person["username"]}' if person.get('username') else 'Аноним')
 
 
+def identity_label(person):
+    """Keep display name and Telegram handle visibly linked, without rewriting prose."""
+    name = person_label(person)
+    tag = '@' + person['username'] if person.get('username') else ''
+    return f'{name} ({tag})' if tag and name.casefold() != tag.casefold() else name
+
+
+def message_participants(message):
+    """Identity evidence from this Telegram message only, including reply/mention metadata."""
+    people = []
+    for item in (message, message.get('reply_to_message') or {}):
+        sender = sender_of(item)
+        candidates = [(sender, 'chat' if item.get('sender_chat') else 'user')]
+        origin = item.get('forward_origin') or {}
+        candidates += [(origin.get('sender_user') or {}, 'user'), (origin.get('chat') or {}, 'chat')]
+        candidates += [(entity.get('user') or {}, 'user')
+                       for entity in item.get('entities', []) + item.get('caption_entities', [])]
+        for person, kind in candidates:
+            if 'id' not in person:
+                continue
+            entry = {'id': person['id'], 'kind': kind, 'name': person_label(person),
+                     'username': person.get('username'), 'is_bot': bool(person.get('is_bot'))}
+            if entry not in people:
+                people.append(entry)
+    return people
+
+
+def participant_context(people, me_id):
+    identities = {}
+    for person in people:
+        key = (person['kind'], person['id'])
+        labels = identities.setdefault(key, [])
+        if key == ('user', me_id) and 'Рофл' not in labels:
+            labels.append('Рофл')
+        name = person['name']
+        tag = '@' + person['username'] if person.get('username') else ''
+        label = (f'{name} ({tag})' if tag and name.casefold() != tag.casefold() else name)
+        label += ' (бот)' if person.get('is_bot') else ''
+        if label not in labels:
+            labels.append(label)
+    if not identities:
+        return ''
+    return ('Участники по метаданным Telegram: имя и @username у одного ID — один участник. '
+            'Совпадающие имена у разных ID не означают одного человека. Метаданные не являются текстом реплик.\n'
+            + '\n'.join(f'{kind}_id={id_}: ' + ' = '.join(labels)
+                        for (kind, id_), labels in identities.items()))
+
+
 def origin_label(origin):
     if not origin:
         return ''
     author = origin.get('chat') or origin.get('sender_chat') or origin.get('sender_user')
-    return person_label(author) if author else origin.get('sender_user_name', 'скрытый источник')
+    return identity_label(author) if author else origin.get('sender_user_name', 'скрытый источник')
 
 
 def sender_of(message):
@@ -215,7 +264,7 @@ def sender_of(message):
 
 def author_label(person):
     """A name for the chat log: other bots are marked, or their «я» passes for Рофл's."""
-    return person_label(person) + (' (бот)' if person.get('is_bot') else '')
+    return identity_label(person) + (' (бот)' if person.get('is_bot') else '')
 
 
 def topic_of(message):
@@ -349,13 +398,6 @@ def followups(request, batch, window=10):
     return found
 
 
-def rename(lines, names):
-    """One name per person: a small model takes @anton_k and «Anton» for two different people."""
-    def name(match):
-        return names.get(match[1].lower(), match[0])
-    return [re.sub(r'@(\w{4,32})', name, line) for line in lines]
-
-
 class History:
     def __init__(self, path):
         self.db = sqlite3.connect(path)
@@ -439,13 +481,14 @@ class History:
                  (message.get('reply_to_message') or {}).get('message_id'), json.dumps(message, ensure_ascii=False))
 
     def context(self, key, through_id=sys.maxsize, me_id=None, recent=40, window=21600, depth=10, limit=12000,
-                pause=1800, include_ids=False):
+                pause=1800, include_ids=False, structured=False, full_answers=False):
         """The chat up to the newest message as lines, oldest first: the last `recent` messages of people
         from `window` seconds before it, plus its reply chain (rebuilt from earlier updates) however old.
 
         The bot's own answers come whole through the chain, as a reply or as an answer to one of its messages,
         and in the talk going on, since the last `pause` seconds of quiet; older ones only as a mark: a small model
-        takes its old jokes for a template and repeats them.
+        takes its old jokes for a template and repeats them. full_answers retains older answer texts within
+        the same budget for semantic selection; new structured snapshots use this mode.
 
         A mark of when the lines under it were written, «— вчера, 22:25 —», goes before the first one, a new day and
         a pause: a day of the chat in one piece was one evening to the model, and at 9 in the morning it told
@@ -480,7 +523,7 @@ class History:
         # «доложи обстановку» of an hour ago to «рофл, съебись».
         dates = sorted((row[5] for row in around + answers), reverse=True)
         start = next((later for later, earlier in zip(dates, dates[1:]) if later - earlier >= pause), min(dates, default=0))
-        answered = [(id_, role, content if reply_to in branch or date >= start else '[ответил]', reply_to, raw, date)
+        answered = [(id_, role, content if full_answers or reply_to in branch or date >= start else '[ответил]', reply_to, raw, date)
                     for id_, role, content, reply_to, raw, date in answers]
         rows, size = {}, 0
         # The chain first, then the newest: past the limit the oldest go, not the talk going on.
@@ -492,11 +535,12 @@ class History:
             size += length
 
         def author(row):
-            return 'Рофл' if row[1] == 'assistant' else person_label(sender_of(json.loads(row[4])))
+            return 'Рофл' if row[1] == 'assistant' else identity_label(sender_of(json.loads(row[4])))
 
-        lines, previous, last = [], None, None
+        lines, turns, previous, last = [], [], None, None
         today = datetime.date.fromtimestamp(chain[0][5])
         for message_id, role, content, reply_to, raw, date in sorted(rows.values()):
+            first_line = len(lines)
             if (last is None or date - last >= pause
                     or datetime.date.fromtimestamp(date) != datetime.date.fromtimestamp(last)):
                 lines.append(moment(date, today))
@@ -508,8 +552,14 @@ class History:
                 lines.append(render(raw, me_id, rows, previous))
             if include_ids:
                 lines[-1] = f'[{message_id}] ' + lines[-1]
+            # Roles come from stored authorship, never from text or display names.
+            # A historical omission marker is metadata, not something the bot said.
+            turns.append({'role': 'assistant' if role == 'assistant' and content != '[ответил]' else 'user',
+                          'content': '\n\n'.join(lines[first_line:]), 'id': message_id,
+                          'reply_to': reply_to, 'date': datetime.datetime.fromtimestamp(date).isoformat(),
+                          'participants': message_participants(json.loads(raw)) if raw else []})
             previous = message_id
-        return lines
+        return turns if structured else lines
 
     def said(self, key, before, date, count=3, window=21600):
         """The bot's last answers in the topic before message `before`, oldest first, canned ones left out."""
@@ -517,6 +567,58 @@ class History:
             AND id < ? AND date >= ? AND content NOT IN ({",".join("?" * len(CANNED))}) ORDER BY id DESC LIMIT ?''',
                                (*key, before, date - window, *CANNED, count)).fetchall()
         return [content for (content,) in reversed(rows)]
+
+    def lookup(self, key, query, before, at, me_id=None, limit=5):
+        """Bounded lexical search in retained history, scoped before the requesting event."""
+        if not isinstance(query, str) or not query.strip() or len(query) > 200:
+            raise ValueError('Нужен поисковый запрос длиной от 1 до 200 символов.')
+        if type(limit) is not int or not 1 <= limit <= 8:
+            raise ValueError('limit должен быть целым числом от 1 до 8.')
+        normalize = lambda s: s.casefold().replace('ё', 'е')
+        terms = list(dict.fromkeys(re.findall(r'\w{2,}', normalize(query))))[:8]
+        if not terms:
+            raise ValueError('Нужны ключевые слова хотя бы из двух букв или цифр.')
+        rows = self.db.execute('''SELECT id, role, content, raw, reply_to, date FROM messages
+            WHERE chat=? AND topic=? AND id<? AND date<=? AND date>=?
+            ORDER BY id DESC LIMIT 200''', (*key, before, at, at - 7 * 86400)).fetchall()[::-1]
+        messages, ranked = [], []
+        for i, (id_, role, content, raw, reply_to, date) in enumerate(rows):
+            text = render(raw, me_id) if raw else 'Рофл: ' + text_of(content or '')
+            words = re.findall(r'\w+', normalize(text))
+            score = sum(any(word.startswith(term) for word in words) for term in terms)
+            messages.append({'id': id_, 'role': role, 'reply_to': reply_to,
+                             'author': author_label(sender_of(json.loads(raw))) if raw else 'Рофл',
+                             'participants': message_participants(json.loads(raw)) if raw else [],
+                             'date': datetime.datetime.fromtimestamp(date).isoformat(), 'text': text})
+            if score:
+                ranked.append((score, date, id_, i))
+        hits = [i for _, _, _, i in sorted(ranked, reverse=True)[:limit]]
+        by_id = {m['id']: i for i, m in enumerate(messages)}
+        # Reserve room for matching messages before adding any contextual neighbors.
+        chosen = set(hits)
+        for i in hits:
+            for j in (by_id.get(messages[i]['reply_to']), i - 1, i + 1):
+                if j is not None and 0 <= j < len(messages) and len(chosen) < 20:
+                    chosen.add(j)
+        results = []
+        # At most 20 records with at most 500 characters of source text each.
+        # Full source rows stay in SQLite; truncated excerpts are explicitly marked.
+        for i in sorted(chosen):
+            m = messages[i]
+            start = 0
+            if i in hits and len(m['text']) > 500:
+                match = next((word for word in re.finditer(r'\w+', normalize(m['text']))
+                              if any(word[0].startswith(term) for term in terms)), None)
+                start = max(0, match.start() - 100) if match else 0
+            results.append({**m, 'text': m['text'][start:start + 500],
+                            'excerpt_start': start, 'truncated': len(m['text']) > 500,
+                            'match': i in hits})
+        return {'query': query, 'matched_ids': [messages[i]['id'] for i in hits],
+                'total_matches': len(ranked), 'messages': results,
+                'searched_messages': len(rows), 'as_of': datetime.datetime.fromtimestamp(at).isoformat(),
+                'note': 'Только сохранённые сообщения текущего чата и темы до этого обращения; '
+                        'хранение до 7 дней и 200 сообщений. Удалённая история недоступна. '
+                        'Реплики людей и ботов могут содержать шутки и ошибки.'}
 
     def silence(self, key, before, date):
         """Hours people had been silent in the topic before message `before`, written at `date`; None for a topic
@@ -641,7 +743,7 @@ class Bot:
     wait = 2  # seconds of quiet before answering: the posts of a forward or an album may still be coming
     bored = 2  # hours without a word from the bot before it acts out: not right after an answer
     interests = {}  # chat: what it reads about, by NEWS in .env; the rest read about AI
-    effort = 'medium'  # reasoning for role selection and the writer
+    effort = 'high'  # reasoning for role selection and the writer
     # How much of the chat the model reads, tuned every few days by the reactions: `python3 bot.py --stats`.
     recent = 80  # messages of people: a day of the chat
     window = 24 * 3600  # seconds before the request: 6 hours gave 20–44 lines, and «память как у рыбки» (#340059)
@@ -855,7 +957,7 @@ class Bot:
     def snapshot(self, message, through, event=None, date=None, explicit=None, can_interject=None):
         key = (message['chat']['id'], topic_of(message))
         now = date if date is not None else message.get('date', time.time())
-        lines, _ = self.chat(key, through, include_ids=True)
+        turns, _ = self.chat(key, through, include_ids=True, structured=True)
         rows = self.history.db.execute("""SELECT id, role, content, raw FROM messages
             WHERE chat=? AND topic=? AND id<=? AND date>=? AND date<=?
             ORDER BY date DESC, id DESC LIMIT 8""", (*key, through, now - self.window, now)).fetchall()
@@ -867,13 +969,24 @@ class Bot:
         reactions = self.history.db.execute("""SELECT r.id, r.emoji FROM reactions r JOIN answers a
             ON a.chat=r.chat AND a.id=r.id WHERE a.chat=? AND a.topic=? AND r.date<=?
             AND r.date>? ORDER BY r.date DESC LIMIT 20""", (*key, now, now - self.window)).fetchall()
-        context = CHAT + '\n\n'.join(lines)
+        context = CHAT + '\n\n'.join(turn['content'] for turn in turns)
+        people = []
+        for person in [p for turn in turns for p in turn.get('participants', [])] + message_participants(message):
+            if person not in people:
+                people.append(person)
+        aliases = participant_context(people, self.me['id'])
+        if aliases:
+            context = aliases + '\n\n' + context
+        reaction_context = ''
         if reactions:
-            context += '\n\nРеакции на сообщения Рофла: ' + json.dumps(reactions, ensure_ascii=False)
-        return {'context': context, 'event': (f'В чате пауза. Возможность вступить в разговор. {event}' if event and event.startswith('idle:') else
-                          f"{person_label(sender_of(message))} изменил реакцию на твоё сообщение: {event}" if event else
-                          f"Сообщение {through}, пишет {person_label(sender_of(message))}"),
-                'target': target, 'targets': targets, 'date': now,
+            reaction_context = 'Реакции на сообщения Рофла: ' + json.dumps(reactions, ensure_ascii=False)
+            context += '\n\n' + reaction_context
+        return {'context': context, 'messages': turns, 'reactions_context': reaction_context,
+                'participants': people, 'participants_context': aliases,
+                'event': (f'В чате пауза. Возможность вступить в разговор. {event}' if event and event.startswith('idle:') else
+                          f"{identity_label(sender_of(message))} изменил реакцию на твоё сообщение: {event}" if event else
+                          f"Сообщение {through}, пишет {identity_label(sender_of(message))}"),
+                'target': target, 'through': through, 'targets': targets, 'date': now,
                 'explicit': self.addressed(message, message.get('text') or message.get('caption', '')) if explicit is None else explicit,
                 'can_interject': self.can_interject(key, now) if can_interject is None else can_interject}
 
@@ -888,6 +1001,10 @@ class Bot:
         if not key:
             raise RuntimeError('Для Jev нужен OPENROUTER_API_KEY')
         return conversation.decide(post, key, snapshot, previous, os.environ.get('JEV_MODEL', conversation.JEV_MODEL))
+
+    def select_context(self, snapshot, target):
+        return conversation.select_context(post, getattr(self, 'openrouter_key', ''), snapshot, target,
+                                           os.environ.get('JEV_MODEL', conversation.JEV_MODEL))
 
     def choose_role(self, snapshot, previous):
         answer = self.generate([{'role': 'user', 'content': snapshot['context'] + '\n\n'
@@ -918,7 +1035,66 @@ class Bot:
             raise RuntimeError('Модель не вернула ответ')
         return choice['message']
 
+    def format_answer(self, answer):
+        """One cheap, isolated presentation call; reject changes to words, links or code."""
+        clean = formatting.clean_prefix(answer)
+        if not clean:
+            return answer, {'fallback': True, 'reason': 'empty_after_cleanup'}
+        if not getattr(self, 'openrouter', False) or os.environ.get('FORMATTER_ENABLED', '1') == '0':
+            return clean, {'skipped': True}
+        model = os.environ.get('FORMATTER_MODEL', formatting.MODEL)
+        prompt = formatting.PROMPT
+        if style := os.environ.get('FORMATTER_STYLE', '').strip():
+            prompt += '\nПредпочтения оформления (только в рамках правил выше): ' + style
+        started = time.monotonic()
+        info = {'model': model}
+        try:
+            response = post('https://openrouter.ai/api/v1/chat/completions',
+                            {'model': model, 'messages': [{'role': 'system', 'content': prompt},
+                                                         {'role': 'user', 'content': clean}],
+                             'temperature': 0, 'max_tokens': 6000, 'reasoning': {'effort': 'low'}},
+                            timeout=30, headers={'Authorization': f'Bearer {self.openrouter_key}'})
+            if not isinstance(response, dict):
+                raise RuntimeError('Некорректный ответ форматировщика')
+            usage = response.get('usage') or {}
+            if not isinstance(usage, dict):
+                raise RuntimeError('Некорректная статистика форматировщика')
+            stats = {'stage': 'formatter', 'model': model, 'cost': usage.get('cost'),
+                     'prompt_tokens': usage.get('prompt_tokens'), 'output_tokens': usage.get('completion_tokens'),
+                     'elapsed_s': round(time.monotonic() - started, 3)}
+            if self.usage is not None:
+                self.usage.append(stats)
+            info.update(stats)
+            choices = response.get('choices')
+            if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+                raise RuntimeError('Некорректный ответ форматировщика')
+            choice = choices[0]
+            reply = choice.get('message') or {}
+            if not isinstance(reply, dict):
+                raise RuntimeError('Некорректный ответ форматировщика')
+            candidate = reply.get('content')
+            if (choice.get('finish_reason') != 'stop' or reply.get('tool_calls')
+                    or not formatting.validate(clean, candidate, telegram_html)):
+                info.update(fallback=True, reason='content_changed_or_incomplete')
+                return clean, info
+            return candidate.strip(), info
+        except RuntimeError as exc:
+            info.update(fallback=True, reason=str(exc))
+            return clean, info
+        finally:
+            info['elapsed_s'] = round(time.monotonic() - started, 3)
+            LOG.info('formatter.response %s', json.dumps(info))
+
     def writer_tool(self, name, args, message, snapshot, live):
+        if name == 'lookup_history':
+            try:
+                result = self.history.lookup((message['chat']['id'], topic_of(message)), args.get('query'),
+                                             snapshot.get('target', message['message_id']),
+                                             snapshot.get('date', message.get('date', time.time())),
+                                             self.me['id'], args.get('limit', 5))
+            except ValueError as exc:
+                return json.dumps({'error': str(exc)}, ensure_ascii=False)
+            return json.dumps(result, ensure_ascii=False)
         if name == 'search':
             query = args.get('query')
             if not isinstance(query, str) or not query.strip():
@@ -938,7 +1114,11 @@ class Bot:
         if name == 'participants':
             chat = message['chat']['id']
             count = self.roster(chat, live=live) if args.get('all') and live else None
-            return json.dumps({'known': self.history.names(chat), 'total': count}, ensure_ascii=False)
+            identities = snapshot.get('participants', [])
+            known = self.history.names(chat) if live else {
+                p['username']: p['name'] for p in identities
+                if p.get('username') and p['kind'] == 'user' and not p.get('is_bot')}
+            return json.dumps({'known': known, 'identities': identities, 'total': count}, ensure_ascii=False)
         if name == 'balance':
             return json.dumps(self.balance(live=live), ensure_ascii=False)
         return 'Неизвестный инструмент.'
@@ -1006,9 +1186,33 @@ class Bot:
                 instruction += 'Текст выбранного сообщения: ' + target['label'] + '\n'
         if decision['action'] == 'react':
             instruction += '\nВыбранное действие: реакция на сообщение. Верни только одно эмодзи.'
-        prompt = snapshot['context'] + '\n\n' + instruction
         image = self.image(message) if message.get('photo') or message.get('sticker') or (message.get('reply_to_message') or {}).get('photo') else None
-        messages = [{'role': 'system', 'content': system}, {'role': 'user', 'content': with_image(prompt, image)}]
+        messages = [{'role': 'system', 'content': system}]
+        if 'messages' in snapshot:
+            prelude = '\n\n'.join(filter(None, [snapshot.get('participants_context'), CHAT.rstrip()]))
+            messages.append({'role': 'user', 'content': prelude})
+            selection = decision.get('context_selection', {})
+            kept = set(selection['ids']) if 'ids' in selection else None
+            for turn in snapshot['messages']:
+                if kept is not None and turn['id'] not in kept:
+                    continue
+                content = turn['content']
+                if kept is not None:
+                    # A removed message may have carried the day's time heading.
+                    content = f"Время сообщения: {turn['date']}\n" + content
+                if turn['role'] == 'user' and messages[-1]['role'] == 'user':
+                    messages[-1]['content'] += '\n\n' + content
+                else:
+                    messages.append({'role': turn['role'], 'content': content})
+            tail = '\n\n'.join(filter(None, [snapshot.get('reactions_context'), instruction]))
+            if messages[-1]['role'] == 'user':
+                messages[-1]['content'] = with_image(messages[-1]['content'] + '\n\n' + tail, image)
+            else:
+                messages.append({'role': 'user', 'content': with_image(tail, image)})
+        else:
+            # Legacy snapshots have no reliable role boundaries. Preserve them exactly;
+            # do not infer assistant roles from names or reconstruct from today's DB.
+            messages.append({'role': 'user', 'content': with_image(snapshot['context'] + '\n\n' + instruction, image)})
         calls = []
         if not self.openrouter:
             return self.generate(messages[1:], system=system), calls
@@ -1077,6 +1281,15 @@ class Bot:
                            if role != previous['role'] or selected and expired else previous['changed_at'])
                 decision['state'] = {'role': role, 'attitude': decision['attitude'], 'changed_at': changed,
                                      'updated_at': snapshot['date']}
+                if decision['action'] == 'reply' and not decision.get('fallback'):
+                    try:
+                        selection = self.select_context(snapshot, decision['target'])
+                        decision['context_selection'] = selection
+                        if selection.get('jev'):
+                            usage.append(selection['jev'])
+                    except RuntimeError as exc:
+                        decision['context_selection'] = {'fallback': True}
+                        LOG.warning('context.selection_failed %s', exc)
                 if live:
                     store.save(key, event_id, snapshot, decision)
             # --morale is retained as a replay-only alias for the new 0–10 scale.
@@ -1086,6 +1299,12 @@ class Bot:
                      'role': decision['state']['role'], 'attitude': decision['state']['attitude'],
                      'role_changed_at': decision['state']['changed_at'], 'jev': decision.get('jev'),
                      'fallback': decision.get('fallback', False)}
+            if decision.get('context_selection'):
+                # Scores stay in SQLite; logs contain counts and costs only.
+                selection = decision['context_selection']
+                trace['context_selection'] = {k: selection[k] for k in ('candidates', 'threshold', 'fallback', 'jev') if k in selection}
+                if 'ids' in selection:
+                    trace['context_selection']['selected'] = len(selection['ids'])
             if decision.get('role_override_until'):
                 trace['role_override_until'] = decision['role_override_until']
             LOG.info('conversation.decision %s', json.dumps({'chat': key[0], 'topic': key[1], **trace}, ensure_ascii=False))
@@ -1099,6 +1318,8 @@ class Bot:
             if decision['action'] == 'react':
                 answer = reaction_of(f'[реакция {answer}]') or '👍'
                 trace['reaction'] = True
+            else:
+                answer, trace['formatter'] = self.format_answer(answer)
             return answer, {**trace, 'tools': calls, **spent(usage)}
 
     def roster(self, chat_id, live=True):
@@ -1114,11 +1335,13 @@ class Bot:
             return 0
         return count
 
-    def chat(self, key, through=sys.maxsize, include_ids=False):
-        """The chat up to message `through` as lines for the model, one name per person, and the names by username."""
+    def chat(self, key, through=sys.maxsize, include_ids=False, structured=False):
+        """Historical author labels retain handles; never rewrite text using today's alias map."""
         names = {**self.history.names(key[0]), self.me['username'].lower(): 'Рофл'}
-        return rename(self.history.context(key, through, self.me['id'], self.recent, self.window,
-                                           limit=self.limit, pause=self.pause, include_ids=include_ids), names), names
+        context = self.history.context(key, through, self.me['id'], self.recent, self.window,
+                                       limit=self.limit, pause=self.pause, include_ids=include_ids, structured=structured,
+                                       full_answers=structured)
+        return context, names
 
     @contextmanager
     def counting(self):
