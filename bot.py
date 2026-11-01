@@ -758,7 +758,8 @@ class Bot:
     openrouter = False
     max_age = 86400  # Telegram keeps updates for a day: whatever was asked while the bot was off gets its answer
     wait = 2  # seconds of quiet before answering: the posts of a forward or an album may still be coming
-    bored = 2  # hours without a word from the bot before it acts out: not right after an answer
+    bored = 2  # hours without a word from the bot before a scheduled idle initiative
+    interjection_pause = 5 * 60  # seconds after any bot reply before unsolicited words
     interests = {}  # chat: what it reads about, by NEWS in .env; the rest read about AI
     effort = 'high'  # reasoning for role selection and the writer
     # How much of the chat the model reads, tuned every few days by the reactions: `python3 bot.py --stats`.
@@ -1009,14 +1010,16 @@ class Bot:
         if reactions:
             reaction_context = 'Реакции на сообщения Рофла (message_id, user_id, emoji): ' + json.dumps(reactions, ensure_ascii=False)
             context += '\n\n' + reaction_context
+        explicit = self.addressed(message, message.get('text') or message.get('caption', '')) if explicit is None else explicit
         return {'context': context, 'messages': turns, 'reactions_context': reaction_context,
                 'participants': people, 'participants_context': aliases,
                 'event': (f'В чате пауза. Возможность вступить в разговор. {event}' if event and event.startswith('idle:') else
                           f"{identity_label(sender_of(message))} изменил реакцию на твоё сообщение: {event}" if event else
                           f"Сообщение {through}, пишет {identity_label(sender_of(message))}"),
                 'target': target, 'through': through, 'targets': targets, 'date': now, 'event_user_id': event_user_id,
-                'explicit': self.addressed(message, message.get('text') or message.get('caption', '')) if explicit is None else explicit,
-                'can_interject': self.can_interject(key, now) if can_interject is None else can_interject}
+                'explicit': explicit,
+                'can_interject': explicit or (self.can_interject(key, now) if can_interject is None else can_interject),
+                'can_react': explicit or self.can_react(now)}
 
     def visual_snapshot(self, message, snapshot):
         """Fetch once for Jev and the writer. Image bytes remain transient."""
@@ -1035,11 +1038,16 @@ class Bot:
                 'image_context': {'message_id': source.get('message_id', snapshot['target']),
                                   'available': bool(image), 'jev': bool(prepared)}}
 
+    @staticmethod
+    def can_react(now):
+        """Spontaneous reactions have no cooldown, but still respect quiet hours."""
+        return HOURS[0] <= datetime.datetime.fromtimestamp(now).hour < 24
+
     def can_interject(self, key, now):
-        if not HOURS[0] <= datetime.datetime.fromtimestamp(now).hour < 24:
+        if not self.can_react(now):
             return False
         last = self.history.db.execute('SELECT max(date) FROM messages WHERE chat=? AND topic=? AND role=\'assistant\'', key).fetchone()[0]
-        return last is None or now - last >= self.bored * 3600
+        return last is None or now - last >= self.interjection_pause
 
     def direct(self, snapshot, previous):
         key = getattr(self, 'openrouter_key', '')
@@ -1313,7 +1321,9 @@ class Bot:
                         and (has_picture(message) or has_picture(message.get('reply_to_message') or {}))):
                     decision.update(jev_action=decision['action'], action='reply', target=snapshot['target'],
                                     reply_policy='addressed_image')
-                elif not snapshot['explicit'] and not decision.get('addressed', False) and not snapshot['can_interject']:
+                elif (not snapshot['explicit'] and not decision.get('addressed', False)
+                      and (decision['action'] == 'reply' and not snapshot['can_interject']
+                           or decision['action'] == 'react' and not snapshot['can_react'])):
                     decision['action'] = 'ignore'
                 role = previous['role']
                 override = store.role_override(snapshot['date'])

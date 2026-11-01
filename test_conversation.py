@@ -486,6 +486,88 @@ class ConversationTests(unittest.TestCase):
         self.b.handle(self.message('разговор между людьми'))
         self.b.api.assert_not_called()
 
+    def test_interjection_opens_at_five_minutes_and_is_scoped_to_topic(self):
+        at = datetime.datetime.combine(datetime.date.today(), datetime.time(12)).timestamp()
+        self.b.history.add((-1, 0), 0, 'assistant', 'мой ответ', at)
+        self.assertFalse(self.b.can_interject((-1, 0), at + 299))
+        self.assertTrue(self.b.can_interject((-1, 0), at + 300))
+        self.assertTrue(self.b.can_interject((-1, 1), at + 1))
+        self.assertTrue(self.b.can_interject((-2, 0), at + 1))
+
+    def test_explicit_calls_and_replies_send_no_cooldown_prohibition(self):
+        at = datetime.datetime.combine(datetime.date.today(), datetime.time(2)).timestamp()
+        self.b.history.add((-1, 0), 0, 'assistant', 'мой ответ', at - 1)
+        for text, reply in [('бот, привет', None), ('@test_bot привет', None),
+                            ('и что дальше?', {'message_id': 0, 'from': self.b.me, 'text': 'мой ответ'})]:
+            with self.subTest(text=text):
+                message = self.message(text, date=at)
+                if reply:
+                    message['reply_to_message'] = reply
+                self.turn(message, can_interject=False)
+                snapshot, previous = self.b.direct.call_args.args
+                self.assertTrue(snapshot['explicit'])
+                self.assertTrue(snapshot['can_interject'])
+                self.assertTrue(snapshot['can_react'])
+                # Older externally supplied snapshots get the same normalization.
+                body = conversation.payload({**snapshot, 'can_interject': False, 'can_react': False}, previous)
+                self.assertTrue(body['state']['can_interject'])
+                self.assertTrue(body['state']['can_react'])
+
+    def test_background_reaction_during_cooldown_does_not_restart_it(self):
+        at = datetime.datetime.combine(datetime.date.today(), datetime.time(12)).timestamp()
+        self.b.history.add((-1, 0), 0, 'assistant', 'мой ответ', at)
+        self.b.direct.side_effect = lambda s, p: {**self.decision(s, p), 'action': 'react', 'addressed': False}
+        self.b.writer_step.return_value = {'role': 'assistant', 'content': '🔥'}
+        message = self.message('удачная шутка между людьми', date=at + 30)
+        answer, trace = self.turn(message)
+        snapshot = self.b.direct.call_args.args[0]
+        self.assertFalse(snapshot['can_interject'])
+        self.assertTrue(snapshot['can_react'])
+        self.assertEqual((answer, trace['action']), ('🔥', 'react'))
+        self.b.deliver(message, answer, trace, request=message['message_id'])
+        self.b.api.assert_called_once()
+        self.assertEqual(self.b.api.call_args.args, ('setMessageReaction',))
+        self.b.select_context.assert_not_called()
+        self.assertFalse(self.b.can_interject((-1, 0), at + 299))
+        self.assertTrue(self.b.can_interject((-1, 0), at + 300))
+
+    def test_permission_to_interject_does_not_force_a_reply(self):
+        at = datetime.datetime.combine(datetime.date.today(), datetime.time(12)).timestamp()
+        self.b.history.add((-1, 0), 0, 'assistant', 'мой ответ', at - 300)
+        self.b.direct.side_effect = lambda s, p: {**self.decision(s, p), 'action': 'ignore', 'addressed': False}
+        answer, trace = self.turn(self.message('обычный разговор', date=at))
+        self.assertTrue(self.b.direct.call_args.args[0]['can_interject'])
+        self.assertEqual((answer, trace['action']), ('', 'ignore'))
+        self.b.writer_step.assert_not_called()
+
+    def test_quiet_hours_block_spontaneous_reactions_but_not_implicit_address(self):
+        at = datetime.datetime.combine(datetime.date.today(), datetime.time(2)).timestamp()
+        for addressed in (False, True):
+            for action in ('reply', 'react'):
+                with self.subTest(addressed=addressed, action=action):
+                    self.b.direct.side_effect = lambda s, p: {
+                        **self.decision(s, p), 'action': action, 'addressed': addressed}
+                    _, trace = self.turn(self.message('ну ты выдал', date=at))
+                    snapshot = self.b.direct.call_args.args[0]
+                    self.assertFalse(snapshot['can_interject'])
+                    self.assertFalse(snapshot['can_react'])
+                    self.assertEqual(trace['action'], action if addressed else 'ignore')
+        morning = datetime.datetime.combine(datetime.date.today(), datetime.time(6)).timestamp()
+        self.assertFalse(self.b.can_react(morning - 1))
+        self.assertTrue(self.b.can_react(morning))
+
+    def test_five_minute_pause_does_not_accelerate_scheduled_initiatives(self):
+        at = datetime.datetime.combine(datetime.date.today(), datetime.time(19)).timestamp()
+        self.b.allowed_groups = {-1}
+        self.b.history.add_message((-1, 0), self.message(date=at - 400))
+        self.b.history.add((-1, 0), 0, 'assistant', 'мой ответ', at - 300)
+        self.assertTrue(self.b.can_interject((-1, 0), at))
+        with patch('bot.plan', return_value=6):
+            self.b.idle(at)
+            self.b.direct.assert_not_called()
+            self.b.idle(at + 6900)
+        self.b.direct.assert_called_once()
+
     def test_replay_sends_nothing_and_does_not_change_database(self):
         m = self.message()
         self.turn(m)

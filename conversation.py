@@ -94,6 +94,9 @@ def payload(snapshot, previous):
     targets = {str(m['id']): m['label'] for m in snapshot['targets']}
     targets.setdefault(str(snapshot['target']), 'the event being considered')
     state = {k: snapshot[k] for k in ('context', 'event', 'target', 'targets', 'explicit', 'can_interject')}
+    # Normalize explicit calls even for older snapshots with a raw cooldown flag.
+    state['can_interject'] = snapshot['explicit'] or snapshot['can_interject']
+    state['can_react'] = snapshot['explicit'] or snapshot.get('can_react', True)
     state.update(attitude=previous['attitude'], role_changed_at=previous['changed_at'], now=snapshot['date'])
     state['attitude_user_id'] = snapshot.get('event_user_id')
     state = visual_state(state, snapshot)
@@ -104,8 +107,12 @@ def payload(snapshot, previous):
             'Rofl (also called «бот») participates in this Russian group chat. explicit=true means he was called or replied to. Decide what he should do in response to this event, '
             'using the conversation and who is replying to whom. People may address him implicitly. '
             'Friendly profanity is not necessarily hostility. Criticism of a bad answer is feedback. '
-            'Do not interrupt other people without a worthwhile reason. Respect can_interject=false unless '
-            'the event addresses Rofl. An emoji can acknowledge praise or laughter; a request needs words. A statement addressed to Rofl also invites his response. '
+            'Do not interrupt other people without a worthwhile reason. can_interject limits only unsolicited replies with words: '
+            'when can_interject=false, do not choose reply unless the event addresses Rofl. '
+            'An emoji reaction does not require can_interject=true; it is allowed during the reply cooldown. '
+            'When can_react=false (quiet hours), do not choose react unless the event addresses Rofl. '
+            'Permission to reply or react is not an obligation: choose ignore when there is no worthwhile reason to participate. '
+            'An emoji can acknowledge praise or laughter; a request needs words. A statement addressed to Rofl also invites his response. '
             'When image_context contains an image, inspect it together with its caption, reply parent and conversation. '
             'Decide whether it addresses Rofl or gives him a worthwhile reason to participate. '
             'An image alone does not require a response: ignore, reply and react are all available. '
