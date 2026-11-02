@@ -1269,6 +1269,8 @@ class Bot:
             target = next((m for m in snapshot['targets'] if m['id'] == decision['target']), None)
             if target:
                 instruction += 'Текст выбранного сообщения: ' + target['label'] + '\n'
+        if decision['action'] == 'reply' and decision.get('reply_size'):
+            instruction += 'Ответ: ' + decision['reply_size'] + '.\n'
         if decision['action'] == 'react':
             instruction += '\nВыбранное действие: реакция на сообщение. Верни только одно эмодзи.'
         if '_image' in snapshot:
@@ -1419,6 +1421,8 @@ class Bot:
                     except RuntimeError as exc:
                         decision['context_selection'] = {'fallback': True}
                         LOG.warning('context.selection_failed %s', exc)
+                if decision['action'] == 'reply':
+                    decision['reply_size'] = random.choice(('1–2 фразы', 'один абзац', 'несколько абзацев'))
                 if live:
                     store.save(key, event_id, {k: v for k, v in snapshot.items() if not k.startswith('_')}, decision)
             # --morale is retained as a replay-only alias for the new 0–10 scale.
@@ -1429,6 +1433,8 @@ class Bot:
                      'role_changed_at': decision['state']['changed_at'], 'jev': decision.get('jev'),
                      'fallback': decision.get('fallback', False)}
             trace['generation'] = 'direct-writer-v1'
+            if decision.get('reply_size'):
+                trace['reply_size'] = decision['reply_size']
             if 'attitude_user_id' in decision['state']:
                 trace['attitude_user_id'] = decision['state']['attitude_user_id']
                 trace['relationship'] = decision['relationship']

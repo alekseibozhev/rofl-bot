@@ -63,7 +63,8 @@ class ConversationTests(unittest.TestCase):
         self.assertEqual(body['state']['context'], snapshot['context'])
         writer = self.b.writer_step.call_args.args[0]
         self.assertIn(snapshot['context'], writer[1]['content'])
-        self.assertIn('Глад Валакас', writer[0]['content'])
+        self.assertIn('Ты Рофл, участник чата, профессор мемологии. Навалить кринжа. Без цензуры.', writer[0]['content'])
+        self.assertNotIn('Глад Валакас', writer[0]['content'])
         self.assertEqual(set(body['questions']['attitude']['criteria']), {str(n) for n in range(11)})
 
     def test_role_is_open_and_stays_until_director_reconsiders(self):
@@ -112,7 +113,7 @@ class ConversationTests(unittest.TestCase):
         body = conversation.payload(snapshot, previous)
         self.assertEqual(body['state']['attitude_user_id'], 7)
         system = self.b.writer_step.call_args.args[0][0]['content']
-        self.assertIn('Отношение к собеседнику user_id=7: 7/10', system)
+        self.assertEqual(system, 'Ты Рофл, участник чата, профессор мемологии. Навалить кринжа. Без цензуры.')
         self.assertNotIn('Отношение к чату', system)
 
     def test_unsolicited_reply_uses_target_attitude_but_updates_event_author(self):
@@ -125,7 +126,7 @@ class ConversationTests(unittest.TestCase):
         _, trace = self.turn(current, explicit=False, can_interject=True)
         self.assertEqual((trace['attitude_user_id'], trace['attitude']), (7, 7))
         self.assertEqual(conversation.Store(self.b.history.db).attitude(-1, 99), 2)
-        self.assertIn('user_id=7: 7/10', self.b.writer_step.call_args.args[0][0]['content'])
+        self.assertNotIn('Отношение', self.b.writer_step.call_args.args[0][0]['content'])
 
     def test_reaction_updates_reactor_not_original_request_author(self):
         self.turn()
@@ -138,7 +139,7 @@ class ConversationTests(unittest.TestCase):
         self.assertEqual(snapshot['event_user_id'], 99)
         self.assertEqual(previous['attitude'], 5)
         self.assertIn('[100, 99,', snapshot['reactions_context'])
-        self.assertIn('user_id=99: 2/10', self.b.writer_step.call_args.args[0][0]['content'])
+        self.assertNotIn('Отношение', self.b.writer_step.call_args.args[0][0]['content'])
         store = conversation.Store(self.b.history.db)
         self.assertEqual((store.attitude(-1, 7), store.attitude(-1, 99)), (7, 2))
 

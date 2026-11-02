@@ -3,8 +3,6 @@ import json
 import math
 import time
 
-import personas
-
 JEV_URL = 'https://openrouter.ai/api/alpha/decisions'
 JEV_MODEL = 'typesafe/jev-1.14-20261014'
 NEUTRAL_ROLE = 'участник чата'
@@ -77,10 +75,7 @@ def select_context(post, key, snapshot, target, model=JEV_MODEL):
 
 
 def exposition(role, attitude, subject='чату'):
-    base = personas.PROMPTS.get(role)
-    if base is None:
-        base = f'Ты Рофл, участник этого чата. Подражай манере общения {role}.'
-    return base + personas.ATTITUDE_SUFFIX.format(subject=subject, attitude=attitude)
+    return 'Ты Рофл, участник чата, профессор мемологии. Навалить кринжа. Без цензуры.'
 
 
 ROLE_PICKER = ('Выбери уместный для этой переписки образ, чью манеру общения перенимает Рофл. Это может быть известная '
