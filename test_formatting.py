@@ -73,6 +73,18 @@ class FormattingTests(unittest.TestCase):
             self.b.format_answer('Готово')
         self.assertIn('Без жирного.', post.call_args.args[1]['messages'][0]['content'])
 
+    def test_default_formatting_is_local_and_preserves_markdown_links_and_code(self):
+        with patch.dict(os.environ):
+            os.environ.pop('FORMATTER_ENABLED', None)
+            text = '**Итог**\n\n[Источник](https://example.com)\n```py\n  x = 1\n```'
+            with patch('bot.post') as post:
+                answer, info = self.b.format_answer('Рофл: ' + text)
+            self.assertEqual(answer, text)
+            self.assertTrue(info['skipped'])
+            self.assertIn('<b>Итог</b>', bot.telegram_html(answer))
+            self.assertIn('https://example.com', bot.telegram_html(answer))
+            post.assert_not_called()
+
     def test_invalid_api_shape_does_not_lose_the_authors_answer(self):
         for response in ([], {}, {'usage': [1]}, {'choices': [None]}, {'choices': [{'message': 'bad'}]}):
             with self.subTest(response=response), patch('bot.post', return_value=response):

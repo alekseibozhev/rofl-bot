@@ -237,6 +237,7 @@ class ConversationTests(unittest.TestCase):
         self.assertEqual(self.b.history.db.execute('SELECT count(*) FROM conversation_decisions').fetchone()[0], 1)
 
     def test_pictures_follow_jev_ignore_react_and_reply_with_visual_context(self):
+        self.b.can_react = Mock(return_value=True)  # Independent of wall-clock quiet hours.
         self.b.image = Mock(return_value='data:image/png;base64,AA==')
         for media in ({'photo': [{'file_id': 'photo'}]},
                       {'document': {'file_id': 'doc', 'mime_type': 'image/png'}}):
@@ -409,7 +410,7 @@ class ConversationTests(unittest.TestCase):
 
         steps = iter([
             {'role': 'assistant', 'content': None, 'tool_calls': [
-                {'id': 'lookup', 'type': 'function', 'function': {'name': 'lookup_history', 'arguments': '{"query":"бот"}'}}]},
+                {'id': 'lookup', 'type': 'function', 'function': {'name': 'vspomnit', 'arguments': '{"query":"бот"}'}}]},
             {'role': 'assistant', 'content': 'Ответ'},
         ])
         def writer(*args, **kwargs):
@@ -603,12 +604,12 @@ class ConversationTests(unittest.TestCase):
 
     def test_writer_tools_return_data_then_model_composes_answer(self):
         self.b.writer_step.side_effect = [
-            {'role': 'assistant', 'content': None, 'tool_calls': [{'id': 't1', 'type': 'function', 'function': {'name': 'news', 'arguments': '{"query":"лампочки"}'}}]},
+            {'role': 'assistant', 'content': None, 'tool_calls': [{'id': 't1', 'type': 'function', 'function': {'name': 'che_novogo', 'arguments': '{"query":"лампочки"}'}}]},
             {'role': 'assistant', 'content': 'Лампочка требует подписку'}]
         with patch('bot.headlines', return_value=[('Новость', 'https://example.com')]):
             answer, trace = self.turn()
         self.assertEqual(answer, 'Лампочка требует подписку')
-        self.assertEqual(trace['tools'][0]['tool'], 'news')
+        self.assertEqual(trace['tools'][0]['tool'], 'che_novogo')
         messages = self.b.writer_step.call_args.args[0]
         self.assertEqual(messages[-1]['role'], 'tool')
         self.assertIn('https://example.com', messages[-1]['content'])
@@ -691,7 +692,7 @@ class ConversationTests(unittest.TestCase):
         self.b.writer_tool = Mock(return_value='данные инструмента')
         self.b.writer_step.side_effect = [
             {'role': 'assistant', 'content': None, 'tool_calls': [
-                {'id': 't1', 'type': 'function', 'function': {'name': 'news', 'arguments': '{}'}}]},
+                {'id': 't1', 'type': 'function', 'function': {'name': 'che_novogo', 'arguments': '{}'}}]},
             {'role': 'assistant', 'content': 'ответ с картинкой'}]
         self.turn(current)
         messages = self.b.writer_step.call_args.args[0]
@@ -722,7 +723,7 @@ class ConversationTests(unittest.TestCase):
         result = conversation.select_context(post, 'key', snapshot, 4)
         self.assertEqual(result['ids'], [1, 2, 4, 5])
         state = post.call_args.args[1]['state']
-        self.assertLess(len(state['messages'][1]['text']), 260)
+        self.assertEqual(state['messages'][1]['text'], snapshot['messages'][1]['content'])
         self.assertEqual(state['immediate_reply_parent']['text'], turns[1]['content'])
         self.assertEqual(state['current_message']['text'], turns[3]['content'])
         self.assertEqual(snapshot, original)
@@ -823,7 +824,25 @@ class ConversationTests(unittest.TestCase):
         self.assertEqual(set(result), {'currency', 'checked_at', 'available_usd', 'note'})
         self.assertNotIn('SECRET', json.dumps(result))
         self.assertNotIn('test-key', json.dumps(result))
-        self.assertEqual(json.loads(self.b.writer_tool('balance', {}, self.message(), {}, True)), result)
+        self.assertEqual(self.b.writer_tool('skok_deneg', {}, self.message(), {}, True),
+                         'МАЛО, МНЕ ПИЗДА')
+
+    def test_balance_phrases_cover_thresholds_without_account_metadata(self):
+        for amount, prefix in [(0, 'МАЛО,'), (2.99, 'МАЛО,'), (3, 'ДЕНЕГ ТОЛЬКО'),
+                               (4.67, 'ДЕНЕГ ТОЛЬКО'), (5, 'ДЕНЕГ ТОЛЬКО'), (5.01, 'ДЕНЕГ ДОХУЯ')]:
+            with self.subTest(amount=amount):
+                phrase = self.b.balance_phrase({'available_usd': amount, 'checked_at': 123})
+                self.assertTrue(phrase.startswith(prefix))
+                self.assertNotIn('123', phrase)
+        self.assertEqual(self.b.balance_phrase({'error': 'internal metadata'}),
+                         'НЕ ЗНАЮ, СКОЛЬКО ОСТАЛОСЬ.')
+
+    def test_only_conversational_tool_names_are_available(self):
+        self.assertEqual({t['function']['name'] for t in conversation.TOOLS},
+                         {'vspomnit', 'sprosit', 'pochitat', 'che_novogo', 'kto_tut', 'skok_deneg'})
+        for name in ('lookup_history', 'search', 'read_url', 'news', 'participants', 'balance'):
+            self.assertEqual(self.b.writer_tool(name, {}, self.message(), {}, False),
+                             'Неизвестный инструмент.')
 
     def test_balance_negative_key_allowance_is_zero(self):
         for remaining, expected in ((.2, .2), (-.1, 0)):
@@ -864,7 +883,7 @@ class ConversationTests(unittest.TestCase):
 
     def test_invalid_tool_arguments_reach_writer_as_error(self):
         self.b.writer_step.side_effect = [
-            {'role': 'assistant', 'tool_calls': [{'id': 't', 'function': {'name': 'news', 'arguments': 'invalid'}}]},
+            {'role': 'assistant', 'tool_calls': [{'id': 't', 'function': {'name': 'che_novogo', 'arguments': 'invalid'}}]},
             {'role': 'assistant', 'content': 'ладно'}]
         self.turn()
         self.assertIn('недоступен', self.b.writer_step.call_args.args[0][-1]['content'])
@@ -872,7 +891,7 @@ class ConversationTests(unittest.TestCase):
     def test_participant_tool_in_replay_never_calls_telegram(self):
         m = self.message()
         snapshot = {'context': ''}
-        self.b.writer_tool('participants', {'all': True}, m, snapshot, live=False)
+        self.b.writer_tool('kto_tut', {'all': True}, m, snapshot, live=False)
         self.b.api.assert_not_called()
 
     def test_history_lookup_is_scoped_and_excludes_future_in_replay(self):
@@ -889,7 +908,7 @@ class ConversationTests(unittest.TestCase):
         self.b.history.add_message((-2, 0), self.message('ник ДРУГОЙ ЧАТ', chat=-2, date=now - 10))
         self.b.history.add_message((-1, 5), self.message('ник ДРУГАЯ ТЕМА', topic=5, date=now - 10))
         before = self.b.history.db.total_changes
-        result = json.loads(self.b.writer_tool('lookup_history', {'query': 'НИК', 'limit': 1, 'chat': -2},
+        result = json.loads(self.b.writer_tool('vspomnit', {'query': 'НИК', 'limit': 1, 'chat': -2},
                                              current, {'target': current['message_id'], 'date': now}, live=False))
         self.assertEqual(result['matched_ids'], [2])
         self.assertEqual([m['id'] for m in result['messages']], [1, 2, 3])
@@ -926,7 +945,7 @@ class ConversationTests(unittest.TestCase):
         for args in ({}, {'query': []}, {'query': 'x' * 201}, {'query': '%_'},
                      {'query': 'ник', 'limit': True}, {'query': 'ник', 'limit': 9}):
             with self.subTest(args=args):
-                self.assertIn('error', json.loads(self.b.writer_tool('lookup_history', args, current,
+                self.assertIn('error', json.loads(self.b.writer_tool('vspomnit', args, current,
                                                                   {'date': now}, live=False)))
         empty = self.b.history.lookup((-1, 0), 'ничегонепохожего', 36, now)
         self.assertEqual(empty['messages'], [])
@@ -937,11 +956,11 @@ class ConversationTests(unittest.TestCase):
         self.b.history.add_message((-1, 0), old)
         self.b.writer_step.side_effect = [
             {'role': 'assistant', 'content': None, 'tool_calls': [{'id': 'h1', 'type': 'function',
-                'function': {'name': 'lookup_history', 'arguments': '{"query":"ник"}'}}]},
+                'function': {'name': 'vspomnit', 'arguments': '{"query":"ник"}'}}]},
             {'role': 'assistant', 'content': 'Ты выбрал Паяснителя.'}]
         answer, trace = self.turn(self.message('бот, что мы выбрали?'), live=False)
         self.assertEqual(answer, 'Ты выбрал Паяснителя.')
-        self.assertEqual(trace['tools'][0]['tool'], 'lookup_history')
+        self.assertEqual(trace['tools'][0]['tool'], 'vspomnit')
         result = self.b.writer_step.call_args.args[0][-1]
         self.assertEqual(result['role'], 'tool')
         self.assertEqual(result['tool_call_id'], 'h1')
@@ -1133,7 +1152,7 @@ class ConversationTests(unittest.TestCase):
         self.b.history.remember(-1, {'id': 7, 'first_name': 'Другое имя', 'username': 'oxgrb'})
         self.b.write_turn(current, snapshot, decision, live=False)
         self.assertEqual(self.b.writer_step.call_args.args[0], expected)
-        participants = json.loads(self.b.writer_tool('participants', {}, current, snapshot, live=False))
+        participants = json.loads(self.b.writer_tool('kto_tut', {}, current, snapshot, live=False))
         self.assertEqual(participants['known']['oxgrb'], 'Andrew')
         post = Mock(return_value={'answers': {'1': {'noul': .1}}})
         conversation.select_context(post, 'test-key', snapshot, 2)

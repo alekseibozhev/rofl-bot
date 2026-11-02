@@ -2,6 +2,7 @@
 """Tiny Telegram + Ollama bot. Python 3.10+, no dependencies."""
 
 import conversation
+import tooluse
 import retrieval
 import formatting
 import vision
@@ -433,6 +434,9 @@ class History:
             chat INTEGER, id INTEGER, user INTEGER, emoji TEXT, date REAL, PRIMARY KEY (chat, id, user))''')
         self.db.execute('''CREATE TABLE IF NOT EXISTS news (
             day TEXT, interest TEXT, title TEXT, link TEXT, mood INTEGER, thought TEXT, PRIMARY KEY (day, interest))''')
+        self.db.execute('''CREATE TABLE IF NOT EXISTS tool_executions (
+            chat INTEGER, topic INTEGER, request INTEGER, date REAL, name TEXT, arguments TEXT, result TEXT)''')
+        self.db.execute('CREATE INDEX IF NOT EXISTS tool_executions_scope ON tool_executions (chat, topic, name, date)')
         self.untag()
         conversation.Store(self.db)
         self.delivery = delivery.Store(self.db)
@@ -699,6 +703,7 @@ class History:
     def clear(self, key):
         with self.db:
             self.db.execute('DELETE FROM messages WHERE chat=? AND topic=?', key)
+            self.db.execute('DELETE FROM tool_executions WHERE chat=? AND topic=?', key)
 
 
 def report(db, days=14):
@@ -774,6 +779,7 @@ class Bot:
 
     def __init__(self, read_only=False):
         self.read_only = read_only
+        self.tool_judge_enabled = True
         try:
             self.version = subprocess.run(['git', 'describe', '--always', '--dirty'], cwd=Path(__file__).parent,
                                           capture_output=True, text=True, timeout=5).stdout.strip() or None
@@ -1071,7 +1077,7 @@ class Bot:
 
     def writer_step(self, messages, tools=True):
         payload = {'model': self.model, 'messages': messages, 'temperature': 1.0, 'max_tokens': 6000,
-                   'reasoning': {'effort': self.effort}}
+                   'reasoning': {'effort': self.effort}, 'repetition_penalty': 1.1}
         if tools:
             payload['tools'] = conversation.TOOLS
         started = time.monotonic()
@@ -1089,11 +1095,11 @@ class Bot:
         return choice['message']
 
     def format_answer(self, answer):
-        """One cheap, isolated presentation call; reject changes to words, links or code."""
+        """Local cleanup by default; optional model formatting preserves every word."""
         clean = formatting.clean_prefix(answer)
         if not clean:
             return answer, {'fallback': True, 'reason': 'empty_after_cleanup'}
-        if not getattr(self, 'openrouter', False) or os.environ.get('FORMATTER_ENABLED', '1') == '0':
+        if not getattr(self, 'openrouter', False) or os.environ.get('FORMATTER_ENABLED', '0') == '0':
             return clean, {'skipped': True}
         model = os.environ.get('FORMATTER_MODEL', formatting.MODEL)
         prompt = formatting.PROMPT
@@ -1139,7 +1145,44 @@ class Bot:
             LOG.info('formatter.response %s', json.dumps(info))
 
     def writer_tool(self, name, args, message, snapshot, live):
-        if name == 'lookup_history':
+        self.last_tool_verdict = None
+        if name not in {t['function']['name'] for t in conversation.TOOLS}:
+            return 'Неизвестный инструмент.'
+        if not getattr(self, 'tool_judge_enabled', False):
+            return self.execute_tool(name, args, message, snapshot, live)
+        chat, topic = message['chat']['id'], topic_of(message)
+        now = snapshot['date']
+        request = snapshot['target']
+        # Replay never writes history. Only earlier/current evidence is eligible.
+        rows = self.history.db.execute(
+            'SELECT request,date,name,arguments,result FROM tool_executions '
+            'WHERE chat=? AND topic=? AND name=? AND date>=? AND date<=? ORDER BY rowid DESC LIMIT 8',
+            (chat, topic, name, now - 86400, now)).fetchall()
+        visible = snapshot.get('_visible_tool_requests', set())
+        recent = [dict(request=r[0], date=r[1], name=r[2], arguments=json.loads(r[3]), result=r[4])
+                  for r in rows if r[0] in visible]
+        try:
+            verdict, stats = tooluse.judge(post, self.openrouter_key, name, args, snapshot, recent)
+            if self.usage is not None:
+                self.usage.append(stats)
+        except RuntimeError as exc:
+            LOG.warning('tool_judge.failed %s', exc)
+            verdict = 'execute'  # No invented repetition accusation on judge failure.
+        self.last_tool_verdict = verdict
+        if verdict == 'repeat':
+            return tooluse.REPEAT
+        if verdict == 'skip':
+            return tooluse.SKIP
+        result = self.execute_tool(name, args, message, snapshot, live)
+        if live and tooluse.successful(result):
+            with self.history.db:
+                self.history.db.execute('INSERT INTO tool_executions VALUES (?,?,?,?,?,?,?)',
+                    (chat, topic, request, now, name, json.dumps(args, sort_keys=True, ensure_ascii=False), result))
+            visible.add(request)
+        return result
+
+    def execute_tool(self, name, args, message, snapshot, live):
+        if name == 'vspomnit':
             try:
                 result = self.history.lookup((message['chat']['id'], topic_of(message)), args.get('query'),
                                              snapshot.get('target', message['message_id']),
@@ -1148,23 +1191,23 @@ class Bot:
             except ValueError as exc:
                 return json.dumps({'error': str(exc)}, ensure_ascii=False)
             return json.dumps(result, ensure_ascii=False)
-        if name == 'search':
+        if name == 'sprosit':
             query = args.get('query')
             if not isinstance(query, str) or not query.strip():
                 return 'Не задан поисковый запрос.'
-            return self.find(query[:1000], kind='справка' if args.get('kind') == 'reference' else 'найти') or 'Ничего не найдено.'
-        if name == 'read_url':
+            return self.find(query[:1000]) or 'Ничего не найдено.'
+        if name == 'pochitat':
             url = args.get('url')
             if not isinstance(url, str) or not url.strip():
                 return 'Не задан URL страницы.'
             return json.dumps(retrieval.read_url(url), ensure_ascii=False)
-        if name == 'news':
+        if name == 'che_novogo':
             query = args.get('query')
             if query is not None and not isinstance(query, str):
                 return 'Запрос должен быть строкой.'
             found = headlines(query)[:15] if query else headlines(None)[:8] + headlines(POLITICS)[:7]
             return json.dumps([{'title': title, 'url': url} for title, url in found], ensure_ascii=False)
-        if name == 'participants':
+        if name == 'kto_tut':
             chat = message['chat']['id']
             count = self.roster(chat, live=live) if args.get('all') and live else None
             identities = snapshot.get('participants', [])
@@ -1172,9 +1215,21 @@ class Bot:
                 p['username']: p['name'] for p in identities
                 if p.get('username') and p['kind'] == 'user' and not p.get('is_bot')}
             return json.dumps({'known': known, 'identities': identities, 'total': count}, ensure_ascii=False)
-        if name == 'balance':
-            return json.dumps(self.balance(live=live), ensure_ascii=False)
+        if name == 'skok_deneg':
+            return self.balance_phrase(self.balance(live=live))
         return 'Неизвестный инструмент.'
+
+    @staticmethod
+    def balance_phrase(result):
+        """Keep accounting metadata internal; give the voice a coarse money status."""
+        if 'error' in result:
+            return 'НЕ ЗНАЮ, СКОЛЬКО ОСТАЛОСЬ.'
+        amount = result['available_usd']
+        if amount < 3:
+            return 'МАЛО, МНЕ ПИЗДА'
+        if amount <= 5:
+            return 'ДЕНЕГ ТОЛЬКО НА ЕДУ И КОММУНАЛКУ'
+        return 'ДЕНЕГ ДОХУЯ'
 
     def balance(self, live=True):
         """Expose only this bot's key allowance; never request the account's credits."""
@@ -1260,6 +1315,10 @@ class Bot:
             # Legacy snapshots have no reliable role boundaries. Preserve them exactly;
             # do not infer assistant roles from names or reconstruct from today's DB.
             messages.append({'role': 'user', 'content': with_image(snapshot['context'] + '\n\n' + instruction, image)})
+        kept = decision.get('context_selection', {}).get('ids')
+        snapshot = {**snapshot, '_visible_tool_requests': {
+            m.get('reply_to') for m in snapshot.get('messages', [])
+            if m['role'] == 'assistant' and (kept is None or m['id'] in kept)}}
         calls = []
         if not self.openrouter:
             return self.generate(messages[1:], system=system), calls
@@ -1279,6 +1338,7 @@ class Bot:
                 raise RuntimeError('Слишком много вызовов инструментов за раунд')
             for call in tool_calls:
                 fn = call.get('function') or {}
+                self.last_tool_verdict = None
                 try:
                     args = json.loads(fn.get('arguments') or '{}')
                     if not isinstance(args, dict):
@@ -1286,7 +1346,8 @@ class Bot:
                     result = self.writer_tool(fn.get('name'), args, message, snapshot, live)
                 except (ValueError, TypeError, RuntimeError) as exc:
                     result = f'Инструмент недоступен: {type(exc).__name__}'
-                calls.append({'tool': fn.get('name'), 'result_chars': len(result)})
+                calls.append({'tool': fn.get('name'), 'result_chars': len(result),
+                              'verdict': getattr(self, 'last_tool_verdict', None)})
                 messages.append({'role': 'tool', 'tool_call_id': call['id'], 'content': result})
         raise RuntimeError('Нет ответа автора')
 
@@ -1367,6 +1428,7 @@ class Bot:
                      'role': decision['state']['role'], 'attitude': decision['state']['attitude'],
                      'role_changed_at': decision['state']['changed_at'], 'jev': decision.get('jev'),
                      'fallback': decision.get('fallback', False)}
+            trace['generation'] = 'direct-writer-v1'
             if 'attitude_user_id' in decision['state']:
                 trace['attitude_user_id'] = decision['state']['attitude_user_id']
                 trace['relationship'] = decision['relationship']
@@ -1531,7 +1593,7 @@ class Bot:
 
     def params(self):
         return {'model': self.model, 'recent': self.recent, 'window_h': self.window / 3600, 'limit': self.limit,
-                'effort': self.effort, 'version': self.version, 'architecture': 'jev-roles-v1'}
+                'effort': self.effort, 'version': self.version, 'architecture': 'jev-direct-writer-v1'}
 
     def idle(self, now=None):
         now = now or time.time()
