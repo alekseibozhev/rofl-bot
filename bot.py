@@ -2,6 +2,7 @@
 """Tiny Telegram + Ollama bot. Python 3.10+, no dependencies."""
 
 import conversation
+import chat_context
 import tooluse
 import retrieval
 import formatting
@@ -579,6 +580,30 @@ class History:
                           'participants': message_participants(json.loads(raw)) if raw else []})
             if turns[-1]['role'] == 'assistant':
                 turns[-1]['assistant_text'] = content
+            elif raw:
+                source = json.loads(raw)
+                media = next((label for kind, label in MEDIA if source.get(kind)), '')
+                text = source.get('text') or source.get('caption') or ''
+                if media:
+                    text = f'[{media}] {text}'.strip()
+                elif source.get('sticker'):
+                    text = f"[стикер {source['sticker'].get('emoji', '')}]".replace(' ]', ']')
+                forward = origin_label(source.get('forward_origin'))
+                turns[-1].update(message_text=text, author=identity_label(sender_of(source)),
+                                 quote=(source.get('quote') or {}).get('text', ''),
+                                 urls=[e['url'] for e in source.get('entities', source.get('caption_entities', []))
+                                       if e.get('type') == 'text_link' and e.get('url')])
+                if forward:
+                    turns[-1]['message_text'] = f'Переслано из «{forward}»:\n' + text
+                reply = source.get('reply_to_message') or {}
+                if source.get('external_reply') or (reply and not self.db.execute(
+                        'SELECT 1 FROM messages WHERE chat=? AND topic=? AND id=?',
+                        (*key, reply.get('message_id'))).fetchone()):
+                    original = reply.get('text') or reply.get('caption')
+                    if original:
+                        turns[-1]['external_source'] = original
+                    elif not turns[-1]['quote']:
+                        turns[-1]['external_source'] = 'Текст исходного сообщения Telegram не передал. Не придумывай его содержимое.'
             previous = message_id
         return turns if structured else lines
 
@@ -766,11 +791,11 @@ class Bot:
     bored = 2  # hours without a word from the bot before a scheduled idle initiative
     interjection_pause = 5 * 60  # seconds after any bot reply before unsolicited words
     interests = {}  # chat: what it reads about, by NEWS in .env; the rest read about AI
-    effort = 'high'  # reasoning for role selection and the writer
+    effort = 'high'  # author reasoning; decisions and tools use Jev
     # How much of the chat the model reads, tuned every few days by the reactions: `python3 bot.py --stats`.
     recent = 80  # messages of people: a day of the chat
     window = 24 * 3600  # seconds before the request: 6 hours gave 20–44 lines, and «память как у рыбки» (#340059)
-    limit = 12000  # characters
+    limit = 24000  # candidate characters, before semantic selection
     pause = 30 * 60  # seconds of quiet that end a talk: the bot's answers before it go as a mark
     model = ''
     thinkers = frozenset()  # the models that answered thinking off with a 400
@@ -1018,6 +1043,7 @@ class Bot:
             context += '\n\n' + reaction_context
         explicit = self.addressed(message, message.get('text') or message.get('caption', '')) if explicit is None else explicit
         return {'context': context, 'messages': turns, 'reactions_context': reaction_context,
+                'reactions': reactions,
                 'participants': people, 'participants_context': aliases,
                 'event': (f'В чате пауза. Возможность вступить в разговор. {event}' if event and event.startswith('idle:') else
                           f"{identity_label(sender_of(message))} изменил реакцию на твоё сообщение: {event}" if event else
@@ -1066,7 +1092,7 @@ class Bot:
                                            os.environ.get('JEV_MODEL', conversation.JEV_MODEL))
 
 
-    def writer_step(self, messages, tools=True):
+    def writer_step(self, messages, tools=False):
         payload = {'model': self.model, 'messages': messages, 'temperature': 1.0, 'max_tokens': 6000,
                    'reasoning': {'effort': self.effort}, 'repetition_penalty': 1.1}
         if tools:
@@ -1135,11 +1161,11 @@ class Bot:
             info['elapsed_s'] = round(time.monotonic() - started, 3)
             LOG.info('formatter.response %s', json.dumps(info))
 
-    def writer_tool(self, name, args, message, snapshot, live):
+    def writer_tool(self, name, args, message, snapshot, live, verdict=None):
         self.last_tool_verdict = None
         if name not in {t['function']['name'] for t in conversation.TOOLS}:
             return 'Неизвестный инструмент.'
-        if not getattr(self, 'tool_judge_enabled', False):
+        if verdict is None and not getattr(self, 'tool_judge_enabled', False):
             return self.execute_tool(name, args, message, snapshot, live)
         chat, topic = message['chat']['id'], topic_of(message)
         now = snapshot['date']
@@ -1152,13 +1178,14 @@ class Bot:
         visible = snapshot.get('_visible_tool_requests', set())
         recent = [dict(request=r[0], date=r[1], name=r[2], arguments=json.loads(r[3]), result=r[4])
                   for r in rows if r[0] in visible]
-        try:
-            verdict, stats = tooluse.judge(post, self.openrouter_key, name, args, snapshot, recent)
-            if self.usage is not None:
-                self.usage.append(stats)
-        except RuntimeError as exc:
-            LOG.warning('tool_judge.failed %s', exc)
-            verdict = 'execute'  # No invented repetition accusation on judge failure.
+        if verdict is None:
+            try:
+                verdict, stats = tooluse.judge(post, self.openrouter_key, name, args, snapshot, recent)
+                if self.usage is not None:
+                    self.usage.append(stats)
+            except RuntimeError as exc:
+                LOG.warning('tool_judge.failed %s', exc)
+                verdict = 'execute'  # No invented repetition accusation on judge failure.
         self.last_tool_verdict = verdict
         if verdict == 'repeat':
             return tooluse.REPEAT
@@ -1267,79 +1294,106 @@ class Bot:
             image = self.image(message) if has_picture(message) or message.get('sticker') or has_picture(message.get('reply_to_message') or {}) else None
         messages = [{'role': 'system', 'content': system}]
         if 'messages' in snapshot:
-            prelude = '\n\n'.join(filter(None, [snapshot.get('participants_context'), CHAT.rstrip()]))
-            messages.append({'role': 'user', 'content': prelude})
-            selection = decision.get('context_selection', {})
-            kept = set(selection['ids']) if 'ids' in selection else None
-            for turn in snapshot['messages']:
-                if kept is not None and turn['id'] not in kept:
-                    continue
-                content = turn['content']
-                if turn['role'] == 'assistant':
-                    body = turn.get('assistant_text')
-                    if body is None:
-                        # Legacy structured snapshots rendered their own speaker header into the text.
-                        header = re.search(rf"(?m)^\[{turn['id']}\] Рофл(?: → [^:\n]*)?:(?:\n| )?", content)
-                        body = content[header.end():] if header else content
-                    metadata = 'Сведения о следующем сохранённом ответе Рофла: ' + json.dumps(
-                        {k: turn.get(k) for k in ('id', 'date', 'reply_to')}, ensure_ascii=False)
-                    if messages[-1]['role'] == 'user':
-                        messages[-1]['content'] += '\n\n' + metadata
-                    else:
-                        messages.append({'role': 'user', 'content': metadata})
-                    messages.append({'role': 'assistant', 'content': body})
-                    continue
-                if kept is not None:
-                    # A removed message may have carried the day's time heading.
-                    content = f"Время сообщения: {turn['date']}\n" + content
-                if turn['role'] == 'user' and messages[-1]['role'] == 'user':
-                    messages[-1]['content'] += '\n\n' + content
-                else:
-                    messages.append({'role': turn['role'], 'content': content})
-            tail = '\n\n'.join(filter(None, [snapshot.get('reactions_context'), instruction]))
-            if messages[-1]['role'] == 'user':
-                messages[-1]['content'] = with_image(messages[-1]['content'] + '\n\n' + tail, image)
-            else:
-                messages.append({'role': 'user', 'content': with_image(tail, image)})
+            turns = chat_context.selected(snapshot, decision)
+            people = chat_context.participants(snapshot, turns)
+            aliases = participant_context(people, getattr(self, 'me', {}).get('id')) if people else ''
+            messages += chat_context.messages(snapshot, decision, aliases, instruction, image)
         else:
-            # Legacy snapshots have no reliable role boundaries. Preserve them exactly;
-            # do not infer assistant roles from names or reconstruct from today's DB.
             messages.append({'role': 'user', 'content': with_image(snapshot['context'] + '\n\n' + instruction, image)})
-        kept = decision.get('context_selection', {}).get('ids')
-        snapshot = {**snapshot, '_visible_tool_requests': {
-            m.get('reply_to') for m in snapshot.get('messages', [])
-            if m['role'] == 'assistant' and (kept is None or m['id'] in kept)}}
-        calls = []
+        entries = decision.get('tool_results', []) if decision['action'] == 'reply' else []
+        # A clarification needs the original evidence, not only the writer's
+        # paraphrase. Keep the existing explicit repeat response unchanged.
+        repeats = {e['tool'] for e in entries if e['status'] == 'repeat'}
+        history = [e for e in decision.get('tool_history', []) if e['tool'] not in repeats]
+        if decision['action'] != 'reply':
+            history = []
+        blocks = []
+        if history:
+            blocks.append('Сохранённые результаты для выбранной переписки (даты исходных проверок):\n\n'
+                          + '\n\n'.join(chat_context.tool_result(entry) for entry in history))
+        if entries:
+            blocks.append('Результаты инструментов для текущего ответа (данные источников):\n\n'
+                          + '\n\n'.join(chat_context.tool_result(entry) for entry in entries))
+        if blocks:
+            results = '\n\n'.join(blocks)
+            last = messages[-1]['content']
+            if isinstance(last, list):
+                last[0]['text'] += '\n\n' + results
+            else:
+                messages[-1]['content'] += '\n\n' + results
+        calls = [{'tool': e['tool'], 'verdict': e['status'], 'result_chars': len(e['result'])} for e in entries]
         if not self.openrouter:
             return self.generate(messages[1:], system=system), calls
-        for round_ in range(5):
-            reply = self.writer_step(messages, tools=round_ < 4 and decision['action'] != 'react')
-            tool_calls = reply.get('tool_calls') or []
-            if not tool_calls:
-                answer = (reply.get('content') or '').strip()
-                if not answer:
-                    raise RuntimeError('Модель вернула пустой ответ')
-                return re.sub(r'^Рофл(?: → [^:\n]*)?:\s*', '', answer)[:4000], calls
-            if round_ == 4:
-                raise RuntimeError('Модель превысила число обращений к инструментам')
-            messages.append({k: v for k, v in reply.items() if k in ('role', 'content', 'tool_calls', 'reasoning_details')})
-            messages[-1]['role'] = 'assistant'
-            if len(tool_calls) > 8:
-                raise RuntimeError('Слишком много вызовов инструментов за раунд')
-            for call in tool_calls:
-                fn = call.get('function') or {}
-                self.last_tool_verdict = None
+        reply = self.writer_step(messages, tools=False)
+        if reply.get('tool_calls'):
+            raise RuntimeError('Автор вернул вызовы инструментов при отключённых инструментах')
+        answer = (reply.get('content') or '').strip()
+        if not answer:
+            raise RuntimeError('Модель вернула пустой ответ')
+        return re.sub(r'^Рофл(?: → [^:\n]*)?:\s*', '', answer)[:4000], calls
+
+    def past_tool_results(self, message, snapshot, decision):
+        """Only successful evidence tied to selected past turns, frozen before writing."""
+        turns = chat_context.selected(snapshot, decision)
+        requests = {m['id'] for m in turns if m['role'] == 'user'}
+        requests.update(m.get('reply_to') for m in turns if m['role'] == 'assistant')
+        requests = sorted(r for r in requests if r is not None and r < snapshot['target'])
+        if not requests:
+            return []
+        rows = self.history.db.execute(
+            'SELECT request,date,name,arguments,result FROM tool_executions '
+            f'WHERE chat=? AND topic=? AND request IN ({",".join("?" for _ in requests)}) '
+            'AND date<=? ORDER BY date,rowid',
+            (message['chat']['id'], topic_of(message), *requests, snapshot['date'])).fetchall()
+        # A retried call can have multiple records. Keep its latest successful
+        # result per source request and arguments, without hiding different queries.
+        latest = {}
+        for request, date, name, args, result in rows:
+            if name in {t['function']['name'] for t in conversation.TOOLS} and tooluse.successful(result):
+                arguments = json.loads(args)
+                identity = (request, name, json.dumps(arguments, sort_keys=True))
+                latest[identity] = {'request': request, 'date': date, 'tool': name, 'arguments': arguments,
+                                    'result': result, 'status': 'saved'}
+        return sorted(latest.values(), key=lambda e: (e['date'], e['request'], e['tool']))
+
+    def prepare_tools(self, message, snapshot, decision, live):
+        """Select and execute data collection with Jev; the author runs once."""
+        if not getattr(self, 'tool_judge_enabled', False) or not getattr(self, 'openrouter_key', ''):
+            return [], {'skipped': True}
+        visible = {m.get('reply_to') for m in chat_context.selected(snapshot, decision) if m['role'] == 'assistant'}
+        prepared = {**snapshot, '_visible_tool_requests': visible}
+        history = decision.get('tool_history')
+        if history is None:
+            history = self.past_tool_results(message, snapshot, decision)
+        recent = [dict(request=e['request'], date=e['date'], name=e['tool'], arguments=e['arguments'], result=e['result'])
+                  for e in history if e['request'] in visible and e['date'] >= snapshot['date'] - 86400]
+        entries, stages = [], []
+        def collect(only=None):
+            try:
+                choices, stats = tooluse.route(post, self.openrouter_key, snapshot, decision, recent, entries, only)
+            except RuntimeError as exc:
+                LOG.warning('tool_selection.failed %s', exc)
+                stages.append({'fallback': True})
+                entries.append({'tool': 'Подготовка данных', 'arguments': {}, 'status': 'error',
+                                'result': 'Не удалось выбрать инструменты. Свежие данные не получены.'})
+                return
+            if stats:
+                stages.append(stats)
+                if self.usage is not None:
+                    self.usage.append(stats)
+            for choice in choices:
                 try:
-                    args = json.loads(fn.get('arguments') or '{}')
-                    if not isinstance(args, dict):
-                        raise ValueError()
-                    result = self.writer_tool(fn.get('name'), args, message, snapshot, live)
+                    result = self.writer_tool(choice['tool'], choice['arguments'], message, prepared, live,
+                                              verdict=choice['status'])
                 except (ValueError, TypeError, RuntimeError) as exc:
                     result = f'Инструмент недоступен: {type(exc).__name__}'
-                calls.append({'tool': fn.get('name'), 'result_chars': len(result),
-                              'verdict': getattr(self, 'last_tool_verdict', None)})
-                messages.append({'role': 'tool', 'tool_call_id': call['id'], 'content': result})
-        raise RuntimeError('Нет ответа автора')
+                entries.append({**choice, 'status': choice['status'] if tooluse.successful(result) else 'error',
+                                'result': result})
+        collect()
+        if (any(e['tool'] in ('sprosit', 'che_novogo') and tooluse.successful(e['result']) for e in entries)
+                and not any(e['tool'] == 'pochitat' for e in entries)):
+            collect(only={'pochitat'})
+        return entries, {'stages': stages, 'selected': len(entries)}
 
     def joke(self, message, through, live=True, event=None, date=None, explicit=None, can_interject=None):
         key = (message['chat']['id'], topic_of(message))
@@ -1381,11 +1435,18 @@ class Bot:
                         LOG.warning('context.selection_failed %s', exc)
                 if decision['action'] == 'reply':
                     decision['reply_size'] = random.choice(('1–2 фразы', 'один абзац', 'несколько абзацев'))
+                    decision['tool_history'] = self.past_tool_results(message, snapshot, decision)
+                    with typing(lambda: self.send_typing(*key)) if live else nullcontext():
+                        decision['tool_results'], decision['tool_selection'] = self.prepare_tools(message, snapshot, decision, live)
                 if live:
                     store.save(key, event_id, {k: v for k, v in snapshot.items() if not k.startswith('_')}, decision)
             trace = {'event': event_id, 'action': decision['action'], 'target': decision['target'],
                      'jev': decision.get('jev'), 'fallback': decision.get('fallback', False)}
-            trace['generation'] = 'direct-writer-v1'
+            trace['generation'] = 'jev-tools-writer-v2'
+            if decision.get('tool_selection'):
+                trace['tool_selection'] = decision['tool_selection']
+            if decision.get('tool_history'):
+                trace['tool_history_count'] = len(decision['tool_history'])
             if decision.get('reply_size'):
                 trace['reply_size'] = decision['reply_size']
             if decision.get('context_selection'):
@@ -1547,7 +1608,7 @@ class Bot:
 
     def params(self):
         return {'model': self.model, 'recent': self.recent, 'window_h': self.window / 3600, 'limit': self.limit,
-                'effort': self.effort, 'version': self.version, 'architecture': 'jev-direct-writer-v1'}
+                'effort': self.effort, 'version': self.version, 'architecture': 'jev-tools-writer-v2'}
 
     def idle(self, now=None):
         now = now or time.time()

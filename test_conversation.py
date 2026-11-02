@@ -33,6 +33,7 @@ class ConversationTests(unittest.TestCase):
         self.b.read = Mock()
         self.b.direct = Mock(side_effect=self.decision)
         self.b.select_context = Mock(return_value={'fallback': True})
+        self.b.prepare_tools = Mock(return_value=([], {'skipped': True}))
         prepare_patch = patch('bot.vision.prepare', return_value='data:image/jpeg;base64,PREPARED')
         self.prepare_image = prepare_patch.start()
         self.addCleanup(prepare_patch.stop)
@@ -166,7 +167,7 @@ class ConversationTests(unittest.TestCase):
                     self.assertEqual(self.b.select_context.call_args.args[0]['_jev_image'], self.prepare_image.return_value)
                     prompt = json.dumps(self.b.writer_step.call_args.args[0], ensure_ascii=False)
                     self.assertIn('Предыстория картинки', prompt)
-                    self.assertIn(f"[{message['message_id']}]", prompt)
+                    self.assertIn(f"#{message['message_id']}", prompt)
                     self.assertIn('ORIGINAL', prompt)
 
     def test_explicit_picture_keeps_full_context_when_selector_fails(self):
@@ -266,23 +267,18 @@ class ConversationTests(unittest.TestCase):
             attempted.clear()
             self.assertTrue(attempted.wait(1), 'Typing stopped during generation')
 
-        steps = iter([
-            {'role': 'assistant', 'content': None, 'tool_calls': [
-                {'id': 'lookup', 'type': 'function', 'function': {'name': 'vspomnit', 'arguments': '{"query":"бот"}'}}]},
-            {'role': 'assistant', 'content': 'Ответ'},
-        ])
         def writer(*args, **kwargs):
             wait_for_typing()
-            return next(steps)
-        def tool(*args, **kwargs):
+            return {'role': 'assistant', 'content': 'Ответ'}
+        def prepare(*args, **kwargs):
             wait_for_typing()
-            return 'данные'
+            return [], {}
         def formatter(text):
             wait_for_typing()
             return text, {}
 
         self.b.writer_step.side_effect = writer
-        self.b.writer_tool = Mock(side_effect=tool)
+        self.b.prepare_tools.side_effect = prepare
         self.b.format_answer.side_effect = formatter
         real_typing = bot.typing
         with patch('bot.post', side_effect=send), patch('bot.typing', side_effect=lambda send: real_typing(send, every=.01)):
@@ -294,7 +290,8 @@ class ConversationTests(unittest.TestCase):
         with patch('bot.typing') as indicator:
             with self.assertRaisesRegex(RuntimeError, 'offline'):
                 self.turn()
-        indicator.return_value.__exit__.assert_called_once()
+        self.assertEqual(indicator.return_value.__exit__.call_count, 2)
+        self.assertIs(indicator.return_value.__exit__.call_args.args[0], RuntimeError)
 
     def test_replay_ignore_and_reaction_do_not_start_typing(self):
         with patch('bot.typing') as indicator:
@@ -448,17 +445,59 @@ class ConversationTests(unittest.TestCase):
         store = conversation.Store(self.b.history.db)
         self.assertEqual(self.b.history.db.execute('SELECT topic FROM conversation_decisions').fetchall(), [(5,)])
 
-    def test_writer_tools_return_data_then_model_composes_answer(self):
-        self.b.writer_step.side_effect = [
-            {'role': 'assistant', 'content': None, 'tool_calls': [{'id': 't1', 'type': 'function', 'function': {'name': 'che_novogo', 'arguments': '{"query":"лампочки"}'}}]},
-            {'role': 'assistant', 'content': 'Лампочка требует подписку'}]
-        with patch('bot.headlines', return_value=[('Новость', 'https://example.com')]):
-            answer, trace = self.turn()
+    def test_prefetched_tools_reach_author_on_first_and_only_call(self):
+        entries = [{'tool': 'che_novogo', 'arguments': {'query': 'лампочки'}, 'status': 'execute',
+                    'result': json.dumps([{'title': 'Новость', 'url': 'https://example.com'}])}]
+        self.b.prepare_tools.return_value = (entries, {'selected': 1})
+        self.b.writer_step.return_value = {'role': 'assistant', 'content': 'Лампочка требует подписку'}
+        answer, trace = self.turn()
         self.assertEqual(answer, 'Лампочка требует подписку')
         self.assertEqual(trace['tools'][0]['tool'], 'che_novogo')
+        self.b.writer_step.assert_called_once()
+        self.assertFalse(self.b.writer_step.call_args.kwargs['tools'])
         messages = self.b.writer_step.call_args.args[0]
-        self.assertEqual(messages[-1]['role'], 'tool')
+        self.assertEqual(messages[-1]['role'], 'user')
         self.assertIn('https://example.com', messages[-1]['content'])
+        self.assertNotIn('"title":', messages[-1]['content'])
+
+    def test_prefetched_results_are_frozen_and_not_reexecuted_on_replay(self):
+        self.b.prepare_tools.return_value = ([{'tool': 'skok_deneg', 'arguments': {},
+            'status': 'execute', 'result': 'СОХРАНЁННЫЙ РЕЗУЛЬТАТ'}], {'selected': 1})
+        current = self.message('бот, сколько денег?')
+        self.turn(current)
+        expected = copy.deepcopy(self.b.writer_step.call_args.args[0])
+        self.b.prepare_tools.side_effect = AssertionError('Replay must not select or execute tools')
+        self.b.joke(current, current['message_id'], live=False)
+        self.b.prepare_tools.assert_called_once()
+        self.assertEqual(self.b.writer_step.call_args.args[0], expected)
+        self.assertIn('СОХРАНЁННЫЙ РЕЗУЛЬТАТ', expected[-1]['content'])
+
+    def test_clarification_gets_source_result_and_replay_keeps_it_without_database_lookup(self):
+        current = self.dialogue()
+        self.b.history.db.execute('INSERT INTO tool_executions VALUES (?,?,?,?,?,?,?)',
+            (-1, 0, 1, current['date'] - .2, 'skok_deneg', '{}', 'ORIGINAL_TOOL_EVIDENCE'))
+        self.turn(current)
+        prompt = copy.deepcopy(self.b.writer_step.call_args.args[0])
+        self.assertIn('ORIGINAL_TOOL_EVIDENCE', json.dumps(prompt))
+        self.assertIn('для сообщения #1', json.dumps(prompt, ensure_ascii=False))
+        snapshot, decision = conversation.Store(self.b.history.db).get((-1, 0), 'message:4:4')
+        self.assertEqual(decision['tool_history'][0]['result'], 'ORIGINAL_TOOL_EVIDENCE')
+        self.b.history.db.execute('DELETE FROM tool_executions')
+        self.b.past_tool_results = Mock(side_effect=AssertionError('Replay must use frozen evidence'))
+        self.b.joke(current, current['message_id'], live=False)
+        self.assertEqual(self.b.writer_step.call_args.args[0], prompt)
+        self.b.past_tool_results.assert_not_called()
+
+    def test_known_unselected_reply_text_is_not_embedded_in_new_author_context(self):
+        old = self.message('EXCLUDED ORIGINAL TEXT')
+        self.b.history.add_message((-1, 0), old)
+        current = self.message('бот, ответь только на это')
+        current['reply_to_message'] = {**old, 'text': 'EXCLUDED ORIGINAL TEXT'}
+        self.b.select_context.return_value = {'ids': [current['message_id']]}
+        self.turn(current)
+        prompt = json.dumps(self.b.writer_step.call_args.args[0], ensure_ascii=False)
+        self.assertNotIn('EXCLUDED ORIGINAL TEXT', prompt)
+        self.assertIn('→ #1', prompt)
 
     def test_writer_gets_message_ids_without_repeated_target_excerpts(self):
         for text in ('ПЕРВАЯ УНИКАЛЬНАЯ РЕПЛИКА', 'ВТОРАЯ УНИКАЛЬНАЯ РЕПЛИКА'):
@@ -499,11 +538,11 @@ class ConversationTests(unittest.TestCase):
         messages = self.b.writer_step.call_args.args[0]
         self.assertEqual([m['role'] for m in messages], ['system', 'user', 'assistant', 'user'])
         self.assertEqual(messages[2]['content'], 'МОЙ ПРЕЖНИЙ ОТВЕТ')
-        self.assertIn('"id": 2', messages[1]['content'])
-        self.assertIn('"reply_to": 1', messages[1]['content'])
-        self.assertIn('— сегодня,', messages[1]['content'])
+        self.assertIn('#2 · Рофл', messages[1]['content'])
+        self.assertIn('→ #1', messages[1]['content'])
+        self.assertIn(datetime.date.today().strftime('%d.%m.%Y'), messages[1]['content'])
         self.assertIn('ЧУЖОЙ ОТВЕТ', messages[3]['content'])
-        self.assertIn('[4] Алексей → Рофл', messages[3]['content'])
+        self.assertIn('#4 · Алексей → #2', messages[3]['content'])
         self.assertIn('Сообщение для ответа: 4', messages[3]['content'])
         self.assertNotIn('МОЙ ПРЕЖНИЙ ОТВЕТ', messages[1]['content'])
 
@@ -531,21 +570,19 @@ class ConversationTests(unittest.TestCase):
         self.assertIn('старый ответ', messages[2]['content'])
         self.assertNotIn('[ответил]', json.dumps(self.b.direct.call_args.args[0], ensure_ascii=False))
 
-    def test_image_and_tool_cycle_follow_native_history(self):
+    def test_image_and_prefetched_tools_follow_native_history(self):
         current = self.dialogue()
         current['photo'] = [{'file_id': 'x'}]
         self.b.image = Mock(return_value='data:image/jpeg;base64,AA==')
-        self.b.writer_tool = Mock(return_value='данные инструмента')
-        self.b.writer_step.side_effect = [
-            {'role': 'assistant', 'content': None, 'tool_calls': [
-                {'id': 't1', 'type': 'function', 'function': {'name': 'che_novogo', 'arguments': '{}'}}]},
-            {'role': 'assistant', 'content': 'ответ с картинкой'}]
+        self.b.prepare_tools.return_value = ([{'tool': 'che_novogo', 'arguments': {},
+            'status': 'execute', 'result': 'данные инструмента'}], {'selected': 1})
         self.turn(current)
         messages = self.b.writer_step.call_args.args[0]
-        self.assertEqual([m['role'] for m in messages], ['system', 'user', 'assistant', 'user', 'assistant', 'tool'])
+        self.assertEqual([m['role'] for m in messages], ['system', 'user', 'assistant', 'user'])
         self.assertEqual(messages[3]['content'][1]['type'], 'image_url')
         self.assertIn('МОЙ ПРЕЖНИЙ ОТВЕТ', messages[2]['content'])
-        self.assertEqual(messages[-1]['tool_call_id'], 't1')
+        self.assertIn('данные инструмента', messages[3]['content'][0]['text'])
+        self.b.writer_step.assert_called_once()
 
     def test_ollama_also_receives_native_history(self):
         self.b.openrouter = False
@@ -594,7 +631,7 @@ class ConversationTests(unittest.TestCase):
         self.assertNotIn('ЧУЖОЙ ОТВЕТ', json.dumps(messages, ensure_ascii=False))
         self.assertIn('МОЙ ПРЕЖНИЙ ОТВЕТ', messages[2]['content'])
         self.assertEqual(messages[2]['content'], 'МОЙ ПРЕЖНИЙ ОТВЕТ')
-        self.assertIn('"date":', messages[1]['content'])
+        self.assertIn(datetime.date.today().strftime('%d.%m.%Y'), messages[1]['content'])
         self.assertTrue(all(set(m) == {'role', 'content'} for m in messages))
         self.assertEqual(trace['context_selection']['selected'], 3)
         self.assertNotIn('scores', trace['context_selection'])
@@ -727,10 +764,9 @@ class ConversationTests(unittest.TestCase):
             self.assertIn('error', self.b.balance(live=False))
             fetch.assert_not_called()
 
-    def test_invalid_tool_arguments_reach_writer_as_error(self):
-        self.b.writer_step.side_effect = [
-            {'role': 'assistant', 'tool_calls': [{'id': 't', 'function': {'name': 'che_novogo', 'arguments': 'invalid'}}]},
-            {'role': 'assistant', 'content': 'ладно'}]
+    def test_failed_prefetch_reaches_writer_as_error(self):
+        self.b.prepare_tools.return_value = ([{'tool': 'che_novogo', 'arguments': {}, 'status': 'error',
+            'result': 'Инструмент недоступен: RuntimeError'}], {})
         self.turn()
         self.assertIn('недоступен', self.b.writer_step.call_args.args[0][-1]['content'])
 
@@ -797,19 +833,20 @@ class ConversationTests(unittest.TestCase):
         self.assertEqual(empty['messages'], [])
         self.assertIn('Удалённая история недоступна', empty['note'])
 
-    def test_author_can_lookup_history_then_continue_without_external_calls(self):
+    def test_history_is_looked_up_before_author_without_external_calls(self):
         old = self.message('Мне понравился ник Паяснитель', date=time.time() - 60)
         self.b.history.add_message((-1, 0), old)
-        self.b.writer_step.side_effect = [
-            {'role': 'assistant', 'content': None, 'tool_calls': [{'id': 'h1', 'type': 'function',
-                'function': {'name': 'vspomnit', 'arguments': '{"query":"ник"}'}}]},
-            {'role': 'assistant', 'content': 'Ты выбрал Паяснителя.'}]
+        def prepare(message, snapshot, decision, live):
+            result = self.b.execute_tool('vspomnit', {'query': 'ник'}, message, snapshot, live)
+            return ([{'tool': 'vspomnit', 'arguments': {'query': 'ник'}, 'status': 'execute', 'result': result}], {})
+        self.b.prepare_tools.side_effect = prepare
+        self.b.writer_step.return_value = {'role': 'assistant', 'content': 'Ты выбрал Паяснителя.'}
         answer, trace = self.turn(self.message('бот, что мы выбрали?'), live=False)
         self.assertEqual(answer, 'Ты выбрал Паяснителя.')
         self.assertEqual(trace['tools'][0]['tool'], 'vspomnit')
+        self.b.writer_step.assert_called_once()
         result = self.b.writer_step.call_args.args[0][-1]
-        self.assertEqual(result['role'], 'tool')
-        self.assertEqual(result['tool_call_id'], 'h1')
+        self.assertEqual(result['role'], 'user')
         self.assertIn('Паяснитель', result['content'])
         self.b.api.assert_not_called()
 
@@ -885,7 +922,7 @@ class ConversationTests(unittest.TestCase):
         self.b.api.assert_called_once()
         self.b.direct.assert_called_once()
 
-    def test_writer_requests_functions_with_high_reasoning_and_records_usage(self):
+    def test_writer_disables_functions_with_high_reasoning_and_records_usage(self):
         response = {'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}],
                     'usage': {'prompt_tokens': 12, 'completion_tokens': 4, 'cost': .02}}
         with self.b.counting() as usage, patch('bot.post', return_value=response) as post:
@@ -893,7 +930,7 @@ class ConversationTests(unittest.TestCase):
         self.assertEqual(answer['content'], 'ok')
         payload = post.call_args.args[1]
         self.assertEqual(payload['reasoning'], {'effort': 'high'})
-        self.assertEqual(payload['tools'], conversation.TOOLS)
+        self.assertNotIn('tools', payload)
         self.assertEqual(usage[0]['output_tokens'], 4)
         self.assertEqual(usage[0]['cost'], .02)
 

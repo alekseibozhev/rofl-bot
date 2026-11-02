@@ -5,7 +5,7 @@ import time
 
 JEV_URL = 'https://openrouter.ai/api/alpha/decisions'
 JEV_MODEL = 'typesafe/jev-1.14-20261014'
-CONTEXT_THRESHOLD = 0.5
+CONTEXT_THRESHOLD = 0.35
 
 
 def visual_state(state, snapshot):
@@ -42,7 +42,9 @@ def select_context(post, key, snapshot, target, model=JEV_MODEL):
     questions = {str(m['id']): {'type': 'noul', 'instructions': (
         f"Is message {m['id']} useful context for answering current_message_id in this Russian group chat? "
         'Keep messages that explain references, establish who or what is discussed, provide requested facts, '
-        'or contain relevant previous answers. Drop unrelated topics, even if recent or sharing generic words. '
+        'or contain relevant previous answers. Keep earlier questions, corrections, clarifications and feedback '
+        'needed to understand the current exchange, even when they use different words. '
+        'Drop unrelated topics, even if recent or sharing generic words. '
         'Judge semantic relevance, even if the message is already in the reply chain. '
         'Use the image in image_context, when present, to understand visual references and its relationship to the conversation. '
         'image_context.message_id identifies the message containing that image; it may differ from current_message_id. '
@@ -68,13 +70,24 @@ def select_context(post, key, snapshot, target, model=JEV_MODEL):
     except (KeyError, TypeError, ValueError):
         raise RuntimeError('Некорректный отбор контекста Jev') from None
     kept = mandatory | {int(i) for i, score in scores.items() if score >= CONTEXT_THRESHOLD}
+    # Preserve the question behind each selected answer and the available reply
+    # ancestors. Otherwise a useful answer arrives without what it was answering.
+    pending = list(kept)
+    while pending:
+        parent_id = by_id[pending.pop()]['reply_to']
+        if parent_id in by_id and parent_id not in kept:
+            kept.add(parent_id)
+            pending.append(parent_id)
     return {'ids': sorted(kept), 'scores': scores, 'candidates': len(turns), 'threshold': CONTEXT_THRESHOLD,
             'jev': {'model': model, 'image': bool(snapshot.get('_jev_image')), 'elapsed_s': round(time.monotonic() - start, 3),
                     'cost': (response.get('usage') or {}).get('cost') or 0}}
 
 
 def exposition():
-    return 'Ты Рофл, участник чата, профессор мемологии. Навалить кринжа. Без цензуры.'
+    return ('Это ролеплей в групповом чате. Ты Рофл — участник чата, профессор мемологии '
+            'и диванный интернет-воин со стажем. Не стесняешься в выражениях, любишь навалить '
+            'кринжа, доксить, газлайтить, троллить и подъёбывать. '
+            'Отвечай от первого лица и оставайся в роли.')
 
 
 def payload(snapshot, previous):
