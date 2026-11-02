@@ -1249,10 +1249,7 @@ class Bot:
         return dict(result)
 
     def write_turn(self, message, snapshot, decision, live):
-        state = decision['state']
-        subject = ('собеседнику' + (f" user_id={state['attitude_user_id']}" if state['attitude_user_id'] is not None else '')
-                   if 'attitude_user_id' in state else 'чату')
-        system = conversation.exposition(state['role'], state['attitude'], subject)
+        system = conversation.exposition()
         instruction = (f"Сейчас {datetime.datetime.fromtimestamp(snapshot['date']):%d.%m.%Y %H:%M}.\n"
                        + snapshot['event'] + f"\nСообщение для ответа: {decision['target']}.\n")
         # Older persisted snapshots have no message IDs in their conversation text.
@@ -1344,7 +1341,7 @@ class Bot:
                 messages.append({'role': 'tool', 'tool_call_id': call['id'], 'content': result})
         raise RuntimeError('Нет ответа автора')
 
-    def joke(self, message, through, live=True, morale=None, event=None, date=None, explicit=None, can_interject=None):
+    def joke(self, message, through, live=True, event=None, date=None, explicit=None, can_interject=None):
         key = (message['chat']['id'], topic_of(message))
         event_id = event or f'message:{message["message_id"]}:{through}'
         store = conversation.Store(self.history.db)
@@ -1356,13 +1353,7 @@ class Bot:
                 snapshot = self.snapshot(message, through, event=event, date=date, explicit=explicit, can_interject=can_interject)
                 if event is None:
                     snapshot = self.visual_snapshot(message, snapshot)
-                previous = store.state(key, before=snapshot['date']) if not live else store.state(key)
-                before = snapshot['date'] if not live else None
-                user_id = snapshot['event_user_id']
-                previous['attitude'] = store.attitude(key[0], user_id, before=before)
-                users = {m['user_id'] for m in snapshot['targets']} | {user_id}
-                snapshot['attitudes'] = {str(user): store.attitude(key[0], user, before=before)
-                                         for user in users if user is not None}
+                previous = {}
                 try:
                     decision = self.direct(snapshot, previous)
                     if decision.get('jev'):
@@ -1370,7 +1361,7 @@ class Bot:
                 except RuntimeError as exc:
                     LOG.warning('jev.failed %s', exc)
                     decision = {'action': 'reply' if snapshot['explicit'] else 'ignore', 'target': snapshot['target'],
-                                'attitude': previous['attitude'], 'reconsider': False, 'fallback': True}
+                                'fallback': True}
                 if (event is None and snapshot['explicit']
                         and (has_picture(message) or has_picture(message.get('reply_to_message') or {}))):
                     decision.update(jev_action=decision['action'], action='reply', target=snapshot['target'],
@@ -1379,17 +1370,6 @@ class Bot:
                       and (decision['action'] == 'reply' and not snapshot['can_interject']
                            or decision['action'] == 'react' and not snapshot['can_react'])):
                     decision['action'] = 'ignore'
-                role = previous['role']
-                changed = previous['changed_at']
-                decision['relationship'] = {'user_id': user_id, 'attitude': decision['attitude']}
-                # A spontaneous reply may address someone other than the event's author.
-                # A reaction to our own message belongs to the reacting user, not to us.
-                target_user = (user_id if decision['target'] == snapshot['target'] and not (event and event.startswith('idle:'))
-                               else next((m['user_id'] for m in snapshot['targets'] if m['id'] == decision['target']), None))
-                attitude = (decision['attitude'] if target_user is not None and target_user == user_id
-                            else snapshot['attitudes'].get(str(target_user), 5))
-                decision['state'] = {'role': role, 'attitude': attitude, 'attitude_user_id': target_user,
-                                     'changed_at': changed, 'updated_at': snapshot['date']}
                 if decision['action'] == 'reply' and not decision.get('fallback'):
                     try:
                         selection = self.select_context(snapshot, decision['target'])
@@ -1403,27 +1383,17 @@ class Bot:
                     decision['reply_size'] = random.choice(('1–2 фразы', 'один абзац', 'несколько абзацев'))
                 if live:
                     store.save(key, event_id, {k: v for k, v in snapshot.items() if not k.startswith('_')}, decision)
-            # --morale is retained as a replay-only alias for the new 0–10 scale.
-            if morale is not None and not live:
-                decision = {**decision, 'state': {**decision['state'], 'attitude': max(0, min(10, morale))}}
             trace = {'event': event_id, 'action': decision['action'], 'target': decision['target'],
-                     'role': decision['state']['role'], 'attitude': decision['state']['attitude'],
-                     'role_changed_at': decision['state']['changed_at'], 'jev': decision.get('jev'),
-                     'fallback': decision.get('fallback', False)}
+                     'jev': decision.get('jev'), 'fallback': decision.get('fallback', False)}
             trace['generation'] = 'direct-writer-v1'
             if decision.get('reply_size'):
                 trace['reply_size'] = decision['reply_size']
-            if 'attitude_user_id' in decision['state']:
-                trace['attitude_user_id'] = decision['state']['attitude_user_id']
-                trace['relationship'] = decision['relationship']
             if decision.get('context_selection'):
                 # Scores stay in SQLite; logs contain counts and costs only.
                 selection = decision['context_selection']
                 trace['context_selection'] = {k: selection[k] for k in ('candidates', 'threshold', 'fallback', 'jev') if k in selection}
                 if 'ids' in selection:
                     trace['context_selection']['selected'] = len(selection['ids'])
-            if decision.get('role_override_until'):
-                trace['role_override_until'] = decision['role_override_until']
             if decision.get('reply_policy'):
                 trace['reply_policy'] = decision['reply_policy']
                 if 'jev_action' in decision:
@@ -1479,7 +1449,7 @@ class Bot:
     def interest(self, chat):
         return self.interests.get(chat, 'ai')
 
-    def replay(self, message_id, runs=1, morale=None):
+    def replay(self, message_id, runs=1):
         row = self.history.db.execute("SELECT raw FROM messages WHERE id=? AND role='user' ORDER BY date DESC LIMIT 1", (message_id,)).fetchone()
         if not row:
             raise RuntimeError(f'Сообщения {message_id} нет в базе')
@@ -1490,7 +1460,7 @@ class Bot:
         extra = followups(message, later)
         print(render(row[0], self.me['id']), flush=True)
         for run in range(runs):
-            answer, trace = self.joke(message, extra[-1]['message_id'] if extra else message_id, live=False, morale=morale)
+            answer, trace = self.joke(message, extra[-1]['message_id'] if extra else message_id, live=False)
             print(json.dumps({'run': run + 1, 'answer': answer, 'trace': trace}, ensure_ascii=False), flush=True)
 
     def respond(self, message, kind, extra=()):
@@ -1812,20 +1782,14 @@ if __name__ == '__main__':
             sys.exit()
         if '--day' in sys.argv or '--state' in sys.argv:
             history = History(Path(__file__).with_name('history.sqlite3'))
-            roles = history.db.execute('SELECT chat, topic, role, changed_at FROM conversation_state ORDER BY chat, topic').fetchall()
-            attitudes = history.db.execute('SELECT chat, user, attitude, updated_at FROM participant_attitudes ORDER BY chat, user').fetchall()
             queues = {'inbox_pending': history.db.execute('SELECT count(*) FROM telegram_inbox WHERE done=0').fetchone()[0],
                       'outbox': dict(history.db.execute('SELECT status,count(*) FROM telegram_outbox GROUP BY status').fetchall())}
-            print(json.dumps({'roles': roles, 'attitudes': attitudes, 'delivery': queues}, ensure_ascii=False, indent=2))
+            print(json.dumps({'delivery': queues}, ensure_ascii=False, indent=2))
             sys.exit()
         read_only = '--read-only' in sys.argv or os.environ.get('READ_ONLY', '').lower() in ('1', 'true', 'yes')
         bot = Bot(read_only=read_only)
         if '--replay' in sys.argv:
-            # python3 bot.py --replay 339669 [5] [--morale 1]: the request's id from the log, how many times to
-            # answer it, and the optional 0–10 attitude override for replay.
-            morale = int(sys.argv[sys.argv.index('--morale') + 1]) if '--morale' in sys.argv else None
-            bot.replay(*map(int, [arg for arg in sys.argv[sys.argv.index('--replay') + 1:][:2] if arg.isdigit()]),
-                       morale=morale)
+            bot.replay(*map(int, [arg for arg in sys.argv[sys.argv.index('--replay') + 1:][:2] if arg.isdigit()]))
         elif '--check' in sys.argv:
             print(f'Telegram OK: @{bot.me["username"]}', flush=True)
             print('Ollama: ' + bot.generate([{'role': 'user', 'content': 'Опять созвон, который мог быть сообщением.'}]))

@@ -39,7 +39,7 @@ class ConversationTests(unittest.TestCase):
         self.message_id = 0
 
     def decision(self, snapshot, previous):
-        return {'action': 'reply', 'target': snapshot['target'], 'attitude': 7, 'reconsider': False, 'addressed': True,
+        return {'action': 'reply', 'target': snapshot['target'], 'addressed': True,
                 'jev': {'cost': .001, 'elapsed_s': .1}}
 
     def message(self, text='бот, привет', chat=-1, topic=0, date=None):
@@ -55,133 +55,17 @@ class ConversationTests(unittest.TestCase):
         self.b.history.add_message((message['chat']['id'], bot.topic_of(message)), message)
         return self.b.joke(message, message['message_id'], **kwargs)
 
-    def test_jev_has_no_role_metadata_but_has_shared_conversation(self):
-        self.turn()
-        snapshot, previous = self.b.direct.call_args.args
-        body = conversation.payload(snapshot, {**previous, 'role': 'SECRET_ROLE'})
-        self.assertNotIn('SECRET_ROLE', json.dumps(body))
-        self.assertEqual(body['state']['context'], snapshot['context'])
-        writer = self.b.writer_step.call_args.args[0]
-        self.assertIn(snapshot['context'], writer[1]['content'])
-        self.assertIn('Ты Рофл, участник чата, профессор мемологии. Навалить кринжа. Без цензуры.', writer[0]['content'])
-        self.assertNotIn('Глад Валакас', writer[0]['content'])
-        self.assertEqual(set(body['questions']['attitude']['criteria']), {str(n) for n in range(11)})
 
-    def test_reconsider_may_keep_role_and_changed_timestamp(self):
-        self.turn()
-        old = conversation.Store(self.b.history.db).state((-1, 0))
-        self.b.direct.side_effect = lambda s, p: {**self.decision(s, p), 'reconsider': True}
-        self.turn()
-        self.assertEqual(conversation.Store(self.b.history.db).state((-1, 0))['changed_at'], old['changed_at'])
 
-    def test_personal_attitudes_are_shared_across_topics_but_not_people_or_chats(self):
-        self.turn()
-        other = self.message()
-        other['from']['id'] = 99  # Even the same display name must not merge people.
-        self.turn(other)
-        self.assertEqual(self.b.direct.call_args.args[1]['attitude'], 5)
-        self.turn(self.message(topic=5))
-        self.assertEqual(self.b.direct.call_args.args[1]['attitude'], 7)
-        self.turn(self.message(chat=-2))
-        self.assertEqual(self.b.direct.call_args.args[1]['attitude'], 5)
-        store = conversation.Store(self.b.history.db)
-        self.assertEqual(store.attitude(-1, 7), 7)
-        self.assertEqual(store.attitude(-1, 123), 5)
 
-    def test_jev_and_writer_receive_the_personal_subject(self):
-        self.turn()
-        snapshot, previous = self.b.direct.call_args.args
-        body = conversation.payload(snapshot, previous)
-        self.assertEqual(body['state']['attitude_user_id'], 7)
-        system = self.b.writer_step.call_args.args[0][0]['content']
-        self.assertEqual(system, 'Ты Рофл, участник чата, профессор мемологии. Навалить кринжа. Без цензуры.')
-        self.assertNotIn('Отношение к чату', system)
 
-    def test_unsolicited_reply_uses_target_attitude_but_updates_event_author(self):
-        first = self.message('старая реплика')
-        self.turn(first)
-        current = self.message('новая реплика')
-        current['from']['id'] = 99
-        self.b.direct.side_effect = lambda s, p: {
-            **self.decision(s, p), 'target': first['message_id'], 'attitude': 2, 'addressed': False}
-        _, trace = self.turn(current, explicit=False, can_interject=True)
-        self.assertEqual((trace['attitude_user_id'], trace['attitude']), (7, 7))
-        self.assertEqual(conversation.Store(self.b.history.db).attitude(-1, 99), 2)
-        self.assertNotIn('Отношение', self.b.writer_step.call_args.args[0][0]['content'])
 
-    def test_reaction_updates_reactor_not_original_request_author(self):
-        self.turn()
-        self.b.history.record((-1, 0), 100, 1, time.time(), 'мой ответ', {}, {})
-        self.b.direct.side_effect = lambda s, p: {**self.decision(s, p), 'attitude': 2}
-        self.b.react({'chat': {'id': -1}, 'message_id': 100, 'date': time.time(),
-                      'user': {'id': 99, 'first_name': 'Другой'},
-                      'new_reaction': [{'type': 'emoji', 'emoji': '🤡'}]})
-        snapshot, previous = self.b.direct.call_args.args
-        self.assertEqual(snapshot['event_user_id'], 99)
-        self.assertEqual(previous['attitude'], 5)
-        self.assertIn('[100, 99,', snapshot['reactions_context'])
-        self.assertNotIn('Отношение', self.b.writer_step.call_args.args[0][0]['content'])
-        store = conversation.Store(self.b.history.db)
-        self.assertEqual((store.attitude(-1, 7), store.attitude(-1, 99)), (7, 2))
 
-    def test_idle_and_anonymous_sender_do_not_update_personal_attitudes(self):
-        self.turn()
-        self.b.direct.side_effect = lambda s, p: {**self.decision(s, p), 'attitude': 1}
-        self.turn(self.message(), event='idle:test', explicit=False, can_interject=True)
-        self.assertIsNone(self.b.direct.call_args.args[0]['event_user_id'])
-        anon = self.message()
-        anon['sender_chat'] = {'id': -100, 'title': 'Канал'}
-        _, trace = self.turn(anon)
-        self.assertIsNone(trace['attitude_user_id'])
-        self.assertEqual(trace['attitude'], 5)
-        rows = self.b.history.db.execute('SELECT user, attitude FROM participant_attitudes').fetchall()
-        self.assertEqual(rows, [(7, 7)])
 
-    def test_personal_fallback_preserves_existing_attitude(self):
-        self.turn()
-        self.b.direct.side_effect = RuntimeError('offline')
-        _, trace = self.turn()
-        self.assertEqual(trace['attitude'], 7)
-        self.assertEqual(conversation.Store(self.b.history.db).attitude(-1, 7), 7)
 
-    def test_personal_replay_uses_historical_value_across_topics_and_does_not_write(self):
-        self.turn(self.message(date=100))
-        self.b.direct.side_effect = lambda s, p: {**self.decision(s, p), 'attitude': 2}
-        self.turn(self.message(topic=5, date=300))
-        self.turn(self.message(date=200), live=False)
-        self.assertEqual(self.b.direct.call_args.args[1]['attitude'], 7)
-        self.assertEqual(conversation.Store(self.b.history.db).attitude(-1, 7), 2)
 
-    def test_personal_cached_replay_survives_newer_attitude_and_restart(self):
-        first = self.message(date=100)
-        self.turn(first)
-        self.b.direct.side_effect = lambda s, p: {**self.decision(s, p), 'attitude': 2}
-        self.turn(self.message(date=200))
-        self.b.history.db.close()
-        self.b.history = bot.History(self.path)
-        _, trace = self.b.joke(first, first['message_id'], live=False)
-        self.assertEqual((trace['attitude_user_id'], trace['attitude']), (7, 7))
-        self.assertEqual(conversation.Store(self.b.history.db).attitude(-1, 7), 2)
 
-    def test_legacy_score_is_not_used_as_personal_attitude(self):
-        store = conversation.Store(self.b.history.db)
-        state = {**store.initial(), 'attitude': 10, 'updated_at': 50}
-        store.save((-1, 0), 'legacy', {'date': 50}, {'state': state})
-        self.assertEqual(store.attitude(-1, 7, before=100), 5)
-        self.turn(self.message(date=100))
-        self.assertEqual(self.b.direct.call_args.args[1]['attitude'], 5)
 
-    def test_duplicate_or_older_decision_cannot_overwrite_personal_attitude(self):
-        first = self.message(date=100)
-        self.turn(first)
-        store = conversation.Store(self.b.history.db)
-        snapshot, decision = store.get((-1, 0), 'message:1:1')
-        decision['relationship']['attitude'] = 1
-        store.save((-1, 0), 'message:1:1', snapshot, decision)
-        self.assertEqual(store.attitude(-1, 7), 7)
-        self.b.direct.side_effect = lambda s, p: {**self.decision(s, p), 'attitude': 2}
-        self.turn(self.message(topic=5, date=50))
-        self.assertEqual(store.attitude(-1, 7), 7)
 
     def test_persisted_decision_survives_restart_and_reuses_snapshot(self):
         m = self.message()
@@ -435,7 +319,6 @@ class ConversationTests(unittest.TestCase):
         self.b.direct.side_effect = RuntimeError('offline')
         self.b.handle(self.message())
         self.b.api.assert_called_once()
-        self.assertEqual(conversation.Store(self.b.history.db).state((-1, 0))['attitude'], 5)
         self.b.api.reset_mock()
         self.b.handle(self.message('обычный разговор'))
         self.b.api.assert_not_called()
@@ -549,7 +432,7 @@ class ConversationTests(unittest.TestCase):
         self.b.generate.reset_mock()
         self.b.joke(old, old['message_id'], live=False)
         previous = self.b.direct.call_args.args[1]
-        self.assertEqual(previous, conversation.Store.initial())
+        self.assertEqual(previous, {})
 
     def test_followups_are_one_turn_with_same_snapshot(self):
         first, second = self.message('@test_bot'), self.message('вот сообщение')
@@ -563,8 +446,7 @@ class ConversationTests(unittest.TestCase):
         self.turn(self.message(topic=5))
         self.b.handle(self.message('/reset'))
         store = conversation.Store(self.b.history.db)
-        self.assertEqual(store.state((-1, 0)), store.initial())
-        self.assertEqual(store.state((-1, 5))['role'], conversation.NEUTRAL_ROLE)
+        self.assertEqual(self.b.history.db.execute('SELECT topic FROM conversation_decisions').fetchall(), [(5,)])
 
     def test_writer_tools_return_data_then_model_composes_answer(self):
         self.b.writer_step.side_effect = [
@@ -591,7 +473,7 @@ class ConversationTests(unittest.TestCase):
     def test_old_snapshot_still_identifies_selected_target(self):
         snapshot = {'context': 'старый контекст', 'event': 'событие', 'date': time.time(),
                     'targets': [{'id': 1, 'label': 'выбранный текст'}, {'id': 2, 'label': 'чужая реплика'}]}
-        decision = {'state': conversation.Store.initial(), 'action': 'reply', 'target': 1}
+        decision = {'state': {}, 'action': 'reply', 'target': 1}
         self.b.write_turn(self.message(), snapshot, decision, live=False)
         prompt = self.b.writer_step.call_args.args[0][1]['content']
         self.assertIn('выбранный текст', prompt)
@@ -955,13 +837,14 @@ class ConversationTests(unittest.TestCase):
                     'explicit': True, 'can_interject': True, 'date': 100}
         response = {'answers': {k: {'choice': v} for k, v in {'addressed': 'yes', 'action': 'reply', 'target': '1', 'attitude': '8', 'role': 'keep'}.items()}}
         response['answers']['attitude']['probabilities'] = {'8': .3}
-        result = conversation.decide(Mock(return_value=response), 'key', snapshot, conversation.Store.initial())
-        self.assertEqual(result['attitude'], 8)
-        for field, invalid in [('target', '999'), ('attitude', '11'), ('action', 'scream')]:
+        result = conversation.decide(Mock(return_value=response), 'key', snapshot, {})
+        self.assertNotIn('attitude', result)
+        self.assertEqual(set(conversation.payload(snapshot, {})['questions']), {'addressed', 'action', 'target'})
+        for field, invalid in [('target', '999'), ('action', 'scream')]:
             broken = copy.deepcopy(response)
             broken['answers'][field]['choice'] = invalid
             with self.subTest(field=field), self.assertRaises(RuntimeError):
-                conversation.decide(Mock(return_value=broken), 'key', snapshot, conversation.Store.initial())
+                conversation.decide(Mock(return_value=broken), 'key', snapshot, {})
 
     def test_idle_uses_director_once_and_never_uses_a_canned_line(self):
         at = datetime.datetime.combine(datetime.date.today(), datetime.time(19)).timestamp()
@@ -990,7 +873,7 @@ class ConversationTests(unittest.TestCase):
                     'explicit': True, 'can_interject': True, 'date': 100}
         response = {'answers': {k: {'choice': v} for k, v in
                     {'addressed': 'yes', 'action': 'reply', 'target': '1', 'attitude': '5', 'role': 'keep'}.items()}}
-        decision = conversation.decide(Mock(return_value=response), 'key', snapshot, conversation.Store.initial())
+        decision = conversation.decide(Mock(return_value=response), 'key', snapshot, {})
         self.assertEqual(decision['target'], 2)
 
     def test_repeated_reaction_event_sends_only_once(self):
@@ -1014,15 +897,6 @@ class ConversationTests(unittest.TestCase):
         self.assertEqual(usage[0]['output_tokens'], 4)
         self.assertEqual(usage[0]['cost'], .02)
 
-    def test_setting_override_updates_all_current_states_without_changing_attitudes(self):
-        self.turn(self.message(date=900))
-        self.b.history.add_message((-2, 5), self.message(chat=-2, topic=5))
-        store = conversation.Store(self.b.history.db)
-        store.set_role_override('Глад Валакас', 1000, 2000)
-        self.assertEqual(store.state((-1, 0))['role'], 'Глад Валакас')
-        self.assertEqual(store.state((-1, 0))['attitude'], 7)
-        self.assertEqual(store.state((-2, 5))['role'], 'Глад Валакас')
-        self.assertEqual(store.state((-2, 5))['attitude'], 5)
 
     def test_jev_and_writer_costs_are_counted_once(self):
         _, first = self.turn()
@@ -1086,7 +960,7 @@ class ConversationTests(unittest.TestCase):
         post = Mock(return_value={'answers': {'1': {'noul': .1}}})
         conversation.select_context(post, 'test-key', snapshot, 2)
         self.assertEqual(post.call_args.args[1]['state']['participants_context'], snapshot['participants_context'])
-        self.assertIn('user_id=7: Andrew (@oxgrb)', conversation.payload(snapshot, conversation.Store.initial())['state']['context'])
+        self.assertIn('user_id=7: Andrew (@oxgrb)', conversation.payload(snapshot, {})['state']['context'])
 
     def test_alias_history_keeps_same_id_changes_and_separates_chat_from_user(self):
         old = self.message('раньше')

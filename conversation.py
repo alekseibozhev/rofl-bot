@@ -5,7 +5,6 @@ import time
 
 JEV_URL = 'https://openrouter.ai/api/alpha/decisions'
 JEV_MODEL = 'typesafe/jev-1.14-20261014'
-NEUTRAL_ROLE = 'участник чата'
 CONTEXT_THRESHOLD = 0.5
 
 
@@ -74,7 +73,7 @@ def select_context(post, key, snapshot, target, model=JEV_MODEL):
                     'cost': (response.get('usage') or {}).get('cost') or 0}}
 
 
-def exposition(role, attitude, subject='чату'):
+def exposition():
     return 'Ты Рофл, участник чата, профессор мемологии. Навалить кринжа. Без цензуры.'
 
 
@@ -86,8 +85,7 @@ def payload(snapshot, previous):
     # Normalize explicit calls even for older snapshots with a raw cooldown flag.
     state['can_interject'] = snapshot['explicit'] or snapshot['can_interject']
     state['can_react'] = snapshot['explicit'] or snapshot.get('can_react', True)
-    state.update(attitude=previous['attitude'], role_changed_at=previous['changed_at'], now=snapshot['date'])
-    state['attitude_user_id'] = snapshot.get('event_user_id')
+    state['now'] = snapshot['date']
     state = visual_state(state, snapshot)
     return {'model': JEV_MODEL, 'state': state, 'questions': {
         'addressed': {'type': 'choice', 'instructions': 'Does this event address Rofl, explicitly or implicitly? He is also called «бот». explicit=true means a reliable mention, call or reply to him.',
@@ -112,19 +110,7 @@ def payload(snapshot, previous):
             'criteria': {'ignore': 'stay silent', 'reply': 'answer with words', 'react': 'acknowledge with an emoji'}},
         'target': {'type': 'choice', 'instructions': 'Which listed message is the response or reaction to? If the event addresses Rofl, use the incoming event target, not an earlier quoted message. Only unsolicited participation may target an earlier message.',
                    'criteria': targets},
-        'attitude': {'type': 'choice', 'instructions': (
-            'How does Rofl feel about the single participant identified by attitude_user_id? '
-            'Update the previous value for this participant using their message or reaction and the conversation. '
-            'Praise, teasing, feedback or reactions from other people must not change this participant\'s value. '
-            'Use Telegram user IDs, not matching names, to identify people. '
-            'If attitude_user_id is null, keep the previous value. '
-            'This is emotional intensity, not confidence. 0 = completely fed up, 5 = neutral, 10 = showered with affection.'),
-            'criteria': {str(n): str(n) + '/10' for n in range(11)}},
-        'role': {'type': 'choice', 'instructions': (
-            'Should the participant reconsider his current role because the conversation has materially changed? '
-            'You do not choose or describe that role. Keeping it indefinitely is fine. A new message alone '
-            'does not require a change.'),
-            'criteria': {'keep': 'keep the current role', 'reconsider': 'reconsider the role for this conversation'}}}}
+        }}
 
 
 def decide(post, key, snapshot, previous, model=JEV_MODEL):
@@ -137,16 +123,13 @@ def decide(post, key, snapshot, previous, model=JEV_MODEL):
         action = answers['action']['choice']
         addressed = answers['addressed']['choice']
         target = int(answers['target']['choice'])
-        attitude = int(answers['attitude']['choice'])
-        reconsider = answers['role']['choice']
-        if (addressed not in ('yes', 'no') or action not in ('ignore', 'reply', 'react') or not 0 <= attitude <= 10
-                or target not in {m['id'] for m in snapshot['targets']} | {snapshot['target']}
-                or reconsider not in ('keep', 'reconsider')):
+        if (addressed not in ('yes', 'no') or action not in ('ignore', 'reply', 'react')
+                or target not in {m['id'] for m in snapshot['targets']} | {snapshot['target']}):
             raise ValueError()
     except (KeyError, TypeError, ValueError):
         raise RuntimeError('Некорректное решение Jev') from None
     return {'addressed': addressed == 'yes', 'action': action,
-            'target': snapshot['target'] if addressed == 'yes' or snapshot['explicit'] else target, 'attitude': attitude, 'reconsider': reconsider == 'reconsider',
+            'target': snapshot['target'] if addressed == 'yes' or snapshot['explicit'] else target,
             'jev': {'model': model, 'image': bool(snapshot.get('_jev_image')), 'elapsed_s': round(time.monotonic() - start, 3),
                     'cost': (response.get('usage') or {}).get('cost') or 0}}
 
@@ -154,96 +137,20 @@ def decide(post, key, snapshot, previous, model=JEV_MODEL):
 class Store:
     def __init__(self, db):
         self.db = db
-        db.execute('''CREATE TABLE IF NOT EXISTS conversation_state (
-            chat INTEGER, topic INTEGER, role TEXT, attitude INTEGER, changed_at REAL, updated_at REAL,
-            PRIMARY KEY(chat, topic))''')
         db.execute('''CREATE TABLE IF NOT EXISTS conversation_decisions (
             chat INTEGER, topic INTEGER, event TEXT, date REAL, snapshot TEXT, decision TEXT,
             PRIMARY KEY(chat, topic, event))''')
-        db.execute('''CREATE TABLE IF NOT EXISTS conversation_role_overrides (
-            starts REAL PRIMARY KEY, ends REAL NOT NULL, role TEXT NOT NULL)''')
-        db.execute('''CREATE TABLE IF NOT EXISTS participant_attitudes (
-            chat INTEGER, user INTEGER, attitude INTEGER NOT NULL, updated_at REAL NOT NULL,
-            PRIMARY KEY(chat, user))''')
-        db.execute('''CREATE TABLE IF NOT EXISTS participant_attitude_backfill (
-            chat INTEGER, user INTEGER, event TEXT, date REAL, attitude INTEGER NOT NULL,
-            PRIMARY KEY(chat, user, event))''')
-
-    def set_role_override(self, role, starts, ends):
-        if not role.strip() or ends <= starts:
-            raise ValueError('A role override needs a name and a positive time interval')
-        with self.db:
-            self.db.execute('INSERT INTO conversation_role_overrides VALUES (?, ?, ?)', (starts, ends, role))
-            self.db.execute('''INSERT OR IGNORE INTO conversation_state
-                SELECT DISTINCT chat, topic, ?, 5, ?, ? FROM messages''', (role, starts, starts))
-            self.db.execute('''UPDATE conversation_state SET role=?, changed_at=?,
-                updated_at=max(updated_at, ?)''', (role, starts, starts))
-
-    def role_override(self, at):
-        row = self.db.execute('''SELECT role, starts, ends FROM conversation_role_overrides
-            WHERE starts <= ? AND ends > ? ORDER BY starts DESC LIMIT 1''', (at, at)).fetchone()
-        return dict(zip(('role', 'starts', 'ends'), row)) if row else None
-
-    def role_override_expired(self, state, at):
-        return bool(self.db.execute('''SELECT 1 FROM conversation_role_overrides
-            WHERE starts=? AND role=? AND ends<=? LIMIT 1''',
-                                   (state['changed_at'], state['role'], at)).fetchone())
-
-    def state(self, key, before=None):
-        if before is not None:
-            row = self.db.execute('''SELECT decision FROM conversation_decisions
-                WHERE chat=? AND topic=? AND date < ? ORDER BY date DESC, rowid DESC LIMIT 1''', (*key, before)).fetchone()
-            return json.loads(row[0])['state'] if row else self.initial()
-        row = self.db.execute('SELECT role, attitude, changed_at, updated_at FROM conversation_state WHERE chat=? AND topic=?', key).fetchone()
-        return dict(zip(('role', 'attitude', 'changed_at', 'updated_at'), row)) if row else self.initial()
-
-    @staticmethod
-    def initial():
-        return {'role': NEUTRAL_ROLE, 'attitude': 5, 'changed_at': 0, 'updated_at': 0}
-
     def get(self, key, event):
         row = self.db.execute('SELECT snapshot, decision FROM conversation_decisions WHERE chat=? AND topic=? AND event=?', (*key, event)).fetchone()
         return (json.loads(row[0]), json.loads(row[1])) if row else None
 
-    def attitude(self, chat, user, before=None):
-        if user is None:
-            return 5
-        if before is not None:
-            # Personal history spans topics; legacy chat-wide scores are not personal evidence.
-            row = self.db.execute('''SELECT attitude FROM (
-                SELECT json_extract(decision, '$.relationship.attitude') AS attitude, date, rowid AS seq, 1 AS live
-                FROM conversation_decisions WHERE chat=? AND date < ?
-                AND json_extract(decision, '$.relationship.user_id')=?
-                UNION ALL SELECT attitude, date, rowid, 0 FROM participant_attitude_backfill
-                WHERE chat=? AND date < ? AND user=?)
-                ORDER BY date DESC, live DESC, seq DESC LIMIT 1''', (chat, before, user, chat, before, user)).fetchone()
-        else:
-            row = self.db.execute('SELECT attitude FROM participant_attitudes WHERE chat=? AND user=?',
-                                  (chat, user)).fetchone()
-        return row[0] if row else 5
-
     def save(self, key, event, snapshot, decision):
-        state = decision['state']
         with self.db:
-            inserted = self.db.execute('INSERT OR IGNORE INTO conversation_decisions VALUES (?, ?, ?, ?, ?, ?)',
-                                      (*key, event, snapshot['date'], json.dumps(snapshot, ensure_ascii=False), json.dumps(decision, ensure_ascii=False)))
-            if not inserted.rowcount:
-                return
-            relationship = decision.get('relationship')
-            if relationship and relationship['user_id'] is not None:
-                self.db.execute('''INSERT INTO participant_attitudes VALUES (?, ?, ?, ?)
-                    ON CONFLICT(chat,user) DO UPDATE SET attitude=excluded.attitude, updated_at=excluded.updated_at
-                    WHERE excluded.updated_at >= participant_attitudes.updated_at''',
-                    (key[0], relationship['user_id'], relationship['attitude'], snapshot['date']))
-            self.db.execute('''INSERT INTO conversation_state VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(chat,topic) DO UPDATE SET role=excluded.role, attitude=excluded.attitude,
-                changed_at=excluded.changed_at, updated_at=excluded.updated_at
-                WHERE excluded.updated_at >= conversation_state.updated_at''',
-                            (*key, state['role'], state['attitude'], state['changed_at'], state['updated_at']))
+            self.db.execute('INSERT OR IGNORE INTO conversation_decisions VALUES (?, ?, ?, ?, ?, ?)',
+                            (*key, event, snapshot['date'], json.dumps(snapshot, ensure_ascii=False), json.dumps(decision, ensure_ascii=False)))
 
     def clear(self, key):
         with self.db:
-            self.db.execute('DELETE FROM conversation_state WHERE chat=? AND topic=?', key)
             self.db.execute('DELETE FROM conversation_decisions WHERE chat=? AND topic=?', key)
 
 

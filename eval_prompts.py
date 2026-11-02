@@ -3,7 +3,7 @@
 python3 eval_prompts.py --output /tmp/prompts.json
 python3 eval_prompts.py --module /tmp/old_bot.py --output /tmp/prompts-before.json
 
-Uses the configured model (paid API calls), real Jev decisions, role selection and writing, and a temporary database per case.
+Uses the configured model (paid API calls), real Jev decisions, writing, and a temporary database per case.
 Web lookup is disabled and reported; this evaluates conversation behaviour, not retrieval accuracy.
 No automatic funniness score: read the replies and compare relevance, surprise, repetition and unnecessary tails.
 """
@@ -108,22 +108,19 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--cases', nargs='+', choices=[name for name, _ in CASES])
     parser.add_argument('--workers', type=int, default=2, choices=(1, 2))
-    parser.add_argument('--role', help='Optional role name for a controlled comparison; otherwise the model chooses')
     args = parser.parse_args()
     # Load only configuration from the workspace, never Bot.__init__ or the production database.
     import bot
     bot.load_env()
     module = load_module(args.module)
     module.headlines = lambda *args, **kwargs: []
-    if args.role:
-        module.Bot.choose_role = lambda self, snapshot, previous: args.role
     cases = [case for case in CASES if not args.cases or case[0] in args.cases]
     results = []
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         for result in pool.map(lambda case: evaluate(module, case), cases):
             results.append(result)
             print(f'{result["case"]}: {result["answer"]}', flush=True)
-            args.output.write_text(json.dumps({'module': str(args.module), 'role': args.role, 'synthetic_only': True,
+            args.output.write_text(json.dumps({'module': str(args.module), 'synthetic_only': True,
                                               'web_lookup_disabled': True, 'results': results},
                                              ensure_ascii=False, indent=2) + '\n')
     if any(result['trace'] is None for result in results):
