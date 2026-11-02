@@ -1065,15 +1065,6 @@ class Bot:
         return conversation.select_context(post, getattr(self, 'openrouter_key', ''), snapshot, target,
                                            os.environ.get('JEV_MODEL', conversation.JEV_MODEL))
 
-    def choose_role(self, snapshot, previous):
-        answer = self.generate([{'role': 'user', 'content': snapshot['context'] + '\n\n'
-                               + snapshot['event'] + f"\nПредыдущая роль: {previous['role']}"}],
-                               system=conversation.ROLE_PICKER, effort=self.effort)
-        # A role is a name, not another prompt or a card of traits.
-        role = answer.strip().strip('«»"')
-        if not role or len(role) > 160 or '\n' in role:
-            raise RuntimeError('Модель не вернула короткое название роли')
-        return role
 
     def writer_step(self, messages, tools=True):
         payload = {'model': self.model, 'messages': messages, 'temperature': 1.0, 'max_tokens': 6000,
@@ -1389,20 +1380,7 @@ class Bot:
                            or decision['action'] == 'react' and not snapshot['can_react'])):
                     decision['action'] = 'ignore'
                 role = previous['role']
-                override = store.role_override(snapshot['date'])
-                expired = store.role_override_expired(previous, snapshot['date'])
-                selected = False
-                if override:
-                    role = override['role']
-                    decision['role_override_until'] = override['ends']
-                elif decision['action'] != 'ignore' and (not previous['changed_at'] or decision['reconsider'] or expired):
-                    try:
-                        role = self.choose_role(snapshot, previous)
-                        selected = True
-                    except RuntimeError as exc:
-                        LOG.warning('role.failed %s', exc)
-                changed = (override['starts'] if override else snapshot['date']
-                           if role != previous['role'] or selected and expired else previous['changed_at'])
+                changed = previous['changed_at']
                 decision['relationship'] = {'user_id': user_id, 'attitude': decision['attitude']}
                 # A spontaneous reply may address someone other than the event's author.
                 # A reaction to our own message belongs to the reacting user, not to us.

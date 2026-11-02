@@ -67,31 +67,12 @@ class ConversationTests(unittest.TestCase):
         self.assertNotIn('Глад Валакас', writer[0]['content'])
         self.assertEqual(set(body['questions']['attitude']['criteria']), {str(n) for n in range(11)})
 
-    def test_role_is_open_and_stays_until_director_reconsiders(self):
-        self.b.generate.return_value = 'типичная анимешница 200кг'
-        self.turn()
-        self.turn()
-        self.b.generate.assert_called_once()
-        self.assertEqual(conversation.Store(self.b.history.db).state((-1, 0))['role'], 'типичная анимешница 200кг')
-        self.b.direct.side_effect = lambda s, p: {**self.decision(s, p), 'reconsider': True}
-        self.b.generate.return_value = 'Ким Кицураги'
-        self.turn()
-        self.assertEqual(self.b.generate.call_count, 2)
-        self.assertEqual(conversation.Store(self.b.history.db).state((-1, 0))['role'], 'Ким Кицураги')
-
     def test_reconsider_may_keep_role_and_changed_timestamp(self):
         self.turn()
         old = conversation.Store(self.b.history.db).state((-1, 0))
         self.b.direct.side_effect = lambda s, p: {**self.decision(s, p), 'reconsider': True}
         self.turn()
         self.assertEqual(conversation.Store(self.b.history.db).state((-1, 0))['changed_at'], old['changed_at'])
-
-    def test_state_and_role_are_isolated_by_chat_and_topic(self):
-        for message, role in [(self.message(), 'Глад'), (self.message(chat=-2), 'Ким'), (self.message(topic=5), 'Гарри')]:
-            self.b.generate.return_value = role
-            self.turn(message)
-        store = conversation.Store(self.b.history.db)
-        self.assertEqual([store.state(k)['role'] for k in [(-1, 0), (-2, 0), (-1, 5)]], ['Глад', 'Ким', 'Гарри'])
 
     def test_personal_attitudes_are_shared_across_topics_but_not_people_or_chats(self):
         self.turn()
@@ -201,14 +182,6 @@ class ConversationTests(unittest.TestCase):
         self.b.direct.side_effect = lambda s, p: {**self.decision(s, p), 'attitude': 2}
         self.turn(self.message(topic=5, date=50))
         self.assertEqual(store.attitude(-1, 7), 7)
-
-    def test_first_ignored_message_does_not_consume_role_selection(self):
-        self.b.direct.side_effect = lambda s, p: {**self.decision(s, p), 'action': 'ignore'}
-        self.turn()
-        self.b.generate.assert_not_called()
-        self.b.direct.side_effect = self.decision
-        self.turn()
-        self.b.generate.assert_called_once()
 
     def test_persisted_decision_survives_restart_and_reuses_snapshot(self):
         m = self.message()
@@ -467,16 +440,6 @@ class ConversationTests(unittest.TestCase):
         self.b.handle(self.message('обычный разговор'))
         self.b.api.assert_not_called()
 
-    def test_role_picker_failure_uses_neutral_and_retries_next_turn(self):
-        self.b.generate.side_effect = RuntimeError('offline')
-        answer, trace = self.turn()
-        self.assertEqual(trace['role'], conversation.NEUTRAL_ROLE)
-        self.assertEqual(answer, 'Шо?')
-        self.b.generate.side_effect = None
-        self.b.generate.return_value = 'Папич'
-        _, trace = self.turn()
-        self.assertEqual(trace['role'], 'Папич')
-
     def test_implicit_address_bypasses_interjection_cooldown(self):
         self.b.history.add((-1, 0), 0, 'assistant', 'моя шутка', time.time())
         self.b.handle(self.message('ну ты выдал'))
@@ -601,7 +564,7 @@ class ConversationTests(unittest.TestCase):
         self.b.handle(self.message('/reset'))
         store = conversation.Store(self.b.history.db)
         self.assertEqual(store.state((-1, 0)), store.initial())
-        self.assertEqual(store.state((-1, 5))['role'], 'Глад Валакас')
+        self.assertEqual(store.state((-1, 5))['role'], conversation.NEUTRAL_ROLE)
 
     def test_writer_tools_return_data_then_model_composes_answer(self):
         self.b.writer_step.side_effect = [
@@ -1051,33 +1014,6 @@ class ConversationTests(unittest.TestCase):
         self.assertEqual(usage[0]['output_tokens'], 4)
         self.assertEqual(usage[0]['cost'], .02)
 
-    def test_active_global_role_override_blocks_picker_and_preserves_director_actions(self):
-        store = conversation.Store(self.b.history.db)
-        store.set_role_override('Глад Валакас', 1000, 2000)
-        self.b.direct.side_effect = lambda snapshot, previous: {**self.decision(snapshot, previous), 'reconsider': True}
-        for message in [self.message(date=1000), self.message(chat=-2, topic=5, date=1999)]:
-            _, trace = self.turn(message)
-            self.assertEqual(trace['role'], 'Глад Валакас')
-            self.assertEqual(trace['attitude'], 7)
-            self.assertEqual(trace['action'], 'reply')
-            self.assertEqual(trace['role_override_until'], 2000)
-        self.b.generate.assert_not_called()
-
-    def test_override_expiry_boundary_restores_selection_even_when_jev_says_keep(self):
-        store = conversation.Store(self.b.history.db)
-        store.set_role_override('Глад Валакас', 1000, 2000)
-        self.turn(self.message(date=1999))
-        self.b.generate.assert_not_called()
-        self.assertIsNone(store.role_override(999))
-        self.assertIsNone(store.role_override(2000))
-        # The picker may independently choose Glad again; that must not force repeated reselection.
-        _, trace = self.turn(self.message(date=2000))
-        self.assertEqual(trace['role'], 'Глад Валакас')
-        self.assertNotIn('role_override_until', trace)
-        self.b.generate.assert_called_once()
-        self.turn(self.message(date=2001))
-        self.b.generate.assert_called_once()
-
     def test_setting_override_updates_all_current_states_without_changing_attitudes(self):
         self.turn(self.message(date=900))
         self.b.history.add_message((-2, 5), self.message(chat=-2, topic=5))
@@ -1087,14 +1023,6 @@ class ConversationTests(unittest.TestCase):
         self.assertEqual(store.state((-1, 0))['attitude'], 7)
         self.assertEqual(store.state((-2, 5))['role'], 'Глад Валакас')
         self.assertEqual(store.state((-2, 5))['attitude'], 5)
-
-    def test_role_override_does_not_affect_historical_replay(self):
-        store = conversation.Store(self.b.history.db)
-        store.set_role_override('Глад Валакас', 1000, 2000)
-        self.b.generate.return_value = 'Ким Кицураги'
-        _, trace = self.turn(self.message(date=999), live=False)
-        self.assertEqual(trace['role'], 'Ким Кицураги')
-        self.assertNotIn('role_override_until', trace)
 
     def test_jev_and_writer_costs_are_counted_once(self):
         _, first = self.turn()

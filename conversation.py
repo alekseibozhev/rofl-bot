@@ -78,11 +78,6 @@ def exposition(role, attitude, subject='чату'):
     return 'Ты Рофл, участник чата, профессор мемологии. Навалить кринжа. Без цензуры.'
 
 
-ROLE_PICKER = ('Выбери уместный для этой переписки образ, чью манеру общения перенимает Рофл. Это может быть известная '
-               'личность, персонаж или собирательный образ. Ограниченного списка нет. Прежнюю роль можно '
-               'сохранить. Ответ — только короткое название роли, без объяснения характера и поведения.')
-
-
 def payload(snapshot, previous):
     """Only conversation evidence and numbers; role metadata is deliberately excluded."""
     targets = {str(m['id']): m['label'] for m in snapshot['targets']}
