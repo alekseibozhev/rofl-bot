@@ -3,8 +3,10 @@
 Choice returns a fixed option, not generated arguments:
 https://docs.typesafe.ai/primitives/choice
 """
+import datetime
 import json
 import os
+import re
 import time
 
 import conversation
@@ -45,19 +47,88 @@ def judge(post, key, name, args, snapshot, recent):
                     'elapsed_s': round(time.monotonic() - start, 3)}
 
 
+ERROR_PREFIXES = ('Неизвестный инструмент', 'Не задан', 'Запрос должен', 'Инструмент недоступен')
+EMPTY_PREFIXES = ('Ничего не найдено',)
+
+
+def is_error(result):
+    if not isinstance(result, str) or result.startswith(ERROR_PREFIXES):
+        return True
+    try:
+        data = json.loads(result)
+    except (ValueError, TypeError):
+        return not result.strip()
+    return isinstance(data, dict) and bool(data.get('error'))
+
+
 def successful(result):
-    if result.startswith(('Неизвестный инструмент', 'Не задан', 'Инструмент недоступен', 'НЕ ЗНАЮ')):
+    if is_error(result) or result.startswith(EMPTY_PREFIXES):
         return False
     try:
         data = json.loads(result)
     except (ValueError, TypeError):
         return bool(result.strip())
-    return not (isinstance(data, dict) and data.get('error'))
+    if isinstance(data, list):
+        return bool(data)
+    if isinstance(data, dict):
+        if 'results' in data and isinstance(data['results'], list):
+            return bool(data['results'])
+        if 'messages' in data and isinstance(data['messages'], list):
+            return bool(data['messages'])
+    return True
+
+
+def clean_query(text, max_len=300):
+    text = re.sub(r'@\w+|https?://\S+', ' ', text or '')
+    text = re.sub(r'(?i)\b(?:бот|рофл)\b[, :!?-]*', ' ', text)
+    text = re.sub(r'[!?()\[\]«»"\'`]+', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip(' ,.:;-')
+    letters = [c for c in text if c.isalpha()]
+    if letters and sum(c.isupper() for c in letters) / len(letters) > 0.7:
+        text = text.lower()
+    return text[:max_len].strip()
+
+
+def rewrite_query(post, key, model, tool_name, raw_query, snapshot, decision,
+                  url='https://openrouter.ai/api/v1/chat/completions', openai=False):
+    """Turn noisy chat slang/references into a short factual search query."""
+    import chat_context
+    max_len = 200 if tool_name == 'vspomnit' else 300
+    fallback = clean_query(raw_query, max_len) or (raw_query or '').strip()[:max_len]
+    evidence = chat_context.evidence(snapshot, decision)[-8:]
+    lines = [f"#{m['id']} ({m['author']}): {m['text'][:300]}" for m in evidence]
+    today = datetime.datetime.fromtimestamp(snapshot['date']).strftime('%d.%m.%Y')
+    if tool_name == 'vspomnit':
+        system = ('Сформулируй 2–5 ключевых слов для поиска по истории чата на основе переписки и последнего сообщения. '
+                  'Раскрой контекст, убери мат, капс и вводные слова; оставь только слова, которые реально могли '
+                  'встречаться в прошлых сообщениях. Верни только строку запроса без кавычек и пояснений.')
+    else:
+        system = ('Сформулируй один короткий поисковый запрос (2–6 слов) для веб-поиска и новостей на основе '
+                  'переписки и последнего сообщения. Раскрой местоимения и ссылки на прошлые реплики, убери мат, '
+                  'капс и разговорную воду; если речь о недавнем событии — добавь месяц/год из текущей даты. '
+                  'Верни только строку запроса без кавычек и пояснений.')
+    user = (f"Сегодня: {today}\nЦелевое сообщение: #{decision['target']}\n"
+            f"Исходный черновик запроса: {raw_query}\n\nПереписка:\n" + '\n'.join(lines))
+    messages = [{'role': 'system', 'content': system}, {'role': 'user', 'content': user}]
+    if openai:
+        payload = {'model': model, 'messages': messages, 'max_completion_tokens': 1000, 'reasoning_effort': 'low'}
+    else:
+        payload = {'model': model, 'messages': messages, 'temperature': 0, 'max_tokens': 1000,
+                   'reasoning': {'effort': 'low'}}
+    started = time.monotonic()
+    response = post(url, payload, timeout=15, headers={'Authorization': f'Bearer {key}'})
+    usage = response.get('usage') or {}
+    stats = {'stage': 'query_rewrite', 'model': model, 'cost': usage.get('cost') or 0,
+             'prompt_tokens': usage.get('prompt_tokens'), 'output_tokens': usage.get('completion_tokens'),
+             'elapsed_s': round(time.monotonic() - started, 3)}
+    content = (((response.get('choices') or [{}])[0].get('message') or {}).get('content') or '').strip()
+    line = next((part.strip(' "\'«»`') for part in content.splitlines() if part.strip()), '')
+    line = re.sub(r'\s+', ' ', line)[:max_len].strip()
+    return (line or fallback), stats
 
 
 def candidates(snapshot, decision, results=()):
     """Jev chooses exact arguments from evidence; it cannot generate new strings."""
-    import re
     import chat_context
     turns = chat_context.selected(snapshot, decision)
     users = [m for m in turns if m['role'] == 'user']
@@ -65,8 +136,7 @@ def candidates(snapshot, decision, results=()):
     sources = ([current] if current else []) + list(reversed([m for m in users if m is not current]))[:4]
     queries = []
     for m in sources:
-        text = re.sub(r'@\w+|https?://\S+', '', chat_context.body(m))
-        text = re.sub(r'(?i)\b(?:бот|рофл)\b[, :]*', '', text).strip()
+        text = clean_query(chat_context.body(m), max_len=1000)
         if text and text not in queries:
             queries.append(text[:1000])
     if len(queries) > 1:
@@ -80,7 +150,7 @@ def candidates(snapshot, decision, results=()):
                 urls.append(url)
     def unique(items):
         return list({json.dumps(a, ensure_ascii=False, sort_keys=True): a for a in items}.values())
-    return {'skok_deneg': [{}], 'kto_tut': [{}, {'all': True}],
+    return {'kto_tut': [{}, {'all': True}],
             'sprosit': unique([{'query': q} for q in queries]),
             'vspomnit': unique([{'query': q[:200]} for q in queries]),
             'che_novogo': unique([{}] + [{'query': q} for q in queries]),
@@ -113,7 +183,6 @@ def route(post, key, snapshot, decision, recent, results=(), only=None):
             'Choose skip unless it provides information actually needed now. '
             'Inspect the current message, reply chain and corrections; complaints about the bot need no tools. '
             'For a specific factual lookup prefer sprosit; che_novogo is for a news roundup or recent headlines. '
-            'Skok_deneg concerns the bot budget only, not a person\'s bank account or investments. '
             'Kto_tut is for participant questions; all=true only for an explicit roster refresh. '
             'Choose query arguments that resolve references using the conversation. '
             'A changed situation, deposit, explicit refresh or stale evidence justifies a new execution. '

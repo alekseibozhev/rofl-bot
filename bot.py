@@ -501,7 +501,7 @@ class History:
                  (message.get('reply_to_message') or {}).get('message_id'), json.dumps(message, ensure_ascii=False))
 
     def context(self, key, through_id=sys.maxsize, me_id=None, recent=40, window=21600, depth=10, limit=12000,
-                pause=1800, include_ids=False, structured=False, full_answers=False):
+                pause=1800, include_ids=False, structured=False, full_answers=False, include_delayed_answers=False):
         """The chat up to the newest message as lines, oldest first: the last `recent` messages of people
         from `window` seconds before it, plus its reply chain (rebuilt from earlier updates) however old.
 
@@ -534,8 +534,13 @@ class History:
                                  (*key, fresh, through_id, chain[0][5] - window, recent)).fetchall()
         candidates = {row[0] for row in chain + around}
         branch = {row[0] for row in chain}
+        # While draining a backlog, an answer already sent for an earlier request
+        # has a Telegram ID beyond the current incoming event. Live processing
+        # must see it, while users remain bounded by through_id. Uncached replay
+        # keeps the historical cutoff; saved snapshots already freeze evidence.
+        answer_through = sys.maxsize if include_delayed_answers else through_id
         answers = [row for row in self.db.execute(query + " AND id <= ? AND id >= ? AND role = 'assistant'",
-                                                  (*key, fresh, through_id, min(candidates))) if row[3] in candidates]
+                                                  (*key, fresh, answer_through, min(candidates))) if row[3] in candidates]
         # The talk going on is what came after the last pause before the request: «рофл, а подробнее?» is about
         # what the bot has just said, whether it replies to it or not. An answer to a message of the chain goes
         # whole too: «в прошлый раз смешнее было», replied to the picture, is about the joke on it. The older
@@ -786,12 +791,15 @@ def report(db, days=14):
 class Bot:
     read_only = False
     openrouter = False
+    provider = 'openrouter'
+    openai_url = 'https://api.openai.com/v1'
+    openai_key = ''
     max_age = 86400  # Telegram keeps updates for a day: whatever was asked while the bot was off gets its answer
     wait = 2  # seconds of quiet before answering: the posts of a forward or an album may still be coming
     bored = 2  # hours without a word from the bot before a scheduled idle initiative
     interjection_pause = 5 * 60  # seconds after any bot reply before unsolicited words
     interests = {}  # chat: what it reads about, by NEWS in .env; the rest read about AI
-    effort = 'high'  # author reasoning; decisions and tools use Jev
+    effort = 'high'  # OpenRouter default; override via WRITER_EFFORT (e.g. low for gpt-6.2-astra)
     # How much of the chat the model reads, tuned every few days by the reactions: `python3 bot.py --stats`.
     recent = 80  # messages of people: a day of the chat
     window = 24 * 3600  # seconds before the request: 6 hours gave 20–44 lines, and «память как у рыбки» (#340059)
@@ -816,13 +824,27 @@ class Bot:
         self.telegram_url = f'https://api.telegram.org/bot{token}/'
         self.ollama_url = os.environ.get('OLLAMA_URL', 'http://localhost:11434').rstrip('/')
         self.model = os.environ.get('OLLAMA_MODEL', 'orcarouter/Qwen3.8-27B-Uncensored:mlx-4bit')
-        # With OPENROUTER_MODEL set the model is OpenRouter's, through the Telegram proxy: it refuses Russia.
-        self.openrouter = bool(os.environ.get('OPENROUTER_MODEL'))
+        # Direct OpenAI takes precedence over OpenRouter for the writer; Jev still uses OPENROUTER_API_KEY.
         self.openrouter_key = os.environ.get('OPENROUTER_API_KEY', '')
-        if self.openrouter:
-            self.model = os.environ['OPENROUTER_MODEL']
+        self.openai_key = os.environ.get('OPENAI_API_KEY', '')
+        self.openai_url = os.environ.get('OPENAI_BASE_URL', 'https://api.openai.com/v1').rstrip('/')
+        if os.environ.get('OPENAI_MODEL'):
+            self.provider = 'openai'
+            self.openrouter = True
+            self.model = os.environ['OPENAI_MODEL'].strip()
+            if not self.openai_key:
+                raise RuntimeError('Укажи OPENAI_API_KEY в .env или закомментируй OPENAI_MODEL')
+        elif os.environ.get('OPENROUTER_MODEL'):
+            self.provider = 'openrouter'
+            self.openrouter = True
+            self.model = os.environ['OPENROUTER_MODEL'].strip()
             if not self.openrouter_key:
                 raise RuntimeError('Укажи OPENROUTER_API_KEY в .env или закомментируй OPENROUTER_MODEL')
+        else:
+            self.provider = 'ollama'
+            self.openrouter = False
+        if env_effort := os.environ.get('WRITER_EFFORT', '').strip():
+            self.effort = env_effort
         try:
             self.allowed_groups = {int(group) for group in os.environ.get('ALLOWED_GROUP_ID', '').split(',')}
         except ValueError:
@@ -864,27 +886,45 @@ class Bot:
                  'tokens_per_s': round(result.get('eval_count', 0) / seconds['eval_duration'], 1) if seconds['eval_duration'] else None}
         return (result.get('message') or {}).get('content'), stats
 
+    def chat_endpoint(self):
+        if getattr(self, 'provider', 'openrouter') == 'openai':
+            url = getattr(self, 'openai_url', 'https://api.openai.com/v1').rstrip('/') + '/chat/completions'
+            return url, getattr(self, 'openai_key', ''), True
+        return 'https://openrouter.ai/api/v1/chat/completions', getattr(self, 'openrouter_key', ''), False
+
     def ask_openrouter(self, messages, temperature, effort=None):
         # Thinking only slows a one-line joke down; the setup gets a little. Muse, Gemini, Grok and GLM cannot stop:
         # «Reasoning is mandatory for this endpoint and cannot be disabled», a 400; they think the least from then on.
+        fallback_effort = 'low' if getattr(self, 'provider', 'openrouter') == 'openai' else 'minimal'
         if not effort and self.model in self.thinkers:
-            effort = 'minimal'
+            effort = fallback_effort
         try:
             return self.ask_openrouter_once(messages, temperature, effort)
         except RuntimeError as exc:
             if effort or str(exc) != 'HTTP 400':
                 raise
         self.thinkers = self.thinkers | {self.model}
-        return self.ask_openrouter_once(messages, temperature, 'minimal')
+        return self.ask_openrouter_once(messages, temperature, fallback_effort)
 
     def ask_openrouter_once(self, messages, temperature, effort):
-        payload = {
-            'model': self.model, 'messages': messages, 'temperature': temperature,
-            # A rap thought through on 3000 tokens came out empty twice of two.
-            'max_tokens': (6000 if effort == 'high' else 3000) if effort else 1000, 'reasoning': {'effort': effort} if effort else {'enabled': False},
-        }
-        result = post('https://openrouter.ai/api/v1/chat/completions', payload, timeout=120,
-                      headers={'Authorization': f'Bearer {self.openrouter_key}'})
+        url, key, is_openai = self.chat_endpoint()
+        if is_openai:
+            payload = {
+                'model': self.model, 'messages': messages,
+                'max_completion_tokens': (6000 if effort == 'high' else 3000) if effort else 1000,
+            }
+            if effort:
+                payload['reasoning_effort'] = effort
+            else:
+                payload['temperature'] = temperature
+        else:
+            payload = {
+                'model': self.model, 'messages': messages, 'temperature': temperature,
+                # A rap thought through on 3000 tokens came out empty twice of two.
+                'max_tokens': (6000 if effort == 'high' else 3000) if effort else 1000,
+                'reasoning': {'effort': effort} if effort else {'enabled': False},
+            }
+        result = post(url, payload, timeout=120, headers={'Authorization': f'Bearer {key}'})
         choice = (result.get('choices') or [{}])[0]
         usage = result.get('usage') or {}
         stats = {'done_reason': choice.get('finish_reason'), 'provider': result.get('provider'),
@@ -1006,10 +1046,12 @@ class Bot:
                 return f'data:{mime};base64,{b64encode(data).decode()}'
         return None
 
-    def snapshot(self, message, through, event=None, date=None, explicit=None, can_interject=None):
+    def snapshot(self, message, through, event=None, date=None, explicit=None, can_interject=None,
+                 include_delayed_answers=False):
         key = (message['chat']['id'], topic_of(message))
         now = date if date is not None else message.get('date', time.time())
-        turns, _ = self.chat(key, through, include_ids=True, structured=True)
+        turns, _ = self.chat(key, through, include_ids=True, structured=True,
+                             include_delayed_answers=include_delayed_answers)
         rows = self.history.db.execute("""SELECT id, role, content, raw FROM messages
             WHERE chat=? AND topic=? AND id<=? AND date>=? AND date<=?
             ORDER BY date DESC, id DESC LIMIT 8""", (*key, through, now - self.window, now)).fetchall()
@@ -1093,13 +1135,20 @@ class Bot:
 
 
     def writer_step(self, messages, tools=False):
-        payload = {'model': self.model, 'messages': messages, 'temperature': 1.0, 'max_tokens': 6000,
-                   'reasoning': {'effort': self.effort}, 'repetition_penalty': 1.1}
+        url, key, is_openai = self.chat_endpoint()
+        if is_openai:
+            payload = {'model': self.model, 'messages': messages, 'max_completion_tokens': 6000}
+            if self.effort:
+                payload['reasoning_effort'] = self.effort
+            if not self.effort or self.effort == 'none':
+                payload['temperature'] = 1.0
+        else:
+            payload = {'model': self.model, 'messages': messages, 'temperature': 1.0, 'max_tokens': 6000,
+                       'reasoning': {'effort': self.effort}, 'repetition_penalty': 1.1}
         if tools:
             payload['tools'] = conversation.TOOLS
         started = time.monotonic()
-        response = post('https://openrouter.ai/api/v1/chat/completions', payload, timeout=180,
-                        headers={'Authorization': f'Bearer {self.openrouter_key}'})
+        response = post(url, payload, timeout=180, headers={'Authorization': f'Bearer {key}'})
         choice = (response.get('choices') or [{}])[0]
         usage = response.get('usage') or {}
         stats = {'cost': usage.get('cost'), 'prompt_tokens': usage.get('prompt_tokens'),
@@ -1233,47 +1282,7 @@ class Bot:
                 p['username']: p['name'] for p in identities
                 if p.get('username') and p['kind'] == 'user' and not p.get('is_bot')}
             return json.dumps({'known': known, 'identities': identities, 'total': count}, ensure_ascii=False)
-        if name == 'skok_deneg':
-            return self.balance_phrase(self.balance(live=live))
         return 'Неизвестный инструмент.'
-
-    @staticmethod
-    def balance_phrase(result):
-        """Keep accounting metadata internal; give the voice a coarse money status."""
-        if 'error' in result:
-            return 'НЕ ЗНАЮ, СКОЛЬКО ОСТАЛОСЬ.'
-        amount = result['available_usd']
-        if amount < 3:
-            return 'МАЛО, МНЕ ПИЗДА'
-        if amount <= 5:
-            return 'ДЕНЕГ ТОЛЬКО НА ЕДУ И КОММУНАЛКУ'
-        return 'ДЕНЕГ ДОХУЯ'
-
-    def balance(self, live=True):
-        """Expose only this bot's key allowance; never request the account's credits."""
-        if not live:
-            return {'error': 'Текущий баланс недоступен в replay; исторический остаток неизвестен.'}
-        now = time.time()
-        cached = getattr(self, '_key_balance_cache', None)
-        if cached and 0 <= now - cached['checked_at'] < 60:
-            return dict(cached)
-        if not self.openrouter_key:
-            raise RuntimeError('Нет ключа OpenRouter')
-
-        try:
-            body = json.loads(fetch(Request('https://openrouter.ai/api/v1/key',
-                                           headers={'Authorization': f'Bearer {self.openrouter_key}'}), 15))
-            remaining = body['data']['limit_remaining']
-            if remaining is None:
-                return {'error': 'У ключа бота не задан отдельный лимит; остаток его бюджета неизвестен.'}
-            if isinstance(remaining, bool) or not isinstance(remaining, (int, float)) or not math.isfinite(remaining):
-                raise ValueError()
-        except (ValueError, KeyError, TypeError):
-            raise RuntimeError('Некорректный ответ OpenRouter о балансе') from None
-        result = {'currency': 'USD', 'checked_at': now, 'available_usd': max(0, round(remaining, 6)),
-                  'note': 'Остаток лимита ключа этого бота до оплаты текущего ответа; может измениться после других запросов.'}
-        self._key_balance_cache = result
-        return dict(result)
 
     def write_turn(self, message, snapshot, decision, live):
         system = conversation.exposition()
@@ -1285,7 +1294,7 @@ class Bot:
             if target:
                 instruction += 'Текст выбранного сообщения: ' + target['label'] + '\n'
         if decision['action'] == 'reply' and decision.get('reply_size'):
-            instruction += 'Ответ: ' + decision['reply_size'] + '.\n'
+            instruction += 'Ориентир по длине: ' + decision['reply_size'] + ' (не лей воду ради объёма).\n'
         if decision['action'] == 'react':
             instruction += '\nВыбранное действие: реакция на сообщение. Верни только одно эмодзи.'
         if '_image' in snapshot:
@@ -1333,8 +1342,19 @@ class Bot:
         return re.sub(r'^Рофл(?: → [^:\n]*)?:\s*', '', answer)[:4000], calls
 
     def past_tool_results(self, message, snapshot, decision):
-        """Only successful evidence tied to selected past turns, frozen before writing."""
+        """Only successful evidence tied to relevant selected past turns, frozen before writing."""
         turns = chat_context.selected(snapshot, decision)
+        selection = decision.get('context_selection') or {}
+        scores = selection.get('scores')
+        if isinstance(scores, dict) and scores:
+            threshold = selection.get('threshold', conversation.CONTEXT_THRESHOLD)
+            by_id = {m['id']: m for m in turns}
+            target_id = decision.get('target', snapshot['target'])
+            direct_parent = (by_id.get(target_id) or {}).get('reply_to')
+            relevant_ids = {int(i) for i, score in scores.items() if score >= threshold}
+            if direct_parent is not None:
+                relevant_ids.add(direct_parent)
+            turns = [m for m in turns if m['id'] in relevant_ids or m.get('reply_to') in relevant_ids]
         requests = {m['id'] for m in turns if m['role'] == 'user'}
         requests.update(m.get('reply_to') for m in turns if m['role'] == 'assistant')
         requests = sorted(r for r in requests if r is not None and r < snapshot['target'])
@@ -1356,6 +1376,31 @@ class Bot:
                                     'result': result, 'status': 'saved'}
         return sorted(latest.values(), key=lambda e: (e['date'], e['request'], e['tool']))
 
+    def refine_query(self, tool_name, raw_query, snapshot, decision):
+        """Normalize noisy chat queries into clean search terms before executing lookup tools."""
+        max_len = 200 if tool_name == 'vspomnit' else 300
+        cleaned = tooluse.clean_query(raw_query, max_len) or (raw_query or '').strip()[:max_len]
+        model = os.environ.get('QUERY_MODEL', '').strip() or getattr(self, 'model', '')
+        url, key, is_openai = self.chat_endpoint()
+        if not getattr(self, 'openrouter', False) or not key or not model:
+            return cleaned, None
+        try:
+            return tooluse.rewrite_query(post, key, model, tool_name, raw_query, snapshot, decision,
+                                         url=url, openai=is_openai)
+        except RuntimeError as exc:
+            LOG.warning('query_rewrite.failed %s', exc)
+            return cleaned, {'stage': 'query_rewrite', 'fallback': True}
+
+    @staticmethod
+    def pick_reply_size(message):
+        text = (message.get('text') or message.get('caption') or '').strip()
+        wants_detail = bool(re.search(
+            r'(?i)\b(?:подробн\w*|разв[её]рнут\w*|объясн\w*|распиш\w*|долож\w*|разбер\w*|почему|откуда|истори\w*)',
+            text))
+        if len(text) >= 80 or wants_detail:
+            return random.choice(('1–2 фразы', 'один абзац', '2–3 коротких абзаца'))
+        return random.choice(('1–2 фразы', 'один абзац'))
+
     def prepare_tools(self, message, snapshot, decision, live):
         """Select and execute data collection with Jev; the author runs once."""
         if not getattr(self, 'tool_judge_enabled', False) or not getattr(self, 'openrouter_key', ''):
@@ -1367,7 +1412,7 @@ class Bot:
             history = self.past_tool_results(message, snapshot, decision)
         recent = [dict(request=e['request'], date=e['date'], name=e['tool'], arguments=e['arguments'], result=e['result'])
                   for e in history if e['request'] in visible and e['date'] >= snapshot['date'] - 86400]
-        entries, stages = [], []
+        entries, stages, refined_cache = [], [], {}
         def collect(only=None):
             try:
                 choices, stats = tooluse.route(post, self.openrouter_key, snapshot, decision, recent, entries, only)
@@ -1382,13 +1427,34 @@ class Bot:
                 if self.usage is not None:
                     self.usage.append(stats)
             for choice in choices:
+                args = dict(choice['arguments'])
+                if (choice['status'] == 'execute'
+                        and choice['tool'] in ('sprosit', 'che_novogo', 'vspomnit')
+                        and isinstance(args.get('query'), str) and args['query'].strip()):
+                    kind = 'chat' if choice['tool'] == 'vspomnit' else 'web'
+                    cache_key = (kind, args['query'])
+                    if cache_key not in refined_cache:
+                        query, rw_stats = self.refine_query(choice['tool'], args['query'], snapshot, decision)
+                        refined_cache[cache_key] = query
+                        if rw_stats:
+                            stages.append(rw_stats)
+                            if self.usage is not None and 'cost' in rw_stats:
+                                self.usage.append(rw_stats)
+                    args['query'] = refined_cache[cache_key]
                 try:
-                    result = self.writer_tool(choice['tool'], choice['arguments'], message, prepared, live,
+                    result = self.writer_tool(choice['tool'], args, message, prepared, live,
                                               verdict=choice['status'])
                 except (ValueError, TypeError, RuntimeError) as exc:
                     result = f'Инструмент недоступен: {type(exc).__name__}'
-                entries.append({**choice, 'status': choice['status'] if tooluse.successful(result) else 'error',
-                                'result': result})
+                if choice['status'] == 'repeat':
+                    status = 'repeat'
+                elif tooluse.is_error(result):
+                    status = 'error'
+                elif not tooluse.successful(result):
+                    status = 'empty'
+                else:
+                    status = choice['status']
+                entries.append({**choice, 'arguments': args, 'status': status, 'result': result})
         collect()
         if (any(e['tool'] in ('sprosit', 'che_novogo') and tooluse.successful(e['result']) for e in entries)
                 and not any(e['tool'] == 'pochitat' for e in entries)):
@@ -1404,7 +1470,8 @@ class Bot:
             if cached:
                 snapshot, decision = cached
             else:
-                snapshot = self.snapshot(message, through, event=event, date=date, explicit=explicit, can_interject=can_interject)
+                snapshot = self.snapshot(message, through, event=event, date=date, explicit=explicit,
+                                         can_interject=can_interject, include_delayed_answers=live)
                 if event is None:
                     snapshot = self.visual_snapshot(message, snapshot)
                 previous = {}
@@ -1420,6 +1487,9 @@ class Bot:
                         and (has_picture(message) or has_picture(message.get('reply_to_message') or {}))):
                     decision.update(jev_action=decision['action'], action='reply', target=snapshot['target'],
                                     reply_policy='addressed_image')
+                elif event is None and snapshot['explicit'] and decision['action'] == 'ignore':
+                    decision.update(jev_action='ignore', action='reply', target=snapshot['target'],
+                                    reply_policy='explicit_address')
                 elif (not snapshot['explicit'] and not decision.get('addressed', False)
                       and (decision['action'] == 'reply' and not snapshot['can_interject']
                            or decision['action'] == 'react' and not snapshot['can_react'])):
@@ -1434,7 +1504,7 @@ class Bot:
                         decision['context_selection'] = {'fallback': True}
                         LOG.warning('context.selection_failed %s', exc)
                 if decision['action'] == 'reply':
-                    decision['reply_size'] = random.choice(('1–2 фразы', 'один абзац', 'несколько абзацев'))
+                    decision['reply_size'] = self.pick_reply_size(message)
                     decision['tool_history'] = self.past_tool_results(message, snapshot, decision)
                     with typing(lambda: self.send_typing(*key)) if live else nullcontext():
                         decision['tool_results'], decision['tool_selection'] = self.prepare_tools(message, snapshot, decision, live)
@@ -1490,12 +1560,12 @@ class Bot:
             return 0
         return count
 
-    def chat(self, key, through=sys.maxsize, include_ids=False, structured=False):
+    def chat(self, key, through=sys.maxsize, include_ids=False, structured=False, include_delayed_answers=False):
         """Historical author labels retain handles; never rewrite text using today's alias map."""
         names = {**self.history.names(key[0]), self.me['username'].lower(): 'Рофл'}
         context = self.history.context(key, through, self.me['id'], self.recent, self.window,
                                        limit=self.limit, pause=self.pause, include_ids=include_ids, structured=structured,
-                                       full_answers=structured)
+                                       full_answers=structured, include_delayed_answers=include_delayed_answers)
         return context, names
 
     @contextmanager

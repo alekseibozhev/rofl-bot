@@ -90,10 +90,36 @@ class ConversationTests(unittest.TestCase):
 
     def test_ignore_is_saved_without_writing_or_sending(self):
         self.b.direct.side_effect = lambda s, p: {**self.decision(s, p), 'action': 'ignore'}
-        self.b.handle(self.message())
+        self.b.handle(self.message('обычный разговор'))
         self.b.writer_step.assert_not_called()
         self.b.api.assert_not_called()
         self.assertEqual(self.b.history.db.execute('SELECT count(*) FROM conversation_decisions').fetchone()[0], 1)
+
+    def test_explicit_text_cannot_be_silently_ignored(self):
+        parent = {'message_id': 0, 'from': self.b.me, 'text': 'Предыдущий ответ'}
+        for text, reply in [('Рофл, сочини шутку', None), ('@test_bot привет', None),
+                            ('давай ещё одну', parent)]:
+            with self.subTest(text=text):
+                message = self.message(text)
+                if reply:
+                    message['reply_to_message'] = reply
+                self.b.direct.side_effect = lambda s, p: {
+                    **self.decision(s, p), 'action': 'ignore', 'addressed': False}
+                self.b.api.reset_mock()
+                self.b.writer_step.reset_mock()
+                self.b.handle(message)
+                self.b.writer_step.assert_called_once()
+                self.b.api.assert_called_once()
+                snapshot, decision = conversation.Store(self.b.history.db).get(
+                    (-1, 0), f'message:{message["message_id"]}:{message["message_id"]}')
+                self.assertTrue(snapshot['explicit'])
+                self.assertEqual(decision['action'], 'reply')
+                self.assertEqual(decision['target'], message['message_id'])
+                self.assertEqual(decision['jev_action'], 'ignore')
+                self.assertEqual(decision['reply_policy'], 'explicit_address')
+                # A retry reuses the saved reply and never sends it twice.
+                self.b.handle(message)
+                self.b.api.assert_called_once()
 
     def test_pictures_follow_jev_ignore_react_and_reply_with_visual_context(self):
         self.b.can_react = Mock(return_value=True)  # Independent of wall-clock quiet hours.
@@ -298,7 +324,7 @@ class ConversationTests(unittest.TestCase):
             self.turn(live=False)
             for action in ('ignore', 'react'):
                 self.b.direct.side_effect = lambda s, p, action=action: {**self.decision(s, p), 'action': action}
-                self.turn()
+                self.turn(explicit=False)
         indicator.assert_not_called()
 
     def test_reaction_is_chosen_by_writer_and_targets_directors_message(self):
@@ -438,6 +464,51 @@ class ConversationTests(unittest.TestCase):
         self.b.api.assert_called_once()
         self.assertIn('вот сообщение', self.b.direct.call_args.args[0]['context'])
 
+    def test_backlog_sees_already_sent_answers_without_later_user_messages(self):
+        now = time.time()
+        picture = self.message('', date=now - 240)
+        picture['photo'] = [{'file_id': 'picture'}]
+        self.b.history.add_message((-1, 0), picture)
+        requests = [self.message('рофл, что думаешь?', date=now - age) for age in (180, 115, 110)]
+        for request in requests:
+            request['reply_to_message'] = picture
+        requests[-1]['from'] = {'id': 8, 'first_name': 'Andrew'}
+        future = self.message('LATER_USER_MESSAGE', date=now)
+        self.b.history.add_message((-1, 0), future)
+        self.b.history.add((-1, 0), 999, 'assistant', 'ANSWER_TO_LATER_USER', now,
+                           future['message_id'])
+        self.b.image = Mock(return_value='data:image/png;base64,AA==')
+        self.b.writer_step.side_effect = [{'content': text} for text in ('8/10', '10/10', '2/10')]
+        self.b.api.side_effect = [{'message_id': 1000 + i, 'date': now + i} for i in range(3)]
+
+        self.b.handle(*requests)
+
+        self.assertEqual(self.b.api.call_count, 3)
+        for i, call in enumerate(self.b.direct.call_args_list):
+            snapshot = call.args[0]
+            self.assertEqual([m['id'] for m in snapshot['messages'] if m['role'] == 'assistant'],
+                             list(range(1000, 1000 + i)))
+            self.assertNotIn('LATER_USER_MESSAGE', snapshot['context'])
+            self.assertNotIn('ANSWER_TO_LATER_USER', snapshot['context'])
+        prompts = [call.args[0] for call in self.b.writer_step.call_args_list]
+        self.assertEqual([m['content'] for m in prompts[1] if m['role'] == 'assistant'], ['8/10'])
+        self.assertEqual([m['content'] for m in prompts[2] if m['role'] == 'assistant'], ['8/10', '10/10'])
+        # Replaying the saved event must retain its evidence even after more replies.
+        self.b.history.add((-1, 0), 1003, 'assistant', 'LATER_ANSWER', now + 3, requests[0]['message_id'])
+        self.b.writer_step.side_effect = None
+        self.b.joke(requests[-1], requests[-1]['message_id'], live=False)
+        self.assertEqual(self.b.writer_step.call_args.args[0], prompts[2])
+
+    def test_uncached_replay_excludes_answers_sent_after_incoming_event(self):
+        first = self.message('рофл, оцени мем', date=time.time() - 120)
+        current = self.message('рофл, а теперь?', date=time.time() - 60)
+        for message in (first, current):
+            self.b.history.add_message((-1, 0), message)
+        self.b.history.add((-1, 0), 1000, 'assistant', 'DELAYED_ANSWER', time.time(), first['message_id'])
+        self.b.joke(current, current['message_id'], live=False)
+        self.assertNotIn('DELAYED_ANSWER', self.b.direct.call_args.args[0]['context'])
+        self.assertFalse(any(m['role'] == 'assistant' for m in self.b.writer_step.call_args.args[0]))
+
     def test_reset_only_clears_its_topic_state(self):
         self.turn()
         self.turn(self.message(topic=5))
@@ -461,9 +532,9 @@ class ConversationTests(unittest.TestCase):
         self.assertNotIn('"title":', messages[-1]['content'])
 
     def test_prefetched_results_are_frozen_and_not_reexecuted_on_replay(self):
-        self.b.prepare_tools.return_value = ([{'tool': 'skok_deneg', 'arguments': {},
+        self.b.prepare_tools.return_value = ([{'tool': 'kto_tut', 'arguments': {},
             'status': 'execute', 'result': 'СОХРАНЁННЫЙ РЕЗУЛЬТАТ'}], {'selected': 1})
-        current = self.message('бот, сколько денег?')
+        current = self.message('бот, кто тут?')
         self.turn(current)
         expected = copy.deepcopy(self.b.writer_step.call_args.args[0])
         self.b.prepare_tools.side_effect = AssertionError('Replay must not select or execute tools')
@@ -475,7 +546,7 @@ class ConversationTests(unittest.TestCase):
     def test_clarification_gets_source_result_and_replay_keeps_it_without_database_lookup(self):
         current = self.dialogue()
         self.b.history.db.execute('INSERT INTO tool_executions VALUES (?,?,?,?,?,?,?)',
-            (-1, 0, 1, current['date'] - .2, 'skok_deneg', '{}', 'ORIGINAL_TOOL_EVIDENCE'))
+            (-1, 0, 1, current['date'] - .2, 'kto_tut', '{}', 'ORIGINAL_TOOL_EVIDENCE'))
         self.turn(current)
         prompt = copy.deepcopy(self.b.writer_step.call_args.args[0])
         self.assertIn('ORIGINAL_TOOL_EVIDENCE', json.dumps(prompt))
@@ -673,7 +744,7 @@ class ConversationTests(unittest.TestCase):
     def test_silence_reactions_and_director_failures_do_not_call_selector(self):
         for action in ('ignore', 'react'):
             self.b.direct.side_effect = lambda s, p: {**self.decision(s, p), 'action': action}
-            self.turn()
+            self.turn(explicit=False)
         self.b.direct.side_effect = RuntimeError('offline')
         self.turn()
         self.b.select_context.assert_not_called()
@@ -695,74 +766,12 @@ class ConversationTests(unittest.TestCase):
                          '<b>Новости.</b> <a href="https://example.com/?a=1&amp;b=2">Источник</a> &lt;текст&gt;')
         self.assertEqual(self.b.history.answer(-1, 1000)[1], answer)
 
-    def test_balance_exposes_only_key_allowance_and_caches_filtered_data(self):
-        responses = [{'data': {'limit_remaining': .75, 'hash': 'SECRET', 'total_credits': 173}}]
-        with patch('bot.fetch', side_effect=[json.dumps(r).encode() for r in responses]) as fetch:
-            result = self.b.balance()
-            self.assertEqual(self.b.balance(), result)
-        self.assertEqual(fetch.call_count, 1)
-        self.assertEqual(fetch.call_args_list[0].args[0].get_method(), 'GET')
-        self.assertEqual(fetch.call_args_list[0].args[0].full_url, 'https://openrouter.ai/api/v1/key')
-        self.assertEqual(result['available_usd'], .75)
-        self.assertEqual(set(result), {'currency', 'checked_at', 'available_usd', 'note'})
-        self.assertNotIn('SECRET', json.dumps(result))
-        self.assertNotIn('test-key', json.dumps(result))
-        self.assertEqual(self.b.writer_tool('skok_deneg', {}, self.message(), {}, True),
-                         'МАЛО, МНЕ ПИЗДА')
-
-    def test_balance_phrases_cover_thresholds_without_account_metadata(self):
-        for amount, prefix in [(0, 'МАЛО,'), (2.99, 'МАЛО,'), (3, 'ДЕНЕГ ТОЛЬКО'),
-                               (4.67, 'ДЕНЕГ ТОЛЬКО'), (5, 'ДЕНЕГ ТОЛЬКО'), (5.01, 'ДЕНЕГ ДОХУЯ')]:
-            with self.subTest(amount=amount):
-                phrase = self.b.balance_phrase({'available_usd': amount, 'checked_at': 123})
-                self.assertTrue(phrase.startswith(prefix))
-                self.assertNotIn('123', phrase)
-        self.assertEqual(self.b.balance_phrase({'error': 'internal metadata'}),
-                         'НЕ ЗНАЮ, СКОЛЬКО ОСТАЛОСЬ.')
-
     def test_only_conversational_tool_names_are_available(self):
         self.assertEqual({t['function']['name'] for t in conversation.TOOLS},
-                         {'vspomnit', 'sprosit', 'pochitat', 'che_novogo', 'kto_tut', 'skok_deneg'})
-        for name in ('lookup_history', 'search', 'read_url', 'news', 'participants', 'balance'):
+                         {'vspomnit', 'sprosit', 'pochitat', 'che_novogo', 'kto_tut'})
+        for name in ('lookup_history', 'search', 'read_url', 'news', 'participants', 'balance', 'skok_deneg'):
             self.assertEqual(self.b.writer_tool(name, {}, self.message(), {}, False),
                              'Неизвестный инструмент.')
-
-    def test_balance_negative_key_allowance_is_zero(self):
-        for remaining, expected in ((.2, .2), (-.1, 0)):
-            with self.subTest(remaining=remaining):
-                self.b._key_balance_cache = None
-                with patch('bot.fetch', return_value=json.dumps({'data': {'limit_remaining': remaining}}).encode()):
-                    self.assertEqual(self.b.balance()['available_usd'], expected)
-
-    def test_balance_ignores_legacy_cache_that_contains_account_funds(self):
-        self.b._balance_cache = {'checked_at': time.time(), 'available_usd': 100, 'account_balance_usd': 100}
-        with patch('bot.fetch', return_value=b'{"data":{"limit_remaining":0.5}}'):
-            result = self.b.balance()
-        self.assertEqual(result['available_usd'], .5)
-        self.assertNotIn('account_balance_usd', result)
-
-    def test_unlimited_key_and_malformed_or_missing_balance(self):
-        with patch('bot.fetch', return_value=b'{"data":{"limit_remaining":null}}') as fetch:
-            self.assertIn('error', self.b.balance())
-            fetch.assert_called_once()
-            self.assertEqual(fetch.call_args.args[0].full_url, 'https://openrouter.ai/api/v1/key')
-        for body in (b'not json', b'{"data":[]}', b'{"data":{"limit_remaining":true}}',
-                     b'{"data":{"limit_remaining":NaN}}', b'{"data":{}}'):
-            with self.subTest(body=body):
-                self.b._key_balance_cache = None
-                with patch('bot.fetch', return_value=body) as fetch:
-                    with self.assertRaises(RuntimeError):
-                        self.b.balance()
-                    fetch.assert_called_once()
-
-    def test_balance_refreshes_expired_cache_and_replay_never_fetches(self):
-        self.b._key_balance_cache = {'available_usd': 99, 'checked_at': time.time() - 61}
-        with patch('bot.fetch', side_effect=[b'{"data":{"limit_remaining":0.1}}', RuntimeError('offline')]) as fetch:
-            self.assertEqual(self.b.balance()['available_usd'], .1)
-            self.assertEqual(fetch.call_count, 1)
-            fetch.reset_mock()
-            self.assertIn('error', self.b.balance(live=False))
-            fetch.assert_not_called()
 
     def test_failed_prefetch_reaches_writer_as_error(self):
         self.b.prepare_tools.return_value = ([{'tool': 'che_novogo', 'arguments': {}, 'status': 'error',
@@ -860,6 +869,13 @@ class ConversationTests(unittest.TestCase):
         self.assertNotIn('Тон:', messages[0]['content'])
         self.assertNotIn('панч', messages[0]['content'])
 
+    def test_reply_size_avoids_multi_paragraph_filler_on_short_banter(self):
+        short_choices = {bot.Bot.pick_reply_size({'text': 'че с деньгами'}) for _ in range(30)}
+        self.assertTrue(short_choices.issubset({'1–2 фразы', 'один абзац'}))
+        with patch('bot.random.choice', side_effect=lambda opts: opts[-1]):
+            self.assertEqual(bot.Bot.pick_reply_size({'text': 'доложи подробно про выборы'}), '2–3 коротких абзаца')
+            self.assertEqual(bot.Bot.pick_reply_size({'text': 'а' * 80}), '2–3 коротких абзаца')
+
     def test_reaction_event_uses_same_director_without_canned_comeback(self):
         self.b.history.record((-1, 0), 100, 1, time.time(), 'мой ответ', {}, {})
         self.b.direct.side_effect = lambda s, p: {**self.decision(s, p), 'action': 'ignore', 'addressed': False}
@@ -934,6 +950,27 @@ class ConversationTests(unittest.TestCase):
         self.assertEqual(usage[0]['output_tokens'], 4)
         self.assertEqual(usage[0]['cost'], .02)
 
+    def test_openai_writer_uses_reasoning_effort_without_openrouter_only_fields(self):
+        self.b.provider = 'openai'
+        self.b.openai_key = 'sk-proj-test'
+        self.b.openai_url = 'https://api.openai.com/v1'
+        self.b.model = 'gpt-6.2-astra'
+        self.b.effort = 'low'
+        response = {'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}],
+                    'usage': {'prompt_tokens': 12, 'completion_tokens': 4}}
+        with patch('bot.post', return_value=response) as post:
+            answer = bot.Bot.writer_step(self.b, [{'role': 'user', 'content': 'hello'}])
+        self.assertEqual(answer['content'], 'ok')
+        url, payload = post.call_args.args[:2]
+        self.assertEqual(url, 'https://api.openai.com/v1/chat/completions')
+        self.assertEqual(post.call_args.kwargs['headers']['Authorization'], 'Bearer sk-proj-test')
+        self.assertEqual(payload['reasoning_effort'], 'low')
+        self.assertEqual(payload['max_completion_tokens'], 6000)
+        self.assertNotIn('reasoning', payload)
+        self.assertNotIn('repetition_penalty', payload)
+        self.assertNotIn('temperature', payload)
+        self.assertNotIn('max_tokens', payload)
+
 
     def test_jev_and_writer_costs_are_counted_once(self):
         _, first = self.turn()
@@ -956,7 +993,7 @@ class ConversationTests(unittest.TestCase):
         for action in ('react', 'ignore'):
             self.b.direct.side_effect = lambda snapshot, previous, action=action: {
                 **self.decision(snapshot, previous), 'action': action}
-            self.turn()
+            self.turn(explicit=False)
         self.b.format_answer.assert_not_called()
 
     def test_aliases_link_name_handle_and_id_without_rewriting_message_text(self):

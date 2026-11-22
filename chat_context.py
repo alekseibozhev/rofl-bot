@@ -116,10 +116,10 @@ def tool_result(entry):
         data = json.loads(text)
     except (ValueError, TypeError):
         data = text
-    names = {'skok_deneg': 'Деньги Рофла', 'sprosit': 'Поиск в интернете', 'pochitat': 'Содержимое страницы',
+    names = {'sprosit': 'Поиск в интернете', 'pochitat': 'Содержимое страницы',
              'vspomnit': 'История чата', 'che_novogo': 'Новости', 'kto_tut': 'Участники чата'}
     status = {'execute': 'результат', 'repeat': 'повтор', 'error': 'ошибка',
-              'saved': 'сохранённый результат'}.get(entry['status'], entry['status'])
+              'empty': 'ничего не найдено', 'saved': 'сохранённый результат'}.get(entry['status'], entry['status'])
     lines = [names.get(entry['tool'], entry['tool']) + ' · ' + status]
     if entry.get('date') is not None and entry.get('request') is not None:
         lines.append(f"Проверка {stamp(entry['date'])} для сообщения #{entry['request']}")
@@ -131,9 +131,13 @@ def tool_result(entry):
         for i, item in enumerate(data['results'], 1):
             lines.extend([f"{i}. {item.get('title', '')}", item.get('url', ''),
                           item.get('content', item.get('snippet', ''))])
+        if not data['results']:
+            lines.append('Ничего не найдено.')
     elif isinstance(data, list) and all(isinstance(x, dict) and 'url' in x for x in data):
         for i, item in enumerate(data, 1):
             lines.extend([f"{i}. {item.get('title', '')}", item['url']])
+        if not data:
+            lines.append('Ничего не найдено.')
     elif isinstance(data, dict) and 'text' in data and 'url' in data:
         lines.extend([data.get('title', ''), data['url'], data['text']])
         if data.get('truncated'):

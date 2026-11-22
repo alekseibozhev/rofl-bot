@@ -5,7 +5,8 @@ import time
 
 JEV_URL = 'https://openrouter.ai/api/alpha/decisions'
 JEV_MODEL = 'typesafe/jev-1.14-20261014'
-CONTEXT_THRESHOLD = 0.35
+CONTEXT_THRESHOLD = 0.5
+CONTEXT_MAX_MESSAGES = 14
 
 
 def visual_state(state, snapshot):
@@ -69,25 +70,44 @@ def select_context(post, key, snapshot, target, model=JEV_MODEL):
             raise ValueError()
     except (KeyError, TypeError, ValueError):
         raise RuntimeError('Некорректный отбор контекста Jev') from None
-    kept = mandatory | {int(i) for i, score in scores.items() if score >= CONTEXT_THRESHOLD}
-    # Preserve the question behind each selected answer and the available reply
-    # ancestors. Otherwise a useful answer arrives without what it was answering.
-    pending = list(kept)
-    while pending:
-        parent_id = by_id[pending.pop()]['reply_to']
+    budget = max(CONTEXT_MAX_MESSAGES, len(mandatory))
+    kept = set(mandatory)
+    ranked = sorted(((score, int(i)) for i, score in scores.items() if score >= CONTEXT_THRESHOLD), reverse=True)
+    for _, mid in ranked:
+        if mid in kept:
+            continue
+        # Add an assistant turn together with its immediate reply parent atomically so we never
+        # orphan a bot answer without the question it was replying to, nor drag unrelated grandparents
+        # across topic switches when Jev scored them below threshold.
+        group = [mid]
+        parent_id = by_id[mid]['reply_to']
         if parent_id in by_id and parent_id not in kept:
-            kept.add(parent_id)
-            pending.append(parent_id)
+            group.append(parent_id)
+            if by_id[parent_id]['role'] == 'assistant':
+                grand_id = by_id[parent_id]['reply_to']
+                if grand_id in by_id and grand_id not in kept and grand_id not in group:
+                    group.append(grand_id)
+        if len(kept) + len(group) > budget:
+            if by_id[mid]['role'] == 'assistant' and len(group) > 1:
+                continue
+            if len(kept) >= budget:
+                break
+            group = [mid]
+        kept.update(group)
     return {'ids': sorted(kept), 'scores': scores, 'candidates': len(turns), 'threshold': CONTEXT_THRESHOLD,
             'jev': {'model': model, 'image': bool(snapshot.get('_jev_image')), 'elapsed_s': round(time.monotonic() - start, 3),
                     'cost': (response.get('usage') or {}).get('cost') or 0}}
 
 
 def exposition():
-    return ('Это ролеплей в групповом чате. Ты Рофл — участник чата, профессор мемологии '
-            'и диванный интернет-воин со стажем. Не стесняешься в выражениях, любишь навалить '
-            'кринжа, доксить, газлайтить, троллить и подъёбывать. '
-            'Отвечай от первого лица и оставайся в роли.')
+    return ('Это ролеплей в групповом чате. Ты Рофл (настоящее имя — Матье Балл), '
+            'свой участник и едкий тролль в этом чате. Отвечай от первого лица, оставайся в роли, '
+            'не ломай четвёртую стену и не скатывайся в тон вежливого ИИ-ассистента или морализаторство.\n'
+            'Не стесняйся в выражениях, подкалывай и подъёбывай по делу, но отвечай именно на текущую '
+            'реплику и её контекст. Не повторяй по кругу одни и те же присказки, клише и свои прошлые шутки, '
+            'и не озвучивай вслух свою роль.\n'
+            'Если в ответе есть факты, опирайся на переписку и приложенные результаты инструментов: '
+            'не выдумывай события, цифры и ссылки и не подменяй названия; если поиск ничего не дал — так и скажи.')
 
 
 def payload(snapshot, previous):
@@ -112,7 +132,10 @@ def payload(snapshot, previous):
             'An emoji reaction does not require can_interject=true; it is allowed during the reply cooldown. '
             'When can_react=false (quiet hours), do not choose react unless the event addresses Rofl. '
             'Permission to reply or react is not an obligation: choose ignore when there is no worthwhile reason to participate. '
-            'An emoji can acknowledge praise or laughter; a request needs words. A statement addressed to Rofl also invites his response. '
+            'An emoji can acknowledge praise or laughter. When the event directly asks Rofl a question or requests '
+            'an action or text, choose reply, including a follow-up request made by replying to his previous answer. '
+            'The writer handles what to say; silently ignoring a direct request leaves it unanswered. '
+            'A statement addressed to Rofl also invites his response. '
             'When image_context contains an image, inspect it together with its caption, reply parent and conversation. '
             'Decide whether it addresses Rofl or gives him a worthwhile reason to participate. '
             'An image alone does not require a response: ignore, reply and react are all available. '
@@ -186,5 +209,4 @@ TOOLS = [
     tool('che_novogo', 'ЧЁ НОВОГО. Узнать последние новости за сутки.', {'query': {'type': 'string'}}),
     tool('kto_tut', 'КТО ТУТ. Посмотреть, кто есть в чате и как к ним обращаться. '
          'all=true — освежить список.', {'all': {'type': 'boolean'}}),
-    tool('skok_deneg', 'СКОК ДЕНЕГ. Посмотреть, что у тебя с деньгами.'),
 ]

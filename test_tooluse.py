@@ -17,13 +17,13 @@ class ToolUseTests(unittest.TestCase):
         self.addCleanup(db.close)
         db.execute('CREATE TABLE tool_executions (chat,topic,request,date,name,arguments,result)')
         self.b.history = Mock(db=db)
-        self.b.execute_tool = Mock(return_value='ДЕНЕГ ТОЛЬКО НА ЕДУ И КОММУНАЛКУ')
+        self.b.execute_tool = Mock(return_value='{"known":{"andrew":"Andrew"},"identities":[]}')
         self.message = {'chat': {'id': -1}, 'message_id': 1}
-        self.snapshot = {'target': 1, 'date': 1000, 'context': 'Что с деньгами?', 'event': 'message',
+        self.snapshot = {'target': 1, 'date': 1000, 'context': 'Кто тут в чате?', 'event': 'message',
                          '_visible_tool_requests': set()}
 
     def call(self, live=True):
-        return self.b.writer_tool('skok_deneg', {}, self.message, self.snapshot, live)
+        return self.b.writer_tool('kto_tut', {}, self.message, self.snapshot, live)
 
     def test_repeat_returns_only_rebuke_and_does_not_execute(self):
         with patch('bot.tooluse.judge', return_value=('execute', {})):
@@ -66,13 +66,13 @@ class ToolUseTests(unittest.TestCase):
     def test_judge_cannot_claim_repeat_without_evidence(self):
         post = Mock(return_value={'answers': {'usefulness': {'choice': 'repeat'}}})
         with self.assertRaises(RuntimeError):
-            tooluse.judge(post, 'key', 'skok_deneg', {}, self.snapshot, [])
+            tooluse.judge(post, 'key', 'kto_tut', {}, self.snapshot, [])
         self.assertNotIn('repeat', post.call_args.args[1]['questions']['usefulness']['criteria'])
 
     def test_same_turn_retry_cannot_accuse_user_of_repeating(self):
         post = Mock(return_value={'answers': {'usefulness': {'choice': 'skip'}}})
         recent = [{'request': self.snapshot['target'], 'result': 'already known'}]
-        choice, _ = tooluse.judge(post, 'key', 'skok_deneg', {}, self.snapshot, recent)
+        choice, _ = tooluse.judge(post, 'key', 'kto_tut', {}, self.snapshot, recent)
         self.assertEqual(choice, 'skip')
         self.assertNotIn('repeat', post.call_args.args[1]['questions']['usefulness']['criteria'])
 
@@ -81,3 +81,12 @@ class ToolUseTests(unittest.TestCase):
         with patch('bot.post', return_value={'choices': [{'message': {'content': 'ok'}}]}) as post:
             self.b.writer_step([])
         self.assertEqual(post.call_args.args[1]['repetition_penalty'], 1.1)
+
+    def test_successful_and_clean_query_helpers(self):
+        self.assertFalse(tooluse.successful('[]'))
+        self.assertFalse(tooluse.successful(json.dumps({'results': []})))
+        self.assertFalse(tooluse.successful(json.dumps({'messages': []})))
+        self.assertFalse(tooluse.successful('Ничего не найдено.'))
+        self.assertTrue(tooluse.successful(json.dumps({'results': [{'url': 'https://example.org'}]})))
+        self.assertTrue(tooluse.successful('OK'))
+        self.assertEqual(tooluse.clean_query('@bot РОФЛ, ЧЕ ТАМ С ВЫБОРАМИ?! https://x.co/1'), 'че там с выборами')
