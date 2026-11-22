@@ -21,7 +21,6 @@ class ConversationTests(unittest.TestCase):
         self.b.me = {'id': 42, 'username': 'test_bot'}
         self.b.history = History(self.path)
         self.b.generate = Mock(return_value='Согласен')
-        self.b.format_answer = Mock(side_effect=lambda text: (text, {'mock': True}))
         self.b.rude = 0
         self.b.setup = Mock(return_value='нет')
         self.counter = 0

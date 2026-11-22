@@ -59,8 +59,7 @@ class PrefetchTests(unittest.TestCase):
         self.assertEqual(self.b.usage[0]['cost'], .001)
 
     def test_prefetch_executes_once_without_second_judge_and_saves_success(self):
-        with patch('bot.post', side_effect=self.responses(lambda name, q: 'call_0' if name == 'kto_tut' else 'skip')), \
-                patch('bot.tooluse.judge', side_effect=AssertionError('No second judge')):
+        with patch('bot.post', side_effect=self.responses(lambda name, q: 'call_0' if name == 'kto_tut' else 'skip')):
             entries, _ = self.b.prepare_tools(self.message, self.snapshot, self.decision, True)
         self.b.execute_tool.assert_called_once()
         self.assertEqual(entries[0]['result'], 'УЧАСТНИКИ ЧАТА')
@@ -183,19 +182,34 @@ class PrefetchTests(unittest.TestCase):
             if turn['role'] == 'assistant':
                 self.assertIn(turn['reply_to'], kept)
 
-    def test_past_tool_results_excludes_low_score_transitive_ancestors(self):
+    def test_past_tool_results_excludes_low_score_reply_parent_on_topic_switch(self):
         self.b.history.db.execute(
             'INSERT INTO tool_executions VALUES (?,?,?,?,?,?,?)',
             (-1, 0, 1, 900, 'kto_tut', '{}', 'УЧАСТНИКИ ЧАТА'))
         decision = {'action': 'reply', 'target': 3,
-                    'context_selection': {'ids': [1, 2, 3], 'threshold': .5, 'scores': {'1': .1, '2': .2}}}
-        # Message 2 is immediate reply parent of 3, so its reply_to=1 is only included if 1 or 2 is relevant.
-        # Move target's reply_to to None so neither 1 nor 2 is an immediate parent of 3.
-        snap = copy.deepcopy(self.snapshot)
-        snap['messages'][-1]['reply_to'] = None
-        self.assertEqual(self.b.past_tool_results(self.message, snap, decision), [])
-        decision['context_selection']['scores']['1'] = .8
-        self.assertEqual(len(self.b.past_tool_results(self.message, snap, decision)), 1)
+                    'context_selection': {'ids': [1, 2, 3], 'threshold': .5, 'scores': {'1': .1, '2': .11}}}
+        # Message 3 replies directly to bot answer 2, but Jev scored both 1 and 2 below threshold (topic switch).
+        self.assertEqual(self.b.past_tool_results(self.message, self.snapshot, decision), [])
+        # When the reply parent itself is relevant (clarification), its underlying tool result is kept.
+        decision['context_selection']['scores']['2'] = .8
+        self.assertEqual(len(self.b.past_tool_results(self.message, self.snapshot, decision)), 1)
+
+    def test_write_turn_places_reference_before_instruction_and_omits_it_without_tools(self):
+        self.b.writer_step = Mock(return_value={'role': 'assistant', 'content': 'ок'})
+        plain = {**self.decision, 'tool_results': [], 'tool_history': []}
+        self.b.write_turn(self.message, self.snapshot, plain, False)
+        plain_prompt = self.b.writer_step.call_args.args[0][-1]['content']
+        self.assertNotIn('Для справки:', plain_prompt)
+        self.assertNotIn('Возьми из справки', plain_prompt)
+
+        with_tools = {**self.decision, 'tool_history': [], 'tool_results': [
+            {'tool': 'sprosit', 'arguments': {'query': 'wow'}, 'status': 'execute',
+             'result': json.dumps({'results': [{'title': 'WoW', 'url': 'https://example.org', 'snippet': 'shaman'}]}, ensure_ascii=False)}]}
+        self.b.write_turn(self.message, self.snapshot, with_tools, False)
+        tool_prompt = self.b.writer_step.call_args.args[0][-1]['content']
+        self.assertIn('Для справки:', tool_prompt)
+        self.assertLess(tool_prompt.index('Для справки:'), tool_prompt.index('Сообщение для ответа: 3.'))
+        self.assertIn('Возьми из справки только то, что отвечает на вопрос', tool_prompt)
 
     def test_empty_search_results_are_not_saved_or_followed_by_pochitat(self):
         self.b.execute_tool.return_value = '[]'

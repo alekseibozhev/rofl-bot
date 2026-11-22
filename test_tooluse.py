@@ -22,59 +22,19 @@ class ToolUseTests(unittest.TestCase):
         self.snapshot = {'target': 1, 'date': 1000, 'context': 'Кто тут в чате?', 'event': 'message',
                          '_visible_tool_requests': set()}
 
-    def call(self, live=True):
-        return self.b.writer_tool('kto_tut', {}, self.message, self.snapshot, live)
-
     def test_repeat_returns_only_rebuke_and_does_not_execute(self):
-        with patch('bot.tooluse.judge', return_value=('execute', {})):
-            self.call()
+        self.b.writer_tool('kto_tut', {}, self.message, self.snapshot, True, verdict='execute')
         self.snapshot.update(target=3, date=1001)
-        with patch('bot.tooluse.judge', return_value=('repeat', {})) as judge:
-            self.assertEqual(self.call(), tooluse.REPEAT)
-            self.assertEqual(len(judge.call_args.args[-1]), 1)
+        self.assertEqual(self.b.writer_tool('kto_tut', {}, self.message, self.snapshot, True, verdict='repeat'),
+                         tooluse.REPEAT)
         self.b.execute_tool.assert_called_once()
         self.assertEqual(self.b.history.db.execute('SELECT count(*) FROM tool_executions').fetchone()[0], 1)
 
-    def test_refresh_executes_and_unseen_or_other_chat_evidence_is_excluded(self):
-        with patch('bot.tooluse.judge', return_value=('execute', {})) as judge:
-            self.call()
-            self.snapshot.update(target=3, date=1001, context='Я пополнил, проверь')
-            self.call()
-            self.assertEqual(self.b.execute_tool.call_count, 2)
-            self.snapshot['_visible_tool_requests'] = set()
-            self.call()
-            self.assertEqual(judge.call_args.args[-1], [])
-            self.message['chat']['id'] = -2
-            self.snapshot['_visible_tool_requests'] = {1, 3}
-            self.call()
-            self.assertEqual(judge.call_args.args[-1], [])
-
     def test_replay_and_failed_results_do_not_write(self):
-        with patch('bot.tooluse.judge', return_value=('execute', {})):
-            self.call(live=False)
-            self.b.execute_tool.return_value = '{"error":"offline"}'
-            self.call()
+        self.b.writer_tool('kto_tut', {}, self.message, self.snapshot, False)
+        self.b.execute_tool.return_value = '{"error":"offline"}'
+        self.b.writer_tool('kto_tut', {}, self.message, self.snapshot, True)
         self.assertEqual(self.b.history.db.execute('SELECT count(*) FROM tool_executions').fetchone()[0], 0)
-
-    def test_judge_failure_executes_and_skip_does_not(self):
-        with patch('bot.tooluse.judge', side_effect=RuntimeError('offline')):
-            self.call()
-        with patch('bot.tooluse.judge', return_value=('skip', {})):
-            self.assertEqual(self.call(), tooluse.SKIP)
-        self.b.execute_tool.assert_called_once()
-
-    def test_judge_cannot_claim_repeat_without_evidence(self):
-        post = Mock(return_value={'answers': {'usefulness': {'choice': 'repeat'}}})
-        with self.assertRaises(RuntimeError):
-            tooluse.judge(post, 'key', 'kto_tut', {}, self.snapshot, [])
-        self.assertNotIn('repeat', post.call_args.args[1]['questions']['usefulness']['criteria'])
-
-    def test_same_turn_retry_cannot_accuse_user_of_repeating(self):
-        post = Mock(return_value={'answers': {'usefulness': {'choice': 'skip'}}})
-        recent = [{'request': self.snapshot['target'], 'result': 'already known'}]
-        choice, _ = tooluse.judge(post, 'key', 'kto_tut', {}, self.snapshot, recent)
-        self.assertEqual(choice, 'skip')
-        self.assertNotIn('repeat', post.call_args.args[1]['questions']['usefulness']['criteria'])
 
     def test_writer_sends_penalty(self):
         self.b.model = 'test'
@@ -90,3 +50,7 @@ class ToolUseTests(unittest.TestCase):
         self.assertTrue(tooluse.successful(json.dumps({'results': [{'url': 'https://example.org'}]})))
         self.assertTrue(tooluse.successful('OK'))
         self.assertEqual(tooluse.clean_query('@bot РОФЛ, ЧЕ ТАМ С ВЫБОРАМИ?! https://x.co/1'), 'че там с выборами')
+
+
+if __name__ == '__main__':
+    unittest.main()

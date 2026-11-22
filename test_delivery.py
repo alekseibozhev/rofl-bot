@@ -29,7 +29,6 @@ class DeliveryTests(unittest.TestCase):
             'action': 'reply', 'target': s['target'], 'attitude': 5, 'reconsider': False, 'addressed': True})
         self.b.select_context = Mock(return_value={'fallback': True})
         self.b.writer_step = Mock(return_value={'role': 'assistant', 'content': 'Готовый ответ'})
-        self.b.format_answer = Mock(side_effect=lambda a: (a, {}))
         self.message = {'chat': {'id': -1, 'type': 'group'}, 'message_id': 1, 'date': time.time(),
                         'from': {'id': 7, 'first_name': 'Автор'}, 'text': 'бот, привет'}
         self.update = {'update_id': 10, 'message': self.message}

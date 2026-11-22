@@ -29,7 +29,6 @@ class ConversationTests(unittest.TestCase):
         self.b.send_typing = Mock()
         self.b.generate = Mock(return_value='Глад Валакас')
         self.b.writer_step = Mock(return_value={'role': 'assistant', 'content': 'Шо?'})
-        self.b.format_answer = Mock(side_effect=lambda text: (text, {'mock': True}))
         self.b.read = Mock()
         self.b.direct = Mock(side_effect=self.decision)
         self.b.select_context = Mock(return_value={'fallback': True})
@@ -299,13 +298,8 @@ class ConversationTests(unittest.TestCase):
         def prepare(*args, **kwargs):
             wait_for_typing()
             return [], {}
-        def formatter(text):
-            wait_for_typing()
-            return text, {}
-
         self.b.writer_step.side_effect = writer
         self.b.prepare_tools.side_effect = prepare
-        self.b.format_answer.side_effect = formatter
         real_typing = bot.typing
         with patch('bot.post', side_effect=send), patch('bot.typing', side_effect=lambda send: real_typing(send, every=.01)):
             answer, _ = self.turn(self.message(topic=12))
@@ -869,12 +863,11 @@ class ConversationTests(unittest.TestCase):
         self.assertNotIn('Тон:', messages[0]['content'])
         self.assertNotIn('панч', messages[0]['content'])
 
-    def test_reply_size_avoids_multi_paragraph_filler_on_short_banter(self):
-        short_choices = {bot.Bot.pick_reply_size({'text': 'че с деньгами'}) for _ in range(30)}
-        self.assertTrue(short_choices.issubset({'1–2 фразы', 'один абзац'}))
-        with patch('bot.random.choice', side_effect=lambda opts: opts[-1]):
-            self.assertEqual(bot.Bot.pick_reply_size({'text': 'доложи подробно про выборы'}), '2–3 коротких абзаца')
-            self.assertEqual(bot.Bot.pick_reply_size({'text': 'а' * 80}), '2–3 коротких абзаца')
+    def test_clean_prefix_strips_leaked_speaker_headers_only(self):
+        for prefix in ('Рофл: ', '[123] Рофл: ', '[01.11.2026 17:17] [123] Рофл → Вася: '):
+            self.assertEqual(bot.clean_prefix(prefix + 'Два бакса.'), 'Два бакса.')
+        for text in ('[123] Привет', 'Рофл сказал привет', '2026-11-01 12:00 старт'):
+            self.assertEqual(bot.clean_prefix(text), text)
 
     def test_reaction_event_uses_same_director_without_canned_comeback(self):
         self.b.history.record((-1, 0), 100, 1, time.time(), 'мой ответ', {}, {})
@@ -976,25 +969,6 @@ class ConversationTests(unittest.TestCase):
         _, first = self.turn()
         self.assertEqual(first['cost'], .001)
         self.assertIsNone(self.b.usage)
-
-    def test_formatter_runs_after_author_and_skips_silence_and_reactions(self):
-        self.b.writer_step.return_value = {'role': 'assistant', 'content': 'Исходный ответ'}
-        def format_answer(text):
-            self.b.usage.append({'cost': .0001, 'stage': 'formatter'})
-            return '**Исходный ответ**', {'cost': .0001}
-        self.b.format_answer.side_effect = format_answer
-        answer, trace = self.turn()
-        self.assertEqual(answer, '**Исходный ответ**')
-        self.assertEqual(trace['formatter']['cost'], .0001)
-        self.assertAlmostEqual(trace['cost'], .0011)
-        self.assertNotIn('reaction', trace)
-        self.b.format_answer.assert_called_once_with('Исходный ответ')
-        self.b.format_answer.reset_mock()
-        for action in ('react', 'ignore'):
-            self.b.direct.side_effect = lambda snapshot, previous, action=action: {
-                **self.decision(snapshot, previous), 'action': action}
-            self.turn(explicit=False)
-        self.b.format_answer.assert_not_called()
 
     def test_aliases_link_name_handle_and_id_without_rewriting_message_text(self):
         author = self.message('Это мой бот.')

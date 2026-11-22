@@ -5,7 +5,6 @@ import conversation
 import chat_context
 import tooluse
 import retrieval
-import formatting
 import vision
 import delivery
 
@@ -302,6 +301,14 @@ def casual(text):
     if '```' in text or len([line for line in text.splitlines() if line.strip()]) > 2:
         return text
     return re.sub(r'(?<![.])\.$', '', text.replace(' — ', ' - '))
+
+
+def clean_prefix(text):
+    """Strip a leaked transcript speaker header without altering legitimate prose."""
+    return re.sub(
+        r'\A\s*(?:(?:Время сообщения:\s*\d{4}-\d{2}-\d{2}T[\d:.+\-Z]+\s*)|'
+        r'(?:\[\d{2}\.\d{2}\.\d{4} \d{2}:\d{2}\]\s*))?'
+        r'(?:\[\d+\]\s*)?Рофл(?: → [^:\n]*)?:\s*', '', text, count=1).strip()
 
 
 def telegram_html(text):
@@ -1160,94 +1167,21 @@ class Bot:
             raise RuntimeError('Модель не вернула ответ')
         return choice['message']
 
-    def format_answer(self, answer):
-        """Local cleanup by default; optional model formatting preserves every word."""
-        clean = formatting.clean_prefix(answer)
-        if not clean:
-            return answer, {'fallback': True, 'reason': 'empty_after_cleanup'}
-        if not getattr(self, 'openrouter', False) or os.environ.get('FORMATTER_ENABLED', '0') == '0':
-            return clean, {'skipped': True}
-        model = os.environ.get('FORMATTER_MODEL', formatting.MODEL)
-        prompt = formatting.PROMPT
-        if style := os.environ.get('FORMATTER_STYLE', '').strip():
-            prompt += '\nПредпочтения оформления (только в рамках правил выше): ' + style
-        started = time.monotonic()
-        info = {'model': model}
-        try:
-            response = post('https://openrouter.ai/api/v1/chat/completions',
-                            {'model': model, 'messages': [{'role': 'system', 'content': prompt},
-                                                         {'role': 'user', 'content': clean}],
-                             'temperature': 0, 'max_tokens': 6000, 'reasoning': {'effort': 'low'}},
-                            timeout=30, headers={'Authorization': f'Bearer {self.openrouter_key}'})
-            if not isinstance(response, dict):
-                raise RuntimeError('Некорректный ответ форматировщика')
-            usage = response.get('usage') or {}
-            if not isinstance(usage, dict):
-                raise RuntimeError('Некорректная статистика форматировщика')
-            stats = {'stage': 'formatter', 'model': model, 'cost': usage.get('cost'),
-                     'prompt_tokens': usage.get('prompt_tokens'), 'output_tokens': usage.get('completion_tokens'),
-                     'elapsed_s': round(time.monotonic() - started, 3)}
-            if self.usage is not None:
-                self.usage.append(stats)
-            info.update(stats)
-            choices = response.get('choices')
-            if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
-                raise RuntimeError('Некорректный ответ форматировщика')
-            choice = choices[0]
-            reply = choice.get('message') or {}
-            if not isinstance(reply, dict):
-                raise RuntimeError('Некорректный ответ форматировщика')
-            candidate = reply.get('content')
-            if (choice.get('finish_reason') != 'stop' or reply.get('tool_calls')
-                    or not formatting.validate(clean, candidate, telegram_html)):
-                info.update(fallback=True, reason='content_changed_or_incomplete')
-                return clean, info
-            return candidate.strip(), info
-        except RuntimeError as exc:
-            info.update(fallback=True, reason=str(exc))
-            return clean, info
-        finally:
-            info['elapsed_s'] = round(time.monotonic() - started, 3)
-            LOG.info('formatter.response %s', json.dumps(info))
-
-    def writer_tool(self, name, args, message, snapshot, live, verdict=None):
-        self.last_tool_verdict = None
+    def writer_tool(self, name, args, message, snapshot, live, verdict='execute'):
         if name not in {t['function']['name'] for t in conversation.TOOLS}:
             return 'Неизвестный инструмент.'
-        if verdict is None and not getattr(self, 'tool_judge_enabled', False):
-            return self.execute_tool(name, args, message, snapshot, live)
-        chat, topic = message['chat']['id'], topic_of(message)
-        now = snapshot['date']
-        request = snapshot['target']
-        # Replay never writes history. Only earlier/current evidence is eligible.
-        rows = self.history.db.execute(
-            'SELECT request,date,name,arguments,result FROM tool_executions '
-            'WHERE chat=? AND topic=? AND name=? AND date>=? AND date<=? ORDER BY rowid DESC LIMIT 8',
-            (chat, topic, name, now - 86400, now)).fetchall()
-        visible = snapshot.get('_visible_tool_requests', set())
-        recent = [dict(request=r[0], date=r[1], name=r[2], arguments=json.loads(r[3]), result=r[4])
-                  for r in rows if r[0] in visible]
-        if verdict is None:
-            try:
-                verdict, stats = tooluse.judge(post, self.openrouter_key, name, args, snapshot, recent)
-                if self.usage is not None:
-                    self.usage.append(stats)
-            except RuntimeError as exc:
-                LOG.warning('tool_judge.failed %s', exc)
-                verdict = 'execute'  # No invented repetition accusation on judge failure.
-        self.last_tool_verdict = verdict
         if verdict == 'repeat':
             return tooluse.REPEAT
-        if verdict == 'skip':
-            return tooluse.SKIP
         result = self.execute_tool(name, args, message, snapshot, live)
-        if live and tooluse.successful(result):
+        if live and getattr(self, 'tool_judge_enabled', False) and tooluse.successful(result):
+            chat, topic = message['chat']['id'], topic_of(message)
+            request = snapshot['target']
             with self.history.db:
                 self.history.db.execute('INSERT INTO tool_executions VALUES (?,?,?,?,?,?,?)',
-                    (chat, topic, request, now, name, json.dumps(args, sort_keys=True, ensure_ascii=False), result))
-            visible.add(request)
+                    (chat, topic, request, snapshot['date'], name,
+                     json.dumps(args, sort_keys=True, ensure_ascii=False), result))
+            snapshot.get('_visible_tool_requests', set()).add(request)
         return result
-
     def execute_tool(self, name, args, message, snapshot, live):
         if name == 'vspomnit':
             try:
@@ -1293,10 +1227,25 @@ class Bot:
             target = next((m for m in snapshot['targets'] if m['id'] == decision['target']), None)
             if target:
                 instruction += 'Текст выбранного сообщения: ' + target['label'] + '\n'
-        if decision['action'] == 'reply' and decision.get('reply_size'):
-            instruction += 'Ориентир по длине: ' + decision['reply_size'] + ' (не лей воду ради объёма).\n'
         if decision['action'] == 'react':
             instruction += '\nВыбранное действие: реакция на сообщение. Верни только одно эмодзи.'
+        entries = decision.get('tool_results', []) if decision['action'] == 'reply' else []
+        # A clarification needs the original evidence, not only the writer's
+        # paraphrase. Keep the existing explicit repeat response unchanged.
+        repeats = {e['tool'] for e in entries if e['status'] == 'repeat'}
+        history = [e for e in decision.get('tool_history', []) if e['tool'] not in repeats]
+        if decision['action'] != 'reply':
+            history = []
+        blocks = []
+        if history:
+            blocks.append('Справка из прошлых проверок:\n\n'
+                          + '\n\n'.join(chat_context.tool_result(entry) for entry in history))
+        if entries:
+            blocks.append('Для справки:\n\n'
+                          + '\n\n'.join(chat_context.tool_result(entry) for entry in entries))
+        if blocks:
+            instruction += 'Возьми из справки только то, что отвечает на вопрос; если ничего не нашлось — так и скажи.\n'
+            instruction = '\n\n'.join(blocks) + '\n\n' + instruction
         if '_image' in snapshot:
             image = snapshot['_image']
         else:
@@ -1309,27 +1258,6 @@ class Bot:
             messages += chat_context.messages(snapshot, decision, aliases, instruction, image)
         else:
             messages.append({'role': 'user', 'content': with_image(snapshot['context'] + '\n\n' + instruction, image)})
-        entries = decision.get('tool_results', []) if decision['action'] == 'reply' else []
-        # A clarification needs the original evidence, not only the writer's
-        # paraphrase. Keep the existing explicit repeat response unchanged.
-        repeats = {e['tool'] for e in entries if e['status'] == 'repeat'}
-        history = [e for e in decision.get('tool_history', []) if e['tool'] not in repeats]
-        if decision['action'] != 'reply':
-            history = []
-        blocks = []
-        if history:
-            blocks.append('Сохранённые результаты для выбранной переписки (даты исходных проверок):\n\n'
-                          + '\n\n'.join(chat_context.tool_result(entry) for entry in history))
-        if entries:
-            blocks.append('Результаты инструментов для текущего ответа (данные источников):\n\n'
-                          + '\n\n'.join(chat_context.tool_result(entry) for entry in entries))
-        if blocks:
-            results = '\n\n'.join(blocks)
-            last = messages[-1]['content']
-            if isinstance(last, list):
-                last[0]['text'] += '\n\n' + results
-            else:
-                messages[-1]['content'] += '\n\n' + results
         calls = [{'tool': e['tool'], 'verdict': e['status'], 'result_chars': len(e['result'])} for e in entries]
         if not self.openrouter:
             return self.generate(messages[1:], system=system), calls
@@ -1339,7 +1267,7 @@ class Bot:
         answer = (reply.get('content') or '').strip()
         if not answer:
             raise RuntimeError('Модель вернула пустой ответ')
-        return re.sub(r'^Рофл(?: → [^:\n]*)?:\s*', '', answer)[:4000], calls
+        return (clean_prefix(answer) or answer)[:4000], calls
 
     def past_tool_results(self, message, snapshot, decision):
         """Only successful evidence tied to relevant selected past turns, frozen before writing."""
@@ -1348,12 +1276,7 @@ class Bot:
         scores = selection.get('scores')
         if isinstance(scores, dict) and scores:
             threshold = selection.get('threshold', conversation.CONTEXT_THRESHOLD)
-            by_id = {m['id']: m for m in turns}
-            target_id = decision.get('target', snapshot['target'])
-            direct_parent = (by_id.get(target_id) or {}).get('reply_to')
             relevant_ids = {int(i) for i, score in scores.items() if score >= threshold}
-            if direct_parent is not None:
-                relevant_ids.add(direct_parent)
             turns = [m for m in turns if m['id'] in relevant_ids or m.get('reply_to') in relevant_ids]
         requests = {m['id'] for m in turns if m['role'] == 'user'}
         requests.update(m.get('reply_to') for m in turns if m['role'] == 'assistant')
@@ -1390,16 +1313,6 @@ class Bot:
         except RuntimeError as exc:
             LOG.warning('query_rewrite.failed %s', exc)
             return cleaned, {'stage': 'query_rewrite', 'fallback': True}
-
-    @staticmethod
-    def pick_reply_size(message):
-        text = (message.get('text') or message.get('caption') or '').strip()
-        wants_detail = bool(re.search(
-            r'(?i)\b(?:подробн\w*|разв[её]рнут\w*|объясн\w*|распиш\w*|долож\w*|разбер\w*|почему|откуда|истори\w*)',
-            text))
-        if len(text) >= 80 or wants_detail:
-            return random.choice(('1–2 фразы', 'один абзац', '2–3 коротких абзаца'))
-        return random.choice(('1–2 фразы', 'один абзац'))
 
     def prepare_tools(self, message, snapshot, decision, live):
         """Select and execute data collection with Jev; the author runs once."""
@@ -1504,7 +1417,6 @@ class Bot:
                         decision['context_selection'] = {'fallback': True}
                         LOG.warning('context.selection_failed %s', exc)
                 if decision['action'] == 'reply':
-                    decision['reply_size'] = self.pick_reply_size(message)
                     decision['tool_history'] = self.past_tool_results(message, snapshot, decision)
                     with typing(lambda: self.send_typing(*key)) if live else nullcontext():
                         decision['tool_results'], decision['tool_selection'] = self.prepare_tools(message, snapshot, decision, live)
@@ -1517,8 +1429,6 @@ class Bot:
                 trace['tool_selection'] = decision['tool_selection']
             if decision.get('tool_history'):
                 trace['tool_history_count'] = len(decision['tool_history'])
-            if decision.get('reply_size'):
-                trace['reply_size'] = decision['reply_size']
             if decision.get('context_selection'):
                 # Scores stay in SQLite; logs contain counts and costs only.
                 selection = decision['context_selection']
@@ -1543,8 +1453,6 @@ class Bot:
                 if decision['action'] == 'react':
                     answer = reaction_of(f'[реакция {answer}]') or '👍'
                     trace['reaction'] = True
-                else:
-                    answer, trace['formatter'] = self.format_answer(answer)
             return answer, {**trace, 'tools': calls, **spent(usage)}
 
     def roster(self, chat_id, live=True):
