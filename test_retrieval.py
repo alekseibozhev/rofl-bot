@@ -56,21 +56,25 @@ class RetrievalTests(unittest.TestCase):
 
     def test_search_failure_has_no_paid_fallback(self):
         b = bot.Bot.__new__(bot.Bot)
-        b.generate = Mock(side_effect=AssertionError('A search must not call a model'))
+        b.chat_step = Mock(side_effect=AssertionError('A search must not call a model'))
+        msg = {'chat': {'id': -1}, 'message_id': 1}
         with patch('retrieval.search', side_effect=RuntimeError('offline')) as search:
-            with self.assertRaises(RuntimeError):
-                b.find('Глад')
+            out = b.execute_tool('web_search', {'query': 'Глад'}, msg, 1, 1000)
         search.assert_called_once_with('Глад')
-        b.generate.assert_not_called()
+        self.assertIn('offline', out)
+        b.chat_step.assert_not_called()
 
-    def test_find_works_without_openrouter_and_returns_raw_results(self):
+    def test_find_works_without_openrouter_and_returns_formatted_results(self):
         b = bot.Bot.__new__(bot.Bot)
         b.openrouter = False
-        b.generate = Mock(side_effect=AssertionError('A search must not call a model'))
+        b.chat_step = Mock(side_effect=AssertionError('A search must not call a model'))
+        msg = {'chat': {'id': -1}, 'message_id': 1}
         result = {'results': [{'title': 'x', 'url': 'https://example.org', 'snippet': 'данные'}]}
         with patch('retrieval.search', return_value=result):
-            self.assertEqual(json.loads(b.find('test')), result)
-        b.generate.assert_not_called()
+            out = b.execute_tool('web_search', {'query': 'test'}, msg, 1, 1000)
+        self.assertIn('https://example.org', out)
+        self.assertIn('данные', out)
+        b.chat_step.assert_not_called()
 
     def test_searxng_malformed_and_oversized_responses_fail_explicitly(self):
         for body in ['<html>not JSON</html>', '{"results":{}}', 'x' * (retrieval.MAX_BYTES + 1)]:
@@ -163,12 +167,13 @@ class RetrievalTests(unittest.TestCase):
             with patch('retrieval.open_public', return_value=(Mock(), http_fixture('x', content_type=content_type, headers=headers))), self.assertRaises(RuntimeError):
                 retrieval.read_url('https://example.org')
 
-    def test_model_generation_has_no_search_tool_registration(self):
+    def test_model_generation_has_no_paid_web_plugin_and_omits_tools_when_none(self):
         b = bot.Bot.__new__(bot.Bot)
         b.model, b.openrouter_key = 'test', 'test'
         with patch('bot.post', return_value={'choices': [{'message': {'content': 'ok'}}]}) as post:
-            b.ask_openrouter_once([], 1.0, 'medium')
+            b.chat_step([], tools=None)
         self.assertNotIn('tools', post.call_args.args[1])
+        self.assertNotIn('plugins', post.call_args.args[1])
 
 
 if __name__ == '__main__':

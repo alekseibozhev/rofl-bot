@@ -1,7 +1,6 @@
-import json
 from contextlib import closing
-import signal
 import os
+import signal
 import tempfile
 import time
 import unittest
@@ -24,11 +23,7 @@ class DeliveryTests(unittest.TestCase):
         self.b.openrouter = True
         self.b.api = Mock(return_value={'message_id': 100, 'date': time.time()})
         self.b.send_typing = Mock()
-        self.b.generate = Mock(return_value='Рофл')
-        self.b.direct = Mock(side_effect=lambda s, p: {
-            'action': 'reply', 'target': s['target'], 'attitude': 5, 'reconsider': False, 'addressed': True})
-        self.b.select_context = Mock(return_value={'fallback': True})
-        self.b.writer_step = Mock(return_value={'role': 'assistant', 'content': 'Готовый ответ'})
+        self.b.chat_step = Mock(return_value={'role': 'assistant', 'content': 'Готовый ответ'})
         self.message = {'chat': {'id': -1, 'type': 'group'}, 'message_id': 1, 'date': time.time(),
                         'from': {'id': 7, 'first_name': 'Автор'}, 'text': 'бот, привет'}
         self.update = {'update_id': 10, 'message': self.message}
@@ -61,24 +56,23 @@ class DeliveryTests(unittest.TestCase):
 
     def test_interrupted_generation_resumes_after_restart(self):
         updates = self.stage_input()
-        self.b.writer_step.side_effect = KeyboardInterrupt
+        self.b.chat_step.side_effect = KeyboardInterrupt
         with self.assertRaises(KeyboardInterrupt):
             self.b.process_updates(updates)
         self.assertEqual(len(self.b.history.delivery.pending()), 1)
         self.b.api.assert_not_called()
         self.restart()
-        self.b.writer_step.side_effect = None
+        self.b.chat_step.side_effect = None
         self.b.process_updates(self.b.history.delivery.pending())
-        self.b.direct.assert_called_once()  # Saved Jev decision is reused.
         self.b.api.assert_called_once()
         self.assertFalse(self.b.history.delivery.pending())
 
     def test_generation_failure_waits_for_retry_and_does_not_advance_completion(self):
-        self.b.writer_step.side_effect = RuntimeError('offline')
+        self.b.chat_step.side_effect = RuntimeError('offline')
         self.b.process_updates(self.stage_input())
         self.assertEqual(self.b.history.db.execute('SELECT done FROM telegram_inbox').fetchone()[0], 0)
         self.assertFalse(self.b.history.delivery.pending())
-        self.b.writer_step.side_effect = None
+        self.b.chat_step.side_effect = None
         self.b.history.db.execute('UPDATE telegram_inbox SET retry_at=0')
         self.b.process_updates(self.b.history.delivery.pending())
         self.b.api.assert_called_once()
@@ -91,7 +85,7 @@ class DeliveryTests(unittest.TestCase):
         self.assertFalse(self.b.history.replied((-1, 0), 1))
         self.restart()
         self.b.process_updates(self.b.history.delivery.pending())
-        self.b.writer_step.assert_called_once()
+        self.b.chat_step.assert_called_once()
         self.b.api.assert_called_once()
         self.assertEqual(self.b.history.answer(-1, 100)[1], 'Готовый ответ')
 
@@ -131,7 +125,7 @@ class DeliveryTests(unittest.TestCase):
         def writer(*args, **kwargs):
             self.b.request_stop(signal.SIGTERM, None)
             return {'role': 'assistant', 'content': 'Законченный ответ'}
-        self.b.writer_step.side_effect = writer
+        self.b.chat_step.side_effect = writer
         self.b.process_updates(self.stage_input())
         self.assertTrue(self.b.stopping)
         self.b.api.assert_called_once()
@@ -145,30 +139,20 @@ class DeliveryTests(unittest.TestCase):
         def writer(*args, **kwargs):
             os.kill(os.getpid(), signal.SIGTERM)
             return {'role': 'assistant', 'content': 'Ответ после сигнала'}
-        self.b.writer_step.side_effect = writer
+        self.b.chat_step.side_effect = writer
         self.b.process_updates(self.stage_input())
         self.assertTrue(self.b.stopping)
         self.assertEqual(self.b.history.answer(-1, 100)[1], 'Ответ после сигнала')
         self.assertEqual(self.b.history.delivery.pending(), [])
 
-    def test_reaction_receipt_does_not_duplicate_metrics_after_partial_completion(self):
-        trace = {'target': 1, 'reaction': True, 'event': 'reaction:test'}
-        with patch.object(self.b.history, 'claim_reply', side_effect=RuntimeError('disk')):
-            with self.assertRaises(RuntimeError):
-                self.b.deliver(self.message, '👍', trace, request=1)
-        for item in self.b.history.delivery.ready():
-            self.b.dispatch(item)
-        self.assertEqual(self.b.history.db.execute('SELECT count(*) FROM answers').fetchone()[0], 1)
-        self.b.api.assert_called_once()
-
     def test_followups_remain_pending_when_the_primary_generation_fails(self):
-        followup = dict(self.message, message_id=2, text='бот, ещё деталь', date=self.message['date'] + 1)
+        followup = dict(self.message, message_id=2, text='ещё деталь', date=self.message['date'] + 1)
         self.b.history.delivery.enqueue([self.update, {'update_id': 11, 'message': followup}])
-        self.b.writer_step.side_effect = RuntimeError('offline')
+        self.b.chat_step.side_effect = RuntimeError('offline')
         self.b.process_updates(self.b.history.delivery.pending())
         self.assertEqual(self.b.history.db.execute('SELECT sum(done) FROM telegram_inbox').fetchone()[0], 0)
         self.assertFalse(self.b.history.replied((-1, 0), 2))
-        self.b.writer_step.side_effect = None
+        self.b.chat_step.side_effect = None
         self.b.history.db.execute('UPDATE telegram_inbox SET retry_at=0')
         self.b.process_updates(self.b.history.delivery.pending())
         self.b.api.assert_called_once()
