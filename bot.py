@@ -112,8 +112,14 @@ TOOLS = [
 TOOL_NAMES = {t['function']['name'] for t in TOOLS}
 
 
+def data_path(name):
+    base = Path(os.environ['DATA_DIR']) if os.environ.get('DATA_DIR') else Path(__file__).parent
+    base.mkdir(parents=True, exist_ok=True)
+    return base / name
+
+
 def setup_logging():
-    log_path = Path(__file__).with_name('bot.log')
+    log_path = data_path('bot.log')
     file_handler = RotatingFileHandler(log_path, maxBytes=2_000_000, backupCount=3, encoding='utf-8')
     log_path.chmod(0o600)
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
@@ -687,11 +693,13 @@ class Bot:
 
     def __init__(self, read_only=False):
         self.read_only = read_only
-        try:
-            self.version = subprocess.run(['git', 'describe', '--always', '--dirty'], cwd=Path(__file__).parent,
-                                          capture_output=True, text=True, timeout=5).stdout.strip() or None
-        except (OSError, subprocess.SubprocessError):
-            pass
+        self.version = os.environ.get('BOT_VERSION') or None
+        if not self.version:
+            try:
+                self.version = subprocess.run(['git', 'describe', '--always', '--dirty'], cwd=Path(__file__).parent,
+                                              capture_output=True, text=True, timeout=5).stdout.strip() or None
+            except (OSError, subprocess.SubprocessError):
+                pass
         token = os.environ.get('TELEGRAM_BOT_TOKEN', '')
         if not token or token == 'put_token_here':
             raise RuntimeError('Укажи TELEGRAM_BOT_TOKEN в .env')
@@ -724,7 +732,7 @@ class Bot:
             raise RuntimeError('Укажи ID своих групп через запятую в ALLOWED_GROUP_ID в .env') from None
         if any(group >= 0 for group in self.allowed_groups):
             raise RuntimeError('В ALLOWED_GROUP_ID должны быть отрицательные ID групп')
-        db_path = Path(__file__).with_name('history.sqlite3')
+        db_path = data_path('history.sqlite3')
         self.history = History(db_path)
         db_path.chmod(0o600)
         self.me = self.api('getMe')
@@ -1209,7 +1217,7 @@ class Bot:
         LOG.info('shutdown.requested: finish current work before exit; second signal forces exit')
 
     def run(self):
-        self.process_lock = Path(__file__).with_name('.bot.lock').open('a')
+        self.process_lock = data_path('.bot.lock').open('a')
         try:
             fcntl.flock(self.process_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -1264,10 +1272,10 @@ if __name__ == '__main__':
         setup_logging()
         if '--stats' in sys.argv:
             days = sys.argv[sys.argv.index('--stats') + 1:][:1]
-            print(report(History(Path(__file__).with_name('history.sqlite3')).db, int(days[0]) if days else 14))
+            print(report(History(data_path('history.sqlite3')).db, int(days[0]) if days else 14))
             sys.exit()
         if '--day' in sys.argv or '--state' in sys.argv:
-            history = History(Path(__file__).with_name('history.sqlite3'))
+            history = History(data_path('history.sqlite3'))
             queues = {'inbox_pending': history.db.execute('SELECT count(*) FROM telegram_inbox WHERE done=0').fetchone()[0],
                       'outbox': dict(history.db.execute('SELECT status,count(*) FROM telegram_outbox GROUP BY status').fetchall())}
             print(json.dumps({'delivery': queues}, ensure_ascii=False, indent=2))

@@ -1,0 +1,44 @@
+name: rofl-bot
+
+services:
+  searxng:
+    image: docker.io/searxng/searxng@sha256:f4aa660c54d062dedb268be84e821ea24e39f48c7a496af8dd02cc9eedb93847
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8888:8080"
+    environment:
+      SEARXNG_BASE_URL: http://127.0.0.1:8888/
+      SEARXNG_SECRET: ${SEARXNG_SECRET:?Set SEARXNG_SECRET in .env}
+    volumes:
+      - ./searxng/config:/etc/searxng
+      - searxng-cache:/var/cache/searxng
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 10s
+
+  bot:
+    build:
+      context: .
+      args:
+        BOT_VERSION: ${BOT_VERSION:-}
+    restart: unless-stopped
+    stop_grace_period: 40s
+    depends_on:
+      searxng:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATA_DIR: /data
+      SEARXNG_URL: http://searxng:8080
+      TZ: ${TZ:-Europe/Moscow}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./data:/data
+
+volumes:
+  searxng-cache:

@@ -213,7 +213,7 @@ def search(query):
     endpoint = os.environ.get('SEARXNG_URL', 'http://127.0.0.1:8888').rstrip('/')
     try:
         parts = urlsplit(endpoint)
-        if (parts.scheme != 'http' or parts.hostname not in ('127.0.0.1', '::1', 'localhost')
+        if (parts.scheme != 'http' or parts.hostname not in ('127.0.0.1', '::1', 'localhost', 'searxng')
                 or parts.username or parts.password or parts.query or parts.fragment):
             raise ValueError()
         port = parts.port or 80

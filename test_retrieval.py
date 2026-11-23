@@ -83,7 +83,12 @@ class RetrievalTests(unittest.TestCase):
             with self.subTest(size=len(body)), patch('retrieval.build_opener', return_value=opener), self.assertRaises(RuntimeError):
                 retrieval.search('test')
 
-    def test_searxng_endpoint_cannot_come_from_model_or_redirect(self):
+    def test_searxng_endpoint_allows_docker_service_and_rejects_external_or_redirect(self):
+        opener = Mock()
+        opener.open.return_value = http_fixture(json.dumps({'results': []}), content_type='application/json')
+        with patch.dict(os.environ, {'SEARXNG_URL': 'http://searxng:8080'}), patch('retrieval.build_opener', return_value=opener):
+            retrieval.search('test')
+        self.assertIn('http://searxng:8080/search?', opener.open.call_args.args[0].full_url)
         with patch.dict(os.environ, {'SEARXNG_URL': 'https://external.example'}), self.assertRaises(RuntimeError):
             retrieval.search('test')
         with self.assertRaises(RuntimeError):

@@ -1,0 +1,15 @@
+.git
+.env
+.bot.lock
+.idea
+__pycache__
+*.pyc
+*.log
+*.log.*
+data
+history.sqlite3*
+jev
+searxng
+*.md
+test_*.py
+eval_prompts.py

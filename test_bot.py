@@ -1,3 +1,4 @@
+import os
 import datetime
 from io import BytesIO
 import tempfile
@@ -200,6 +201,17 @@ class TelegramFormattingTests(unittest.TestCase):
         self.assertEqual(bot.clean_prefix('[12] Рофл: ну привет'), 'ну привет')
         self.assertEqual(bot.clean_prefix('Рофл → Вася: сам дурак'), 'сам дурак')
         self.assertEqual(bot.clean_prefix('обычный текст'), 'обычный текст')
+
+    def test_data_path_uses_env_dir_when_set(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            custom = Path(tmp) / 'nested'
+            with patch.dict(os.environ, {'DATA_DIR': str(custom)}):
+                resolved = bot.data_path('history.sqlite3')
+            self.assertEqual(resolved, custom / 'history.sqlite3')
+            self.assertTrue(custom.is_dir())
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('DATA_DIR', None)
+            self.assertEqual(bot.data_path('history.sqlite3'), Path(bot.__file__).with_name('history.sqlite3'))
 
 
 if __name__ == '__main__':
