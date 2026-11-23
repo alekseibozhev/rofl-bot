@@ -89,6 +89,12 @@ class RetrievalTests(unittest.TestCase):
         with patch.dict(os.environ, {'SEARXNG_URL': 'http://searxng:8080'}), patch('retrieval.build_opener', return_value=opener):
             retrieval.search('test')
         self.assertIn('http://searxng:8080/search?', opener.open.call_args.args[0].full_url)
+        opener.open.return_value = http_fixture(
+            json.dumps({'results': [], 'unresponsive_engines': [['brave', 'Suspended'], ['duckduckgo', 'CAPTCHA']]}),
+            content_type='application/json')
+        with patch('retrieval.build_opener', return_value=opener):
+            err_res = retrieval.search('test')
+        self.assertIn('brave', err_res.get('error', ''))
         with patch.dict(os.environ, {'SEARXNG_URL': 'https://external.example'}), self.assertRaises(RuntimeError):
             retrieval.search('test')
         with self.assertRaises(RuntimeError):

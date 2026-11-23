@@ -10,6 +10,7 @@ from collections import Counter
 from contextlib import contextmanager, nullcontext
 import datetime
 import fcntl
+import hashlib
 import html
 import json
 import logging
@@ -403,6 +404,8 @@ class History:
             PRIMARY KEY (chat, id))''')
         self.db.execute('''CREATE TABLE IF NOT EXISTS reactions (
             chat INTEGER, id INTEGER, user INTEGER, emoji TEXT, date REAL, PRIMARY KEY (chat, id, user))''')
+        self.db.execute('''CREATE TABLE IF NOT EXISTS tool_cache (
+            kind TEXT, key TEXT, value TEXT, expires REAL, updated REAL, PRIMARY KEY (kind, key))''')
         self.untag()
         self.delivery = delivery.Store(self.db)
 
@@ -651,6 +654,32 @@ class History:
             'note': f'Поиск только по сохранённой истории этого чата (до {self.retention_limit} последних сообщений).',
         }
 
+    @staticmethod
+    def _cache_key(kind, raw):
+        if kind == 'web_search':
+            norm = re.sub(r'[«»"\x27?!.,;:]+', ' ', raw.casefold().replace('ё', 'е'))
+            norm = ' '.join(norm.split())
+        else:
+            norm = raw.strip()
+        return hashlib.sha256(norm.encode('utf-8')).hexdigest()
+
+    def cache_get(self, kind, raw, now=None):
+        ts = time.time() if now is None else now
+        row = self.db.execute(
+            'SELECT value FROM tool_cache WHERE kind=? AND key=? AND expires > ?',
+            (kind, self._cache_key(kind, raw), ts)).fetchone()
+        return row[0] if row else None
+
+    def cache_put(self, kind, raw, value, ttl, now=None, limit=500):
+        ts = time.time() if now is None else now
+        with self.db:
+            self.db.execute(
+                'INSERT OR REPLACE INTO tool_cache VALUES (?, ?, ?, ?, ?)',
+                (kind, self._cache_key(kind, raw), value, ts + ttl, ts))
+            self.db.execute('DELETE FROM tool_cache WHERE expires <= ?', (ts,))
+            self.db.execute('''DELETE FROM tool_cache WHERE rowid NOT IN
+                (SELECT rowid FROM tool_cache ORDER BY updated DESC LIMIT ?)''', (limit,))
+
 
 def report(db, days=14):
     since = time.time() - days * 86400
@@ -708,6 +737,8 @@ class Bot:
     max_tool_rounds = 3
     max_tool_calls = 5
     max_tool_output = 7000
+    search_cache_ttl = 24 * 3600
+    page_cache_ttl = 48 * 3600
     model = ''
     thinkers = frozenset()
     version = None
@@ -958,12 +989,30 @@ class Bot:
                 query = args.get('query')
                 if not isinstance(query, str) or not query.strip():
                     return 'Не задан поисковый запрос.'
-                return clip(chat_context.format_web_search(retrieval.search(query.strip()[:300])), self.max_tool_output)
+                q = query.strip()[:300]
+                cache = getattr(self, 'history', None)
+                if cache is not None and (cached := cache.cache_get('web_search', q)) is not None:
+                    LOG.info('agent.cache_hit chat=%s tool=web_search chars=%s', key[0], len(cached))
+                    return cached
+                data = retrieval.search(q)
+                out = clip(chat_context.format_web_search(data), self.max_tool_output)
+                if cache is not None and isinstance(data, dict) and data.get('results') and not data.get('error'):
+                    cache.cache_put('web_search', q, out, self.search_cache_ttl)
+                return out
             if name == 'read_url':
                 url = args.get('url')
                 if not isinstance(url, str) or not url.strip():
                     return 'Не задан URL страницы.'
-                return clip(chat_context.format_read_url(retrieval.read_url(url.strip())), self.max_tool_output)
+                u = url.strip()
+                cache = getattr(self, 'history', None)
+                if cache is not None and (cached := cache.cache_get('read_url', u)) is not None:
+                    LOG.info('agent.cache_hit chat=%s tool=read_url chars=%s', key[0], len(cached))
+                    return cached
+                data = retrieval.read_url(u)
+                out = clip(chat_context.format_read_url(data), self.max_tool_output)
+                if cache is not None and isinstance(data, dict) and data.get('text') and not data.get('error'):
+                    cache.cache_put('read_url', u, out, self.page_cache_ttl)
+                return out
             if name == 'news':
                 query = args.get('query')
                 if query is not None and not isinstance(query, str):

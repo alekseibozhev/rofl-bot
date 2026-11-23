@@ -160,6 +160,40 @@ class AgentLoopTests(unittest.TestCase):
         self.assertIsInstance(last_content, list)
         self.assertEqual(last_content[1]['image_url']['url'], 'data:image/jpeg;base64,AA==')
 
+    def test_tool_cache_reuses_search_and_url_skips_errors_and_expires(self):
+        msg = {'chat': {'id': -100, 'type': 'supergroup'}, 'message_id': 1, 'date': int(time.time()),
+               'from': {'id': 7, 'first_name': 'Вася'}, 'text': 'рофл, проверь'}
+        good_search = {'results': [{'title': 'Терентьев', 'url': 'https://example.org/m', 'snippet': 'С какими деньгами?'}]}
+        with patch('retrieval.search', return_value=good_search) as search:
+            r1 = self.b.execute_tool('web_search', {'query': '«Завяжи лямку!»'}, msg, 1, int(time.time()))
+            r2 = self.b.execute_tool('web_search', {'query': '  завяжи   лямку  '}, msg, 1, int(time.time()))
+        self.assertEqual(r1, r2)
+        self.assertEqual(search.call_count, 1)
+
+        # Errors and empty results are not cached
+        with patch('retrieval.search', return_value={'results': [], 'error': 'rate limited'}) as bad:
+            self.b.execute_tool('web_search', {'query': 'пусто'}, msg, 1, int(time.time()))
+            self.b.execute_tool('web_search', {'query': 'пусто'}, msg, 1, int(time.time()))
+        self.assertEqual(bad.call_count, 2)
+
+        # read_url is cached by URL
+        with patch('retrieval.read_url', return_value={'title': 'T', 'url': 'https://example.org/p', 'text': 'текст'}) as reader:
+            u1 = self.b.execute_tool('read_url', {'url': 'https://example.org/p'}, msg, 1, int(time.time()))
+            u2 = self.b.execute_tool('read_url', {'url': 'https://example.org/p'}, msg, 1, int(time.time()))
+        self.assertEqual(u1, u2)
+        self.assertEqual(reader.call_count, 1)
+
+        # TTL expiry and size cap
+        self.b.history.db.execute('DELETE FROM tool_cache')
+        self.b.history.cache_put('web_search', 'old', 'v1', ttl=10, now=100, limit=2)
+        self.assertEqual(self.b.history.cache_get('web_search', 'old', now=105), 'v1')
+        self.assertIsNone(self.b.history.cache_get('web_search', 'old', now=111))
+        self.b.history.cache_put('web_search', 'a', 'va', ttl=100, now=200, limit=2)
+        self.b.history.cache_put('web_search', 'b', 'vb', ttl=100, now=201, limit=2)
+        self.b.history.cache_put('web_search', 'c', 'vc', ttl=100, now=202, limit=2)
+        self.assertIsNone(self.b.history.cache_get('web_search', 'a', now=203))
+        self.assertEqual(self.b.history.cache_get('web_search', 'c', now=203), 'vc')
+
 
 if __name__ == '__main__':
     unittest.main()

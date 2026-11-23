@@ -249,4 +249,8 @@ def search(query):
                         'snippet': re.sub(r'<[^>]*>', '', str(item.get('content') or ''))[:700]})
         if len(results) >= SEARCH_LIMIT:
             break
-    return {'query': query[:1000], 'results': results, 'untrusted_data': True}
+    payload = {'query': query[:1000], 'results': results, 'untrusted_data': True}
+    if not results and isinstance(data.get('unresponsive_engines'), list) and data['unresponsive_engines']:
+        engines = ', '.join(str(item[0]) for item in data['unresponsive_engines'] if isinstance(item, list) and item)
+        payload['error'] = f'поисковики временно не ответили ({engines}); поиск не сработал'
+    return payload
