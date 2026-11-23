@@ -385,8 +385,8 @@ def followups(request, batch, window=10):
 
 
 class History:
-    retention_days = 14
-    retention_limit = 500
+    retention_days = None
+    retention_limit = 50_000
 
     def __init__(self, path):
         self.db = sqlite3.connect(path)
@@ -449,10 +449,12 @@ class History:
             self.db.execute('''INSERT OR IGNORE INTO messages (chat, topic, id, role, content, date, reply_to, raw)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
                             (*key, message_id, role, content and content[:6500], date, reply_to, raw))
-            self.db.execute('DELETE FROM messages WHERE date < ?', (time.time() - self.retention_days * 86400,))
-            self.db.execute('''DELETE FROM messages WHERE chat=? AND topic=? AND id NOT IN
-                (SELECT id FROM messages WHERE chat=? AND topic=? ORDER BY id DESC LIMIT ?)''',
-                            (*key, *key, self.retention_limit))
+            if self.retention_days:
+                self.db.execute('DELETE FROM messages WHERE date < ?', (time.time() - self.retention_days * 86400,))
+            if self.retention_limit:
+                self.db.execute('''DELETE FROM messages WHERE chat=? AND topic=? AND id NOT IN
+                    (SELECT id FROM messages WHERE chat=? AND topic=? ORDER BY id DESC LIMIT ?)''',
+                                (*key, *key, self.retention_limit))
 
     def add_message(self, key, message):
         self.add(key, message['message_id'], 'user', None, message.get('date', time.time()),
@@ -592,8 +594,25 @@ class History:
             'has_more': has_more,
         }
 
+    _RU_SUFFIXES = (
+        'ями', 'ами', 'ого', 'его', 'ому', 'ему', 'ыми', 'ими', 'иях', 'иям', 'ией',
+        'ень', 'нем', 'ней', 'нях', 'ням', 'ени', 'ою', 'ею', 'ом', 'ем', 'ой', 'ей',
+        'ый', 'ий', 'ая', 'яя', 'ое', 'ее', 'ые', 'ие', 'их', 'ых', 'им', 'ым',
+        'ов', 'ев', 'ам', 'ям', 'ах', 'ях', 'ня', 'ню', 'не',
+        'а', 'я', 'у', 'ю', 'ы', 'и', 'е', 'о', 'ь',
+    )
+
+    @classmethod
+    def _stem(cls, word):
+        if len(word) < 5 or not ('а' <= word[0] <= 'я'):
+            return word
+        for suffix in cls._RU_SUFFIXES:
+            if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+                return word[:-len(suffix)]
+        return word
+
     def lookup(self, key, query, before, at, me_id=None, limit=5):
-        """Bounded lexical search in retained history, strictly before the current request."""
+        """Bounded lexical search across full retained messages and archived bot answers, strictly before current request."""
         if not isinstance(query, str) or not query.strip() or len(query) > 200:
             raise ValueError('Нужен поисковый запрос длиной от 1 до 200 символов.')
         if type(limit) is not int or not 1 <= limit <= 8:
@@ -602,10 +621,18 @@ class History:
         terms = list(dict.fromkeys(re.findall(r'\w{2,}', normalize(query))))[:8]
         if not terms:
             raise ValueError('Нужны ключевые слова хотя бы из двух букв или цифр.')
-        rows = self.db.execute(
+        stems = [(term, self._stem(term)) for term in terms]
+        msg_rows = self.db.execute(
             'SELECT id, role, content, raw, reply_to, date FROM messages '
-            'WHERE chat=? AND topic=? AND id<? AND date<=? ORDER BY id DESC LIMIT ?',
-            (*key, before, at, self.retention_limit)).fetchall()[::-1]
+            'WHERE chat=? AND topic=? AND id<? AND date<=? ORDER BY id ASC',
+            (*key, before, at)).fetchall()
+        seen_ids = {row[0] for row in msg_rows}
+        ans_rows = self.db.execute(
+            "SELECT id, 'assistant', content, NULL, request, date FROM answers "
+            'WHERE chat=? AND topic=? AND id IS NOT NULL AND id<? AND date<=? ORDER BY id ASC',
+            (*key, before, at)).fetchall()
+        rows = msg_rows + [row for row in ans_rows if row[0] not in seen_ids]
+        rows.sort(key=lambda r: (r[5], r[0]))
         messages, ranked = [], []
         matched_any = set()
         for i, (id_, role, content, raw, reply_to, date) in enumerate(rows):
@@ -619,7 +646,8 @@ class History:
                 author = 'Рофл'
                 text = 'Рофл: ' + body
             words = re.findall(r'\w+', normalize(body))
-            hit_terms = [term for term in terms if any(word.startswith(term) for word in words)]
+            hit_terms = [term for term, stem in stems
+                         if any(word.startswith(stem) for word in words)]
             matched_any.update(hit_terms)
             score = len(hit_terms)
             messages.append({
@@ -643,7 +671,7 @@ class History:
             start = 0
             if i in hits and len(m['text']) > 500:
                 match = next((word for word in re.finditer(r'\w+', normalize(m['text']))
-                              if any(word[0].startswith(term) for term in terms)), None)
+                              if any(word[0].startswith(stem) for _, stem in stems)), None)
                 start = max(0, match.start() - 100) if match else 0
             results.append({**m, 'text': m['text'][start:start + 500],
                             'truncated': len(m['text']) > 500, 'match': i in hits})
@@ -651,7 +679,7 @@ class History:
             'query': query, 'matched_ids': [messages[i]['id'] for i in hits],
             'total_matches': len(ranked), 'messages': results,
             'searched_messages': len(rows), 'missing_terms': missing_terms,
-            'note': f'Поиск только по сохранённой истории этого чата (до {self.retention_limit} последних сообщений).',
+            'note': 'Поиск только по всей сохранённой истории этого чата.',
         }
 
     @staticmethod

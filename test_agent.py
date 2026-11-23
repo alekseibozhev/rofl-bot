@@ -194,6 +194,22 @@ class AgentLoopTests(unittest.TestCase):
         self.assertIsNone(self.b.history.cache_get('web_search', 'a', now=203))
         self.assertEqual(self.b.history.cache_get('web_search', 'c', now=203), 'vc')
 
+    def test_search_chat_matches_russian_inflections_archived_answers_and_keeps_old_messages(self):
+        old_ts = int(time.time()) - 60 * 86400  # 60 days old — must NOT be pruned
+        self.store(1, 'Старое сообщение два месяца назад про рептилоида', date=old_ts, name='Антон')
+        self.store(2, 'Свежее сообщение сегодня', date=int(time.time()) - 10, name='Вася')
+        # Record an archived answer not present in messages (e.g. after /reset)
+        self.b.history.record((-100, 0), 50, 49, old_ts + 100,
+                              'Эндрю - дырявый шершень, Антон - сундучный рептилоид', {})
+        msg = {'chat': {'id': -100, 'type': 'supergroup'}, 'message_id': 100, 'date': int(time.time()),
+               'from': {'id': 7, 'first_name': 'Вася'}, 'text': 'рофл, поищи'}
+        # Inflected query finds archived answer
+        out = self.b.execute_tool('search_chat', {'query': 'Шершня Дырявого'}, msg, 100, int(time.time()))
+        self.assertIn('дырявый шершень', out)
+        # 60-day-old user message is still retained and searchable
+        out_old = self.b.execute_tool('search_chat', {'query': 'рептилоид'}, msg, 100, int(time.time()))
+        self.assertIn('два месяца назад', out_old)
+
 
 if __name__ == '__main__':
     unittest.main()
