@@ -83,6 +83,11 @@ class AgentLoopTests(unittest.TestCase):
         out = self.b.execute_tool('search_chat', {'query': 'видеокарты'}, msg, 3, int(time.time()) - 997)
         self.assertIn('RTX 5090', out)
         self.assertNotIn('#3', out)
+        partial = self.b.execute_tool('search_chat', {'query': 'видеокарты капитал'}, msg, 3, int(time.time()) - 997)
+        self.assertIn('капитал', partial)
+        self.assertIn('web_search', partial)
+        miss = self.b.execute_tool('search_chat', {'query': 'несуществующее'}, msg, 3, int(time.time()) - 997)
+        self.assertIn('web_search', miss)
 
     def test_web_search_then_read_url_multi_round_chain(self):
         self.store(1, 'рофл, найди и прочитай про пример')

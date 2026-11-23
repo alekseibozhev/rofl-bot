@@ -103,9 +103,15 @@ def format_search_chat(data):
     if isinstance(data, dict) and data.get('error'):
         return 'Ошибка поиска по чату: ' + str(data['error'])
     items = data.get('messages', [])
+    missing = data.get('missing_terms') or []
     if not items:
-        return 'Совпадений в сохранённой истории чата не найдено.'
+        return ('В сохранённой истории этого чата совпадений не найдено. '
+                'Не повторяй search_chat — если фраза может быть публичной цитатой, мемом или внешним фактом, '
+                'проверь её характерные слова через web_search (личные дела чата в интернет не выноси).')
     lines = []
+    if missing:
+        lines.append(f'Внимание: слов {", ".join(missing)} в истории этого чата нет (совпали только другие слова). '
+                     'Не повторяй search_chat по ним — если это может быть публичная цитата или мем, проверь через web_search.')
     for m in items:
         reply = f" → #{m['reply_to']}" if m.get('reply_to') else ''
         lines.append(f"{stamp(m.get('date'))} · #{m['id']} · {m.get('author', m['role'])}{reply}")

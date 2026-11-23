@@ -604,17 +604,29 @@ class History:
             'WHERE chat=? AND topic=? AND id<? AND date<=? ORDER BY id DESC LIMIT ?',
             (*key, before, at, self.retention_limit)).fetchall()[::-1]
         messages, ranked = [], []
+        matched_any = set()
         for i, (id_, role, content, raw, reply_to, date) in enumerate(rows):
-            text = render(raw, me_id) if raw else 'Рофл: ' + text_of(content or '')
-            words = re.findall(r'\w+', normalize(text))
-            score = sum(any(word.startswith(term) for word in words) for term in terms)
+            if raw:
+                source = json.loads(raw)
+                body = (source.get('text') or source.get('caption') or '') + ' ' + ((source.get('quote') or {}).get('text') or '')
+                author = author_label(sender_of(source))
+                text = render(raw, me_id)
+            else:
+                body = text_of(content or '')
+                author = 'Рофл'
+                text = 'Рофл: ' + body
+            words = re.findall(r'\w+', normalize(body))
+            hit_terms = [term for term in terms if any(word.startswith(term) for word in words)]
+            matched_any.update(hit_terms)
+            score = len(hit_terms)
             messages.append({
                 'id': id_, 'role': role, 'reply_to': reply_to,
-                'author': author_label(sender_of(json.loads(raw))) if raw else 'Рофл',
+                'author': author,
                 'date': datetime.datetime.fromtimestamp(date).isoformat(), 'text': text,
             })
             if score:
                 ranked.append((score, date, id_, i))
+        missing_terms = [t for t in terms if t not in matched_any]
         hits = [i for _, _, _, i in sorted(ranked, reverse=True)[:limit]]
         by_id = {m['id']: i for i, m in enumerate(messages)}
         chosen = set(hits)
@@ -635,8 +647,8 @@ class History:
         return {
             'query': query, 'matched_ids': [messages[i]['id'] for i in hits],
             'total_matches': len(ranked), 'messages': results,
-            'searched_messages': len(rows),
-            'note': f'Поиск по сохранённой истории этого чата (до {self.retention_limit} последних сообщений).',
+            'searched_messages': len(rows), 'missing_terms': missing_terms,
+            'note': f'Поиск только по сохранённой истории этого чата (до {self.retention_limit} последних сообщений).',
         }
 
 
@@ -689,7 +701,7 @@ class Bot:
     openrouter_key = ''
     max_age = 86400
     wait = 2
-    effort = 'medium'
+    effort = 'low'
     recent = 20
     window = 24 * 3600
     limit = 12000
