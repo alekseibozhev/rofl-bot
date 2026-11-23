@@ -8,9 +8,33 @@ search:
   formats:
     - html
     - json
+  suspended_times:
+    SearxEngineTooManyRequests: 60
+    SearxEngineCaptcha: 120
+    SearxEngineAccessDenied: 120
 outgoing:
   request_timeout: 6.0
   max_request_timeout: 10.0
 engines:
+  - name: brave
+    disabled: false
+    weight: 1.2
+  - name: google cse
+    disabled: false
+    weight: 1.2
+  - name: privacywall
+    disabled: false
+    weight: 1.0
   - name: yahoo
     disabled: false
+    weight: 0.9
+  - name: luxxle
+    disabled: false
+    weight: 0.8
+  - name: wikipedia
+    disabled: false
+    weight: 0.6
+  - name: duckduckgo
+    disabled: true
+  - name: wikidata
+    disabled: true

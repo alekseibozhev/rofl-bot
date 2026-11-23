@@ -8,6 +8,7 @@ import os
 import re
 import socket
 import ssl
+import threading
 import time
 from urllib.parse import quote, urlencode, urljoin, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener, getproxies, proxy_bypass
@@ -16,6 +17,10 @@ MAX_BYTES = 512 * 1024
 MAX_TEXT = 12000
 TIMEOUT = 15
 SEARCH_LIMIT = 5
+SEARCH_MIN_INTERVAL = 0.8
+FALLBACK_ENGINES = 'privacywall,yahoo,luxxle'
+_SEARCH_LOCK = threading.Lock()
+_LAST_SEARCH = 0.0
 
 
 def public_url(url):
@@ -207,21 +212,15 @@ class NoRedirect(HTTPRedirectHandler):
         raise RuntimeError('Перенаправление SearXNG запрещено')
 
 
-def search(query):
-    if not isinstance(query, str) or not query.strip():
-        raise RuntimeError('Не задан поисковый запрос')
-    endpoint = os.environ.get('SEARXNG_URL', 'http://127.0.0.1:8888').rstrip('/')
-    try:
-        parts = urlsplit(endpoint)
-        if (parts.scheme != 'http' or parts.hostname not in ('127.0.0.1', '::1', 'localhost', 'searxng')
-                or parts.username or parts.password or parts.query or parts.fragment):
-            raise ValueError()
-        port = parts.port or 80
-        if not 1 <= port <= 65535:
-            raise ValueError()
-    except ValueError:
-        raise RuntimeError('SEARXNG_URL должен указывать на фиксированный локальный HTTP endpoint') from None
-    url = endpoint + '/search?' + urlencode({'q': query[:1000], 'format': 'json', 'language': 'ru', 'safesearch': 0})
+def _searxng_query(endpoint, params):
+    global _LAST_SEARCH
+    if SEARCH_MIN_INTERVAL > 0:
+        with _SEARCH_LOCK:
+            wait = SEARCH_MIN_INTERVAL - (time.monotonic() - _LAST_SEARCH)
+            if wait > 0:
+                time.sleep(wait)
+            _LAST_SEARCH = time.monotonic()
+    url = endpoint + '/search?' + urlencode(params)
     try:
         opener = build_opener(ProxyHandler({}), NoRedirect())
         with opener.open(Request(url, headers={'Accept': 'application/json'}), timeout=TIMEOUT) as response:
@@ -231,10 +230,14 @@ def search(query):
         data = json.loads(body)
         if not isinstance(data, dict) or not isinstance(data.get('results'), list):
             raise ValueError()
+        return data
     except (OSError, ValueError, http.client.HTTPException):
         raise RuntimeError('Локальный SearXNG недоступен или вернул некорректный ответ; платного fallback нет') from None
+
+
+def _extract_results(raw_results):
     results, seen = [], set()
-    for item in data['results']:
+    for item in raw_results:
         if not isinstance(item, dict):
             continue
         link = item.get('url')
@@ -249,7 +252,34 @@ def search(query):
                         'snippet': re.sub(r'<[^>]*>', '', str(item.get('content') or ''))[:700]})
         if len(results) >= SEARCH_LIMIT:
             break
-    payload = {'query': query[:1000], 'results': results, 'untrusted_data': True}
+    return results
+
+
+def search(query):
+    if not isinstance(query, str) or not query.strip():
+        raise RuntimeError('Не задан поисковый запрос')
+    endpoint = os.environ.get('SEARXNG_URL', 'http://127.0.0.1:8888').rstrip('/')
+    try:
+        parts = urlsplit(endpoint)
+        if (parts.scheme != 'http' or parts.hostname not in ('127.0.0.1', '::1', 'localhost', 'searxng')
+                or parts.username or parts.password or parts.query or parts.fragment):
+            raise ValueError()
+        port = parts.port or 80
+        if not 1 <= port <= 65535:
+            raise ValueError()
+    except ValueError:
+        raise RuntimeError('SEARXNG_URL должен указывать на фиксированный локальный HTTP endpoint') from None
+    q = query[:1000]
+    data = _searxng_query(endpoint, {'q': q, 'format': 'json', 'language': 'ru', 'safesearch': 0})
+    results = _extract_results(data['results'])
+    if not results and data.get('unresponsive_engines') and FALLBACK_ENGINES:
+        fallback = _searxng_query(endpoint, {
+            'q': q, 'format': 'json', 'language': 'all', 'safesearch': 0, 'engines': FALLBACK_ENGINES,
+        })
+        results = _extract_results(fallback['results'])
+        if results:
+            data = fallback
+    payload = {'query': q, 'results': results, 'untrusted_data': True}
     if not results and isinstance(data.get('unresponsive_engines'), list) and data['unresponsive_engines']:
         engines = ', '.join(str(item[0]) for item in data['unresponsive_engines'] if isinstance(item, list) and item)
         payload['error'] = f'поисковики временно не ответили ({engines}); поиск не сработал'

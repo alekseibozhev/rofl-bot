@@ -30,6 +30,12 @@ def http_fixture(body, status=200, content_type='text/html; charset=utf-8', head
 
 
 class RetrievalTests(unittest.TestCase):
+    def setUp(self):
+        self._orig_interval = retrieval.SEARCH_MIN_INTERVAL
+        retrieval.SEARCH_MIN_INTERVAL = 0
+
+    def tearDown(self):
+        retrieval.SEARCH_MIN_INTERVAL = self._orig_interval
     def test_search_uses_fixed_local_searxng_without_environment_proxy(self):
         fixture = {'results': [{'title': 'Глад', 'url': 'https://example.org/glad', 'content': '<b>Пранки</b>'}]}
         opener = Mock()
@@ -89,9 +95,20 @@ class RetrievalTests(unittest.TestCase):
         with patch.dict(os.environ, {'SEARXNG_URL': 'http://searxng:8080'}), patch('retrieval.build_opener', return_value=opener):
             retrieval.search('test')
         self.assertIn('http://searxng:8080/search?', opener.open.call_args.args[0].full_url)
-        opener.open.return_value = http_fixture(
-            json.dumps({'results': [], 'unresponsive_engines': [['brave', 'Suspended'], ['duckduckgo', 'CAPTCHA']]}),
-            content_type='application/json')
+        # If primary is rate-limited, search retries fallback engines before failing
+        opener.open.side_effect = [
+            http_fixture(json.dumps({'results': [], 'unresponsive_engines': [['brave', 'Suspended']]}), content_type='application/json'),
+            http_fixture(json.dumps({'results': [{'title': 'Backup', 'url': 'https://example.org/ok', 'content': 'found'}]}), content_type='application/json'),
+        ]
+        with patch('retrieval.build_opener', return_value=opener):
+            ok_res = retrieval.search('test')
+        self.assertEqual(ok_res['results'][0]['title'], 'Backup')
+        self.assertNotIn('error', ok_res)
+
+        opener.open.side_effect = [
+            http_fixture(json.dumps({'results': [], 'unresponsive_engines': [['brave', 'Suspended']]}), content_type='application/json'),
+            http_fixture(json.dumps({'results': [], 'unresponsive_engines': [['yahoo', 'error']]}), content_type='application/json'),
+        ]
         with patch('retrieval.build_opener', return_value=opener):
             err_res = retrieval.search('test')
         self.assertIn('brave', err_res.get('error', ''))
