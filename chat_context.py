@@ -56,9 +56,11 @@ def messages(turns, aliases, instruction, image=None):
     if result[-1]['role'] != 'user':
         result.append({'role': 'user', 'content': ''})
     result[-1]['content'] = (result[-1]['content'] + '\n\n' + instruction).strip()
-    if image:
-        result[-1]['content'] = [{'type': 'text', 'text': result[-1]['content']},
-                                 {'type': 'image_url', 'image_url': {'url': image}}]
+    images = [image] if isinstance(image, str) else list(image or ())
+    if images:
+        result[-1]['content'] = [{'type': 'text', 'text': result[-1]['content']}] + [
+            {'type': 'image_url', 'image_url': {'url': url}} for url in images
+        ]
     return result
 
 

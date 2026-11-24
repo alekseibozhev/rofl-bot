@@ -192,6 +192,16 @@ def has_picture(message):
                 (message.get('document') or {}).get('mime_type', '').startswith('image/'))
 
 
+def has_image_source(message, include_sticker=True):
+    if not isinstance(message, dict):
+        return False
+    if has_picture(message):
+        return True
+    if include_sticker and (sticker := message.get('sticker')):
+        return bool(sticker.get('thumbnail') if sticker.get('is_animated') or sticker.get('is_video') else sticker)
+    return False
+
+
 def headlines(query=None):
     """Google News RSS for the last 24h on `query`, or world headlines."""
     region = {'hl': 'ru', 'gl': 'RU', 'ceid': 'RU:ru'}
@@ -520,10 +530,20 @@ class History:
                   if e.get('type') == 'text_link' and e.get('url')],
         )
         reply = source.get('reply_to_message') or {}
-        if source.get('external_reply') or (reply and not self.db.execute(
+        external = source.get('external_reply') or {}
+        if external or (reply and not self.db.execute(
                 'SELECT 1 FROM messages WHERE chat=? AND topic=? AND id=?',
                 (*key, reply.get('message_id'))).fetchone()):
             original = reply.get('text') or reply.get('caption')
+            if not original:
+                for ref in (reply, external):
+                    ref_media = next((label for kind, label in MEDIA if ref.get(kind)), '')
+                    if ref_media:
+                        original = f'[{ref_media}]'
+                        break
+                    if ref.get('sticker'):
+                        original = f"[стикер {ref['sticker'].get('emoji', '')}]".replace(' ]', ']')
+                        break
             if original:
                 turn['external_source'] = original
             elif not turn['quote']:
@@ -762,8 +782,8 @@ class Bot:
     recent = 20
     window = 24 * 3600
     limit = 12000
-    max_tool_rounds = 3
-    max_tool_calls = 5
+    max_tool_rounds = 5
+    max_tool_calls = 8
     max_tool_output = 7000
     search_cache_ttl = 24 * 3600
     page_cache_ttl = 48 * 3600
@@ -964,7 +984,9 @@ class Bot:
         sender = sender_of(message)
         reply = message.get('reply_to_message') or {}
         self.history.remember(chat['id'], sender, reply.get('from') or {})
-        if reply.get('message_id') and (reply.get('text') or reply.get('caption')) and reply.get('from', {}).get('id') != self.me['id']:
+        if (reply.get('message_id') and reply.get('from', {}).get('id') != self.me['id']
+                and (reply.get('text') or reply.get('caption') or reply.get('sticker')
+                     or any(reply.get(k) for k, _ in MEDIA))):
             self.history.add_message(key, reply)
         self.history.add_message(key, message)
         addressed = bool(command or self.addressed(message, text))
@@ -975,15 +997,19 @@ class Bot:
         return 'rofl'
 
     def image(self, message):
-        """Photo, image document, or sticker from the request or its immediate reply parent."""
-        for source in (message, message.get('reply_to_message') or {}):
+        """Photo, image document, or sticker from the message, its reply parent, or external reply."""
+        for source in (message, message.get('reply_to_message') or {}, message.get('external_reply') or {}):
             photo, sticker = source.get('photo'), source.get('sticker')
+            doc = source.get('document') or {}
             if photo:
                 file = next((p for p in reversed(photo) if max(p['width'], p['height']) <= 1280), photo[0])
-            elif (source.get('document') or {}).get('mime_type', '').startswith('image/'):
-                file = source['document']
+                mime_hint = None
+            elif doc.get('mime_type', '').startswith('image/'):
+                file = doc.get('thumbnail') if (doc.get('file_size') or 0) > 5 * 1024 * 1024 and doc.get('thumbnail') else doc
+                mime_hint = doc.get('mime_type') if file is doc else None
             elif sticker:
                 file = sticker.get('thumbnail') if sticker.get('is_animated') or sticker.get('is_video') else sticker
+                mime_hint = None
             else:
                 continue
             if file and file.get('file_id'):
@@ -993,9 +1019,108 @@ class Bot:
                 except RuntimeError as exc:
                     LOG.warning('telegram.image_failed %s', exc)
                     return None
-                mime = (source.get('document') or {}).get('mime_type') or mimetypes.guess_type(path)[0] or 'image/jpeg'
+                mime = (mime_hint or mimetypes.guess_type(path)[0]
+                        or ('image/webp' if path.lower().endswith('.webp') else 'image/jpeg'))
                 return f'data:{mime};base64,{b64encode(data).decode()}'
         return None
+
+    def collect_images(self, key, message, extra=(), now=None, max_images=3):
+        """Find relevant image(s) in request/followups, reply chain (multi-hop), or immediate prior photo."""
+        images, source_ids, seen = [], [], set()
+
+        def add(source, msg_id=None):
+            if len(images) >= max_images or not isinstance(source, dict):
+                return
+            sid = msg_id if msg_id is not None else source.get('message_id')
+            if sid is not None and sid in seen:
+                return
+            img = self.image(source)
+            if img:
+                images.append(img)
+                if sid is not None:
+                    seen.add(sid)
+                    source_ids.append(sid)
+
+        # 1. Direct images/stickers on the request and same-user followups (e.g. album or text + photo).
+        for m in (message, *extra):
+            if has_image_source(m):
+                add(m, m.get('message_id'))
+
+        # 2. Immediate reply parent or external_reply (including stickers and captionless photos).
+        if not images:
+            for m in (message, *extra):
+                reply_ref = m.get('reply_to_message') or {}
+                ext_ref = m.get('external_reply') or {}
+                for ref, ref_id in ((reply_ref, reply_ref.get('message_id')), (ext_ref, m.get('message_id'))):
+                    if has_image_source(ref):
+                        add(ref, ref_id)
+                        if images:
+                            break
+                if images:
+                    break
+
+        # 3. Walk reply chain in history (e.g. forwarded photo -> comment -> @bot, or 1-turn follow-up after bot).
+        if not images:
+            parent_id = (message.get('reply_to_message') or {}).get('message_id')
+            assistant_hops = 0
+            for _ in range(8):
+                if parent_id is None or parent_id in seen:
+                    break
+                row = self.history.db.execute(
+                    'SELECT id, role, reply_to, raw FROM messages WHERE chat=? AND topic=? AND id=?',
+                    (*key, parent_id)).fetchone()
+                if not row:
+                    break
+                mid, role, reply_to, raw = row
+                if role == 'assistant':
+                    assistant_hops += 1
+                    if assistant_hops > 1:
+                        break
+                elif raw:
+                    src = json.loads(raw)
+                    if has_picture(src):
+                        add(src, mid)
+                        if images:
+                            break
+                    elif has_picture(src.get('external_reply') or {}):
+                        add(src['external_reply'], mid)
+                        if images:
+                            break
+                parent_id = reply_to
+
+        # 4. Unanswered photo sent right before a non-reply request (e.g. photo, then "@bot ..." without Reply).
+        if not images and not message.get('reply_to_message') and not message.get('external_reply'):
+            cutoff = (now if now is not None else message.get('date', time.time())) - 300
+            rows = self.history.db.execute(
+                'SELECT id, role, raw FROM messages WHERE chat=? AND topic=? AND id < ? AND date >= ? '
+                'ORDER BY id DESC LIMIT 4',
+                (*key, message['message_id'], cutoff)).fetchall()
+            group_id = None
+            picked = []
+            for mid, role, raw in rows:
+                if role == 'assistant':
+                    break
+                if not raw:
+                    continue
+                src = json.loads(raw)
+                if not has_picture(src):
+                    if group_id is not None:
+                        break
+                    continue
+                mgid = src.get('media_group_id')
+                if group_id is None:
+                    picked.append((mid, src))
+                    if mgid is None:
+                        break
+                    group_id = mgid
+                elif mgid == group_id:
+                    picked.append((mid, src))
+                else:
+                    break
+            for mid, src in reversed(picked):
+                add(src, mid)
+
+        return images, source_ids
 
     def execute_tool(self, name, args, message, through, now):
         key = (message['chat']['id'], topic_of(message))
@@ -1065,41 +1190,65 @@ class Bot:
                     people.append(person)
         aliases = participant_context(people, getattr(self, 'me', {}).get('id')) if people else ''
         oldest_hint = f' (в окне сообщения начиная с #{turns[0]["id"]})' if turns else ''
+        images, image_ids = self.collect_images(key, message, extra=extra, now=now)
+        image_hint = ''
+        if len(image_ids) == 1 and image_ids[0] != message['message_id']:
+            image_hint = f'\nПриложено изображение из сообщения #{image_ids[0]}.'
+        elif len(image_ids) > 1:
+            image_hint = '\nПриложены изображения из сообщений: ' + ', '.join(f'#{mid}' for mid in image_ids) + '.'
         instruction = (
             f'Сейчас {datetime.datetime.fromtimestamp(now):%d.%m.%Y %H:%M}.\n'
-            f'Ответь на сообщение #{message["message_id"]}{oldest_hint}.'
+            f'Ответь на сообщение #{message["message_id"]}{oldest_hint}.{image_hint}'
         )
-        image = next((img for m in (message, *extra)
-                      if (has_picture(m) or m.get('sticker') or has_picture(m.get('reply_to_message') or {}))
-                      and (img := self.image(m))), None)
         messages = [{'role': 'system', 'content': SYSTEM_PROMPT}]
-        messages += chat_context.messages(turns, aliases, instruction, image=image)
+        messages += chat_context.messages(turns, aliases, instruction, image=images)
 
         with self.counting() as usage:
             if not self.openrouter:
                 answer = self.generate(messages[1:], chat_id=key[0] if live else None, topic=key[1], system=SYSTEM_PROMPT)
                 trace = {'target': message['message_id'], 'architecture': 'agent-v3',
-                         'context_messages': len(turns), 'tools': [], 'rounds': 1, **spent(usage)}
+                         'context_messages': len(turns), 'tools': [], 'rounds': 1, 'images': image_ids, **spent(usage)}
                 return (clean_prefix(answer) or answer)[:4000], trace
 
             calls_made = 0
             seen_calls = set()
             tool_trace = []
             rounds = 0
+            limit_note = (
+                'Достигнут лимит вызовов инструментов на этот ход — инструменты больше недоступны. '
+                'Сразу дай итоговый ответ пользователю по уже собранным данным, без обещаний проверить ещё.'
+            )
+
+            def finish(reply):
+                answer = (reply.get('content') or '').strip()
+                if not answer:
+                    raise RuntimeError('Модель вернула пустой ответ')
+                trace = {'target': message['message_id'], 'architecture': 'agent-v3',
+                         'context_messages': len(turns), 'tools': tool_trace, 'rounds': rounds,
+                         'images': image_ids, **spent(usage)}
+                LOG.info('agent.done %s', json.dumps({'chat': key[0], 'topic': key[1], **trace}, ensure_ascii=False))
+                return (clean_prefix(answer) or answer)[:4000], trace
+
+            def reject_tool_calls(reply):
+                rejected = reply.get('tool_calls') or []
+                messages.append({
+                    'role': 'assistant',
+                    'content': reply.get('content'),
+                    'tool_calls': rejected,
+                })
+                for tc in rejected:
+                    tc_id = tc.get('id') or f'call_{len(tool_trace)}'
+                    name = (tc.get('function') or {}).get('name', '')
+                    tool_trace.append({'tool': name, 'status': 'limit', 'result_chars': len(limit_note)})
+                    messages.append({'role': 'tool', 'tool_call_id': tc_id, 'content': limit_note})
+
             with typing(lambda: self.send_typing(*key)) if live else nullcontext():
                 for round_idx in range(self.max_tool_rounds):
                     rounds = round_idx + 1
-                    allowed_tools = TOOLS if calls_made < self.max_tool_calls else None
-                    reply = self.chat_step(messages, tools=allowed_tools)
+                    reply = self.chat_step(messages, tools=TOOLS)
                     tool_calls = reply.get('tool_calls') or []
                     if not tool_calls:
-                        answer = (reply.get('content') or '').strip()
-                        if not answer:
-                            raise RuntimeError('Модель вернула пустой ответ')
-                        trace = {'target': message['message_id'], 'architecture': 'agent-v3',
-                                 'context_messages': len(turns), 'tools': tool_trace, 'rounds': rounds, **spent(usage)}
-                        LOG.info('agent.done %s', json.dumps({'chat': key[0], 'topic': key[1], **trace}, ensure_ascii=False))
-                        return (clean_prefix(answer) or answer)[:4000], trace
+                        return finish(reply)
 
                     messages.append({
                         'role': 'assistant',
@@ -1123,7 +1272,7 @@ class Bot:
                             result = f'Неизвестный инструмент: {name}'
                             tool_trace.append({'tool': name, 'status': 'unknown', 'result_chars': len(result)})
                         elif calls_made >= self.max_tool_calls:
-                            result = 'Достигнут лимит вызовов инструментов на этот ход. Отвечай по уже собранным данным.'
+                            result = limit_note
                             tool_trace.append({'tool': name, 'status': 'limit', 'result_chars': len(result)})
                         else:
                             canonical = json.dumps(args, sort_keys=True, ensure_ascii=False)
@@ -1137,16 +1286,21 @@ class Bot:
                                 tool_trace.append({'tool': name, 'status': 'ok', 'result_chars': len(result)})
                                 LOG.info('agent.tool chat=%s tool=%s chars=%s', key[0], name, len(result))
                         messages.append({'role': 'tool', 'tool_call_id': tc_id, 'content': result})
+                    if calls_made >= self.max_tool_calls:
+                        break
 
-                rounds += 1
-                reply = self.chat_step(messages, tools=None)
-                answer = (reply.get('content') or '').strip()
-                if not answer:
-                    raise RuntimeError('Модель вернула пустой ответ')
-                trace = {'target': message['message_id'], 'architecture': 'agent-v3',
-                         'context_messages': len(turns), 'tools': tool_trace, 'rounds': rounds, **spent(usage)}
-                LOG.info('agent.done %s', json.dumps({'chat': key[0], 'topic': key[1], **trace}, ensure_ascii=False))
-                return (clean_prefix(answer) or answer)[:4000], trace
+                if messages and messages[-1].get('role') == 'tool' and limit_note not in (messages[-1].get('content') or ''):
+                    messages[-1]['content'] = (messages[-1]['content'] or '') + '\n\n' + limit_note
+
+                for _ in range(2):
+                    rounds += 1
+                    reply = self.chat_step(messages, tools=None)
+                    if not (reply.get('tool_calls') or []):
+                        return finish(reply)
+                    LOG.warning('agent.final_tool_call_rejected chat=%s count=%s', key[0], len(reply['tool_calls']))
+                    reject_tool_calls(reply)
+
+                raise RuntimeError('Модель не выдала итоговый ответ без инструментов')
 
     @contextmanager
     def counting(self):
@@ -1168,7 +1322,7 @@ class Bot:
         extra = followups(message, later)
         print(render(row[0], self.me['id']), flush=True)
         for run in range(runs):
-            answer, trace = self.agent_reply(message, extra[-1]['message_id'] if extra else message_id, live=False)
+            answer, trace = self.agent_reply(message, extra[-1]['message_id'] if extra else message_id, live=False, extra=extra)
             print(json.dumps({'run': run + 1, 'answer': answer, 'trace': trace}, ensure_ascii=False), flush=True)
 
     def respond(self, message, kind, extra=()):
